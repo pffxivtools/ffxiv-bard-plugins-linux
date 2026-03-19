@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+*.log
+*.zip
+dist/
+published/
+docker/.xlcore-snapshot/
+docker/artifacts/
+docker/.xlcore-wine-snapshot/
+docker/.xlcore-proton-snapshot/
