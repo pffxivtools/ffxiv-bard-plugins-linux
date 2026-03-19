@@ -37,6 +37,12 @@ namespace XivIpc.Internal
             return Path.Combine(directory, BuildSharedFileName(name, kind));
         }
 
+        internal static string BuildSharedFilePath(string directory, string name, string kind)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+            return Path.Combine(ConvertPathToUnix(directory), BuildSharedFileName(name, kind));
+        }
+
         internal static string BuildSharedObjectName(string name, string kind)
         {
             string scopeHash = ComputeStableHexHash(ResolveSharedDirectory());
@@ -177,6 +183,45 @@ namespace XivIpc.Internal
             }
         }
 
+        internal static void EnsureBrokerAccessConfigured()
+        {
+            RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+            if (runtime.IsWindowsProcess)
+                return;
+
+            string? groupName = GetConfiguredGroup();
+            if (string.IsNullOrWhiteSpace(groupName))
+                throw new InvalidOperationException("Brokered TinyIpc requires TINYIPC_SHARED_GROUP to be configured.");
+
+            if (GetGroupId(groupName) < 0)
+                throw new InvalidOperationException($"Brokered TinyIpc shared group '{groupName}' could not be resolved.");
+        }
+
+        internal static void ApplyBrokerPermissions(string path, bool isDirectory)
+        {
+            RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+            if (runtime.IsWindowsProcess)
+                return;
+
+            string unixPath = ConvertPathToUnix(path);
+            string? groupName = GetConfiguredGroup();
+            if (string.IsNullOrWhiteSpace(groupName))
+                throw new InvalidOperationException("Brokered TinyIpc requires TINYIPC_SHARED_GROUP to be configured.");
+
+            int gid = GetGroupId(groupName);
+            if (gid < 0)
+                throw new InvalidOperationException($"Brokered TinyIpc shared group '{groupName}' could not be resolved.");
+
+            int chownResult = chown(unixPath, -1, gid);
+            if (chownResult != 0)
+                throw new IOException($"Failed to apply broker group ownership to '{unixPath}'. errno={System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}.");
+
+            uint mode = Convert.ToUInt32(isDirectory ? "2770" : "660", 8);
+            int chmodResult = chmod(unixPath, mode);
+            if (chmodResult != 0)
+                throw new IOException($"Failed to apply broker permissions to '{unixPath}'. errno={System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}.");
+        }
+
         internal static IDisposable AcquireProcessLock(string path)
         {
             RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
@@ -227,7 +272,7 @@ namespace XivIpc.Internal
             RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
 
             if (runtime.IsWindowsProcess)
-                return NormalizeWindowsPath(path);
+                return NormalizeWindowsRuntimePath(path);
 
             string unixPath = ConvertPathToUnix(path);
 
@@ -236,6 +281,9 @@ namespace XivIpc.Internal
 
             return unixPath;
         }
+
+        internal static string ConvertPathForCurrentRuntime(string path)
+            => ResolvePathForCurrentRuntime(path);
 
         private static string BuildSharedFileName(string name, string kind)
         {
@@ -314,10 +362,13 @@ namespace XivIpc.Internal
             return -1;
         }
 
-        private static string NormalizeWindowsPath(string path)
+        private static string NormalizeWindowsRuntimePath(string path)
         {
             if (string.IsNullOrWhiteSpace(path))
                 return path;
+
+            if (IsUnixAbsolutePath(path))
+                return ConvertUnixPathToWine(path);
 
             try
             {
@@ -329,6 +380,14 @@ namespace XivIpc.Internal
                 return path.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
             }
         }
+
+        private static bool IsUnixAbsolutePath(string path)
+            => !string.IsNullOrWhiteSpace(path)
+               && path[0] == '/'
+               && !(path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' && path[2] == '/');
+
+        private static string ConvertUnixPathToWine(string path)
+            => "Z:" + ConvertPathToUnix(path).Replace('/', '\\');
 
         private static string ConvertPathToUnix(string path)
         {

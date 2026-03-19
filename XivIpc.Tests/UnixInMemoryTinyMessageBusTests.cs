@@ -194,7 +194,7 @@ public sealed class UnixInMemoryTinyMessageBusTests
     }
 
     [Fact]
-    public void Constructor_AllowsOpeningSmallerLocalRequestAgainstLargerExistingImage()
+    public void Constructor_AllowsReopeningChannelWithSmallerCapacityAfterPreviousMembersDispose()
     {
         using var largerEnv = new SharedMemoryTestEnvironment(slotCount: 256);
 
@@ -212,7 +212,7 @@ public sealed class UnixInMemoryTinyMessageBusTests
     }
 
     [Fact]
-    public void Constructor_ThrowsWhenExistingPayloadCapacityIsSmallerThanRequested()
+    public void Constructor_AllowsReopeningChannelWithLargerCapacityAfterPreviousMembersDispose()
     {
         using var envSmall = new SharedMemoryTestEnvironment(slotCount: 64);
 
@@ -224,12 +224,21 @@ public sealed class UnixInMemoryTinyMessageBusTests
             channelName: envSmall.ChannelName,
             slotCount: 64);
 
-        InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
-            () => new UnixInMemoryTinyMessageBus(envLarge.ChannelName, maxPayloadBytes: 4096));
+        using var larger = new UnixInMemoryTinyMessageBus(envLarge.ChannelName, maxPayloadBytes: 4096);
 
-        Assert.True(
-            ex.Message.Contains("incompatible", StringComparison.OrdinalIgnoreCase) ||
-            ex.Message.Contains("payload capacity", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(larger);
+    }
+
+    [Fact]
+    public void Constructor_ThrowsWhenConcurrentMemberRequestsLargerCapacityThanExistingChannel()
+    {
+        using var env = new SharedMemoryTestEnvironment(slotCount: 64);
+        using var smaller = new UnixInMemoryTinyMessageBus(env.ChannelName, maxPayloadBytes: 1024);
+
+        InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
+            () => new UnixInMemoryTinyMessageBus(env.ChannelName, maxPayloadBytes: 4096));
+
+        Assert.Contains("payload capacity", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

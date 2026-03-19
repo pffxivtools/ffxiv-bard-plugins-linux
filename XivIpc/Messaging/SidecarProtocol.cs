@@ -1,11 +1,5 @@
-using System;
-using System.Buffers;
 using System.Buffers.Binary;
-using System.IO;
-using System.IO.Pipelines;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Net.Sockets;
 
 namespace XivIpc.Internal
 {
@@ -15,9 +9,17 @@ namespace XivIpc.Internal
         Publish = 2,
         Dispose = 3,
         Heartbeat = 4,
+        Notify = 5,
+        AttachRing = 10,
         Ready = 11,
-        Message = 12,
         Error = 13
+    }
+
+    [Flags]
+    internal enum SidecarClientCapabilities : int
+    {
+        None = 0,
+        BrokeredRing = 1
     }
 
     internal readonly record struct SidecarHello(
@@ -26,10 +28,17 @@ namespace XivIpc.Internal
         int OwnerPid,
         int HeartbeatIntervalMs,
         int HeartbeatTimeoutMs,
-        int ProtocolVersion = 1)
-    {
+        SidecarClientCapabilities Capabilities = SidecarClientCapabilities.BrokeredRing,
+        int ProtocolVersion = 2);
 
-    }
+    internal readonly record struct SidecarAttachRing(
+        string RingPath,
+        int SlotCount,
+        int SlotPayloadBytes,
+        long StartSequence,
+        long SessionId,
+        int RingLength,
+        int ProtocolVersion = 3);
 
     internal readonly record struct SidecarFrame(SidecarFrameType Type, ReadOnlyMemory<byte> Payload);
 
@@ -37,158 +46,196 @@ namespace XivIpc.Internal
     {
         private const int LengthPrefixBytes = 4;
 
-        public static async ValueTask WriteHelloAsync(PipeWriter writer, SidecarHello hello, CancellationToken cancellationToken = default)
+        public static void WriteHello(Socket socket, SidecarHello hello)
         {
-            byte[] channelBytes = Encoding.UTF8.GetBytes(hello.Channel ?? string.Empty);
-            int payloadLength = 4 + 4 + 4 + 4 + 4 + 4 + channelBytes.Length;
-            Span<byte> header = stackalloc byte[LengthPrefixBytes + 1 + 24];
-            BinaryPrimitives.WriteInt32LittleEndian(header[..4], 1 + payloadLength);
-            header[4] = (byte)SidecarFrameType.Hello;
-            int offset = 5;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], hello.ProtocolVersion); offset += 4;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], hello.OwnerPid); offset += 4;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], hello.MaxBytes); offset += 4;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], hello.HeartbeatIntervalMs); offset += 4;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], hello.HeartbeatTimeoutMs); offset += 4;
-            BinaryPrimitives.WriteInt32LittleEndian(header[offset..(offset + 4)], channelBytes.Length);
+            byte[] channelBytes = System.Text.Encoding.UTF8.GetBytes(hello.Channel ?? string.Empty);
+            int payloadLength = 4 + 4 + 4 + 4 + 4 + 4 + 4 + channelBytes.Length;
+            byte[] buffer = new byte[LengthPrefixBytes + 1 + payloadLength];
 
-            writer.Write(header);
-            writer.Write(channelBytes);
-            FlushResult flushResult = await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
-            if (flushResult.IsCanceled)
-            {
-                throw new OperationCanceledException(cancellationToken);
-            }
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(0, 4), 1 + payloadLength);
+            buffer[4] = (byte)SidecarFrameType.Hello;
+
+            int offset = 5;
+            WriteInt32(buffer, ref offset, hello.ProtocolVersion);
+            WriteInt32(buffer, ref offset, hello.OwnerPid);
+            WriteInt32(buffer, ref offset, hello.MaxBytes);
+            WriteInt32(buffer, ref offset, hello.HeartbeatIntervalMs);
+            WriteInt32(buffer, ref offset, hello.HeartbeatTimeoutMs);
+            WriteInt32(buffer, ref offset, (int)hello.Capabilities);
+            WriteInt32(buffer, ref offset, channelBytes.Length);
+            channelBytes.CopyTo(buffer, offset);
+
+            SendAll(socket, buffer);
         }
 
-        public static async ValueTask<SidecarHello> ReadHelloAsync(PipeReader reader, CancellationToken cancellationToken = default)
+        public static SidecarHello ReadHello(Socket socket)
         {
-            SidecarFrame frame = await ReadFrameAsync(reader, cancellationToken).ConfigureAwait(false);
+            SidecarFrame frame = ReadFrame(socket);
             if (frame.Type != SidecarFrameType.Hello)
                 throw new InvalidDataException($"Expected sidecar frame '{SidecarFrameType.Hello}' but received '{frame.Type}'.");
 
             ReadOnlySpan<byte> span = frame.Payload.Span;
-            if (span.Length < 24)
+            if (span.Length < 28)
                 throw new InvalidDataException("HELLO payload is truncated.");
 
             int offset = 0;
-            int version = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
-            int ownerPid = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
-            int maxBytes = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
-            int heartbeatIntervalMs = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
-            int heartbeatTimeoutMs = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
-            int channelLength = BinaryPrimitives.ReadInt32LittleEndian(span[offset..(offset + 4)]); offset += 4;
+            int version = ReadInt32(span, ref offset);
+            int ownerPid = ReadInt32(span, ref offset);
+            int maxBytes = ReadInt32(span, ref offset);
+            int heartbeatIntervalMs = ReadInt32(span, ref offset);
+            int heartbeatTimeoutMs = ReadInt32(span, ref offset);
+            SidecarClientCapabilities capabilities = (SidecarClientCapabilities)ReadInt32(span, ref offset);
+            int channelLength = ReadInt32(span, ref offset);
 
             if (channelLength < 0 || offset + channelLength > span.Length)
                 throw new InvalidDataException("HELLO channel payload is invalid.");
 
-            string channel = Encoding.UTF8.GetString(span.Slice(offset, channelLength));
-            return new SidecarHello(channel, maxBytes, ownerPid, heartbeatIntervalMs, heartbeatTimeoutMs, version);
+            string channel = System.Text.Encoding.UTF8.GetString(span.Slice(offset, channelLength));
+            return new SidecarHello(channel, maxBytes, ownerPid, heartbeatIntervalMs, heartbeatTimeoutMs, capabilities, version);
         }
 
-        public static ValueTask WritePublishAsync(PipeWriter writer, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Publish, payload, cancellationToken);
-
-        public static ValueTask WriteDisposeAsync(PipeWriter writer, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Dispose, ReadOnlyMemory<byte>.Empty, cancellationToken);
-
-        public static ValueTask WriteHeartbeatAsync(PipeWriter writer, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Heartbeat, ReadOnlyMemory<byte>.Empty, cancellationToken);
-
-        public static ValueTask WriteReadyAsync(PipeWriter writer, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Ready, ReadOnlyMemory<byte>.Empty, cancellationToken);
-
-        public static ValueTask WriteMessageAsync(PipeWriter writer, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Message, payload, cancellationToken);
-
-        public static ValueTask WriteErrorAsync(PipeWriter writer, string message, CancellationToken cancellationToken = default)
-            => WriteFrameAsync(writer, SidecarFrameType.Error, Encoding.UTF8.GetBytes(message ?? string.Empty), cancellationToken);
-
-        public static async ValueTask<SidecarFrame> ReadFrameAsync(PipeReader reader, CancellationToken cancellationToken = default)
+        public static void WriteAttachRing(Socket socket, SidecarAttachRing attach)
         {
-            while (true)
+            byte[] ringPathBytes = System.Text.Encoding.UTF8.GetBytes(attach.RingPath ?? string.Empty);
+            byte[] payload = new byte[4 + 4 + 4 + 4 + 8 + 8 + 4 + ringPathBytes.Length];
+            int offset = 0;
+            WriteInt32(payload, ref offset, attach.ProtocolVersion);
+            WriteInt32(payload, ref offset, ringPathBytes.Length);
+            WriteInt32(payload, ref offset, attach.SlotCount);
+            WriteInt32(payload, ref offset, attach.SlotPayloadBytes);
+            WriteInt64(payload, ref offset, attach.StartSequence);
+            WriteInt64(payload, ref offset, attach.SessionId);
+            WriteInt32(payload, ref offset, attach.RingLength);
+            ringPathBytes.CopyTo(payload, offset);
+            SendAll(socket, BuildFrame(SidecarFrameType.AttachRing, payload));
+        }
+
+        public static SidecarAttachRing ReadAttachRing(Socket socket)
+        {
+            SidecarFrame frame = ReadFrame(socket);
+            SidecarFrameType frameType = frame.Type;
+            if (frameType == SidecarFrameType.Error)
             {
-                ReadResult headerResult = await reader.ReadAtLeastAsync(LengthPrefixBytes, cancellationToken).ConfigureAwait(false);
-                ReadOnlySequence<byte> headerBuffer = headerResult.Buffer;
-                if (headerBuffer.Length < LengthPrefixBytes)
-                {
-                    if (headerResult.IsCompleted)
-                    {
-                        reader.AdvanceTo(headerBuffer.Start, headerBuffer.End);
-                        throw new EndOfStreamException();
-                    }
+                string message = frame.Payload.Length > 0
+                    ? System.Text.Encoding.UTF8.GetString(frame.Payload.Span)
+                    : "Broker attach failed.";
+                throw new InvalidOperationException(message);
+            }
 
-                    reader.AdvanceTo(headerBuffer.Start, headerBuffer.End);
-                    continue;
-                }
+            if (frameType != SidecarFrameType.AttachRing)
+                throw new InvalidDataException("Expected ATTACH_RING from the broker.");
 
-                Span<byte> headerBytes = stackalloc byte[LengthPrefixBytes];
-                headerBuffer.Slice(0, LengthPrefixBytes).CopyTo(headerBytes);
-                int frameLength = BinaryPrimitives.ReadInt32LittleEndian(headerBytes);
-                if (frameLength < 1)
-                {
-                    reader.AdvanceTo(headerBuffer.Start, headerBuffer.End);
-                    throw new InvalidDataException("Frame length is invalid.");
-                }
+            ReadOnlySpan<byte> span = frame.Payload.Span;
+            int offset = 0;
+            int version = ReadInt32(span, ref offset);
+            int ringPathLength = ReadInt32(span, ref offset);
+            int slotCount = ReadInt32(span, ref offset);
+            int slotPayloadBytes = ReadInt32(span, ref offset);
+            long startSequence = ReadInt64(span, ref offset);
+            long sessionId = ReadInt64(span, ref offset);
+            int ringLength = ReadInt32(span, ref offset);
 
-                long totalLength = LengthPrefixBytes + frameLength;
-                reader.AdvanceTo(headerBuffer.Start, headerBuffer.Start);
+            if (ringPathLength < 0 || offset + ringPathLength > span.Length)
+                throw new InvalidDataException("ATTACH_RING ring path payload is invalid.");
 
-                ReadResult frameResult = await reader.ReadAtLeastAsync((int)totalLength, cancellationToken).ConfigureAwait(false);
-                ReadOnlySequence<byte> frameBuffer = frameResult.Buffer;
-                if (frameBuffer.Length < totalLength)
-                {
-                    if (frameResult.IsCompleted)
-                    {
-                        reader.AdvanceTo(frameBuffer.Start, frameBuffer.End);
-                        throw new EndOfStreamException();
-                    }
+            string ringPath = System.Text.Encoding.UTF8.GetString(span.Slice(offset, ringPathLength));
+            return new SidecarAttachRing(ringPath, slotCount, slotPayloadBytes, startSequence, sessionId, ringLength, version);
+        }
 
-                    reader.AdvanceTo(frameBuffer.Start, frameBuffer.Start);
-                    continue;
-                }
+        public static void WritePublish(Socket socket, ReadOnlyMemory<byte> payload)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Publish, payload.Span));
 
-                SequencePosition payloadStart = frameBuffer.GetPosition(LengthPrefixBytes, frameBuffer.Start);
-                ReadOnlySequence<byte> frameContent = frameBuffer.Slice(payloadStart, frameLength);
-                Span<byte> typeByte = stackalloc byte[1];
-                frameContent.Slice(0, 1).CopyTo(typeByte);
-                SidecarFrameType type = (SidecarFrameType)typeByte[0];
-                byte[] payload = frameContent.Length > 1 ? frameContent.Slice(1).ToArray() : Array.Empty<byte>();
+        public static void WriteDispose(Socket socket)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Dispose, ReadOnlySpan<byte>.Empty));
 
-                SequencePosition consumed = frameBuffer.GetPosition(totalLength, frameBuffer.Start);
-                reader.AdvanceTo(consumed, consumed);
-                return new SidecarFrame(type, payload);
+        public static void WriteHeartbeat(Socket socket)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Heartbeat, ReadOnlySpan<byte>.Empty));
+
+        public static void WriteNotify(Socket socket)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Notify, ReadOnlySpan<byte>.Empty));
+
+        public static void WriteReady(Socket socket)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Ready, ReadOnlySpan<byte>.Empty));
+
+        public static void WriteError(Socket socket, string message)
+            => SendAll(socket, BuildFrame(SidecarFrameType.Error, System.Text.Encoding.UTF8.GetBytes(message ?? string.Empty)));
+
+        public static SidecarFrame ReadFrame(Socket socket)
+        {
+            byte[] header = ReceiveExact(socket, LengthPrefixBytes);
+            int frameLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+            if (frameLength < 1)
+                throw new InvalidDataException("Frame length is invalid.");
+
+            byte[] content = ReceiveExact(socket, frameLength);
+            SidecarFrameType type = (SidecarFrameType)content[0];
+            byte[] payload = content.Length > 1 ? content[1..] : Array.Empty<byte>();
+            return new SidecarFrame(type, payload);
+        }
+
+        private static byte[] BuildFrame(SidecarFrameType type, ReadOnlySpan<byte> payload)
+        {
+            byte[] buffer = new byte[LengthPrefixBytes + 1 + payload.Length];
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(0, 4), 1 + payload.Length);
+            buffer[4] = (byte)type;
+            payload.CopyTo(buffer.AsSpan(5));
+            return buffer;
+        }
+
+        private static byte[] ReceiveExact(Socket socket, int length)
+        {
+            byte[] buffer = new byte[length];
+            int offset = 0;
+
+            while (offset < length)
+            {
+                int read = socket.Receive(buffer, offset, length - offset, SocketFlags.None);
+                if (read == 0)
+                    throw new EndOfStreamException();
+
+                offset += read;
+            }
+
+            return buffer;
+        }
+
+        private static void SendAll(Socket socket, byte[] buffer)
+        {
+            int offset = 0;
+            while (offset < buffer.Length)
+            {
+                int written = socket.Send(buffer, offset, buffer.Length - offset, SocketFlags.None);
+                if (written <= 0)
+                    throw new IOException("Socket send returned no bytes.");
+
+                offset += written;
             }
         }
 
-        public static async ValueTask<byte[]> ReadPayloadAsync(PipeReader reader, SidecarFrameType expectedType, CancellationToken cancellationToken = default)
+        private static void WriteInt32(byte[] buffer, ref int offset, int value)
         {
-            SidecarFrame frame = await ReadFrameAsync(reader, cancellationToken).ConfigureAwait(false);
-            if (frame.Type != expectedType)
-                throw new InvalidDataException($"Expected sidecar frame '{expectedType}' but received '{frame.Type}'.");
-            return frame.Payload.ToArray();
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), value);
+            offset += 4;
         }
 
-        public static async ValueTask<string> ReadErrorAsync(PipeReader reader, CancellationToken cancellationToken = default)
+        private static void WriteInt64(byte[] buffer, ref int offset, long value)
         {
-            byte[] payload = await ReadPayloadAsync(reader, SidecarFrameType.Error, cancellationToken).ConfigureAwait(false);
-            return Encoding.UTF8.GetString(payload);
+            BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(offset, 8), value);
+            offset += 8;
         }
 
-        public static async ValueTask WriteFrameAsync(PipeWriter writer, SidecarFrameType type, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+        private static int ReadInt32(ReadOnlySpan<byte> span, ref int offset)
         {
-            int frameLength = 1 + payload.Length;
-            Span<byte> prefix = stackalloc byte[LengthPrefixBytes + 1];
-            BinaryPrimitives.WriteInt32LittleEndian(prefix[..4], frameLength);
-            prefix[4] = (byte)type;
-            writer.Write(prefix);
-            if (!payload.IsEmpty)
-                writer.Write(payload.Span);
-            FlushResult flushResult = await writer.FlushAsync(cancellationToken);
-            if (flushResult.IsCanceled)
-            {
-                throw new OperationCanceledException(cancellationToken);
-            }
+            int value = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+            offset += 4;
+            return value;
+        }
+
+        private static long ReadInt64(ReadOnlySpan<byte> span, ref int offset)
+        {
+            long value = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(offset, 8));
+            offset += 8;
+            return value;
         }
     }
 }

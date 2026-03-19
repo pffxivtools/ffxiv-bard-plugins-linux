@@ -307,6 +307,8 @@ public sealed class FunctionalTests
         private readonly string? _previousBackend;
         private readonly string? _previousHostPath;
         private readonly string? _previousUnixShell;
+        private readonly string? _previousSharedDir;
+        private readonly string _testSharedDir;
 
         public string Backend { get; }
         public string ChannelName { get; }
@@ -319,11 +321,16 @@ public sealed class FunctionalTests
             _previousBackend = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
             _previousHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
             _previousUnixShell = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL");
+            _previousSharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+            _testSharedDir = Path.Combine(Path.GetTempPath(), "xivipc-tests", Guid.NewGuid().ToString("N"));
 
             Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", backend);
 
             if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
             {
+                Directory.CreateDirectory(_testSharedDir);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _testSharedDir);
+
                 string? hostPath = ResolveNativeHostPath();
                 if (!string.IsNullOrWhiteSpace(hostPath))
                     Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", hostPath);
@@ -338,6 +345,16 @@ public sealed class FunctionalTests
             Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", _previousBackend);
             Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", _previousHostPath);
             Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", _previousUnixShell);
+            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _previousSharedDir);
+
+            try
+            {
+                if (Directory.Exists(_testSharedDir))
+                    Directory.Delete(_testSharedDir, recursive: true);
+            }
+            catch
+            {
+            }
         }
 
         private static string? ResolveNativeHostPath()

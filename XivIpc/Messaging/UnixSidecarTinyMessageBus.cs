@@ -1,30 +1,28 @@
-using System;
-using System.IO;
-using System.IO.Pipelines;
+using System.Collections.Concurrent;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
 using XivIpc.Internal;
-using XivIpc.IO;
 
 namespace XivIpc.Messaging
 {
     internal sealed class UnixSidecarTinyMessageBus : IXivMessageBus
     {
         private const int DefaultHeartbeatIntervalMs = 2000;
-        private const int DefaultHeartbeatTimeoutMs = 12000;
+        private const int DefaultHeartbeatTimeoutMs = 60000;
 
         private readonly string _channelName;
         private readonly int _maxPayloadBytes;
         private readonly UnixSidecarProcessManager.Lease _lease;
-        private readonly TcpClient _client;
-        private readonly NetworkStream _stream;
-        private readonly PipeReader _reader;
-        private readonly PipeWriter _writer;
+        private readonly Socket _socket;
         private readonly SemaphoreSlim _writeLock = new(1, 1);
         private readonly CancellationTokenSource _cts = new();
-        private readonly Task _readerTask;
+        private readonly ConcurrentQueue<byte[]> _pendingMessages = new();
+        private readonly SemaphoreSlim _pendingSignal = new(0);
+        private readonly Task _eventLoopTask;
+        private readonly Task _dispatchLoopTask;
         private readonly Task _heartbeatTask;
+        private readonly BrokeredChannelRing _ring;
+        private readonly long _sessionId;
+        private long _nextSequence;
         private bool _disposed;
 
         public UnixSidecarTinyMessageBus(ChannelInfo channelInfo)
@@ -43,41 +41,32 @@ namespace XivIpc.Messaging
             _channelName = channelName;
             _maxPayloadBytes = maxPayloadBytes;
 
-            _lease = UnixSidecarProcessManager.Acquire();
-            (string host, int port) = ResolveEndpoint(_lease);
-            _client = Connect(host, port);
-            _stream = _client.GetStream();
-            _reader = PipeReader.Create(_stream, new StreamPipeReaderOptions(leaveOpen: true));
-            _writer = PipeWriter.Create(_stream, new StreamPipeWriterOptions(leaveOpen: true));
-
             try
             {
-                SidecarHello hello = new(
+                _lease = UnixSidecarProcessManager.Acquire();
+                _socket = Connect(_lease.SocketPath);
+
+                SidecarProtocol.WriteHello(_socket, new SidecarHello(
                     _channelName,
                     _maxPayloadBytes,
                     RuntimeEnvironmentDetector.GetCurrentProcessId(),
                     ResolveHeartbeatIntervalMs(),
-                    ResolveHeartbeatTimeoutMs());
+                    ResolveHeartbeatTimeoutMs()));
 
-                SidecarProtocol.WriteHelloAsync(_writer, hello, _cts.Token).AsTask().GetAwaiter().GetResult();
+                SidecarAttachRing attach = SidecarProtocol.ReadAttachRing(_socket);
+                _ring = AttachRingWithRetry(attach);
+                _sessionId = attach.SessionId;
+                _nextSequence = attach.StartSequence;
 
-                SidecarFrame readyFrame = SidecarProtocol.ReadFrameAsync(_reader, _cts.Token).AsTask().GetAwaiter().GetResult();
+                SidecarFrame readyFrame = SidecarProtocol.ReadFrame(_socket);
                 if (readyFrame.Type == SidecarFrameType.Error)
                     throw new InvalidOperationException(System.Text.Encoding.UTF8.GetString(readyFrame.Payload.Span));
 
                 if (readyFrame.Type != SidecarFrameType.Ready)
                     throw new InvalidOperationException($"Expected sidecar READY but received '{readyFrame.Type}'.");
 
-                TinyIpcLogger.Info(
-                    nameof(UnixSidecarTinyMessageBus),
-                    "Connected",
-                    "Connected to sidecar-backed TinyMessageBus.",
-                    ("channel", _channelName),
-                    ("host", host),
-                    ("port", port),
-                    ("maxPayloadBytes", _maxPayloadBytes));
-
-                _readerTask = Task.Run(() => ReaderLoopAsync(_cts.Token));
+                _eventLoopTask = Task.Run(() => EventLoopAsync(_cts.Token));
+                _dispatchLoopTask = Task.Run(() => DispatchLoopAsync(_cts.Token));
                 _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
             }
             catch
@@ -93,6 +82,10 @@ namespace XivIpc.Messaging
         {
             ArgumentNullException.ThrowIfNull(message);
             ThrowIfDisposed();
+
+            if (message.Length > _maxPayloadBytes)
+                throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {_maxPayloadBytes}.");
+
             return WritePublishAsync(message, _cts.Token);
         }
 
@@ -104,9 +97,10 @@ namespace XivIpc.Messaging
             _disposed = true;
 
             try { _cts.Cancel(); } catch { }
-            try { TryWriteDisposeAsync().GetAwaiter().GetResult(); } catch { }
-            try { _readerTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-            try { _heartbeatTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            try { TryWriteDisposeAsync(); } catch { }
+            try { _socket.Dispose(); } catch { }
+            try { _pendingSignal.Release(); } catch { }
+            try { Task.WaitAll(new[] { _eventLoopTask, _dispatchLoopTask, _heartbeatTask }, TimeSpan.FromSeconds(2)); } catch { }
 
             SafeDisposeCore();
         }
@@ -122,112 +116,51 @@ namespace XivIpc.Messaging
             await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                await SidecarProtocol.WritePublishAsync(_writer, message, cancellationToken).ConfigureAwait(false);
+                SidecarProtocol.WritePublish(_socket, message);
             }
             finally
             {
                 _writeLock.Release();
             }
-
-            if (TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Debug))
-            {
-                TinyIpcLogger.Debug(
-                    nameof(UnixSidecarTinyMessageBus),
-                    "Publish",
-                    "Published message through sidecar backend.",
-                    ("channel", _channelName),
-                    ("bytes", message.Length),
-                    ("payloadPreview", TinyIpcLogger.CreatePayloadPreview(message)));
-            }
         }
 
-        private async Task TryWriteDisposeAsync()
+        private void TryWriteDisposeAsync()
         {
+            _writeLock.Wait(CancellationToken.None);
             try
             {
-                await _writeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-                try
-                {
-                    await SidecarProtocol.WriteDisposeAsync(_writer, CancellationToken.None).ConfigureAwait(false);
-                }
-                finally
-                {
-                    _writeLock.Release();
-                }
+                SidecarProtocol.WriteDispose(_socket);
             }
-            catch (Exception ex)
+            catch
             {
-                TinyIpcLogger.Warning(
-                    nameof(UnixSidecarTinyMessageBus),
-                    "DisposeSignalFailed",
-                    "Failed to signal sidecar dispose.",
-                    ex,
-                    ("channel", _channelName));
+            }
+            finally
+            {
+                _writeLock.Release();
             }
         }
 
-        private async Task ReaderLoopAsync(CancellationToken cancellationToken)
+        private async Task EventLoopAsync(CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested && !_disposed)
             {
                 try
                 {
-                    SidecarFrame frame = await SidecarProtocol.ReadFrameAsync(_reader, cancellationToken).ConfigureAwait(false);
+                    SidecarFrame frame = await Task.Run(() => SidecarProtocol.ReadFrame(_socket), cancellationToken).ConfigureAwait(false);
                     switch (frame.Type)
                     {
-                        case SidecarFrameType.Message:
-                            {
-                                byte[] payload = frame.Payload.ToArray();
-                                try
-                                {
-                                    MessageReceived?.Invoke(this, new XivMessageReceivedEventArgs(payload));
-                                }
-                                catch (Exception ex)
-                                {
-                                    TinyIpcLogger.Error(
-                                        nameof(UnixSidecarTinyMessageBus),
-                                        "MessageHandlerFailed",
-                                        "A sidecar-backed MessageReceived handler threw an exception.",
-                                        ex,
-                                        ("channel", _channelName));
-                                }
-
-                                break;
-                            }
-
-                        case SidecarFrameType.Error:
-                            {
-                                string error = System.Text.Encoding.UTF8.GetString(frame.Payload.Span);
-                                TinyIpcLogger.Error(
-                                    nameof(UnixSidecarTinyMessageBus),
-                                    "SidecarError",
-                                    "Sidecar reported an error.",
-                                    null,
-                                    ("channel", _channelName),
-                                    ("message", error));
-                                return;
-                            }
-
-                        case SidecarFrameType.Ready:
-                        case SidecarFrameType.Heartbeat:
+                        case SidecarFrameType.Notify:
+                            DrainAvailableMessages();
                             break;
-
+                        case SidecarFrameType.Error:
+                            return;
+                        case SidecarFrameType.Ready:
+                            break;
                         default:
-                            TinyIpcLogger.Warning(
-                                nameof(UnixSidecarTinyMessageBus),
-                                "UnexpectedFrame",
-                                "Received unexpected sidecar frame.",
-                                null,
-                                ("channel", _channelName),
-                                ("frameType", frame.Type));
                             return;
                     }
                 }
-                catch (EndOfStreamException)
-                {
-                    return;
-                }
-                catch (IOException)
+                catch (OperationCanceledException)
                 {
                     return;
                 }
@@ -235,20 +168,41 @@ namespace XivIpc.Messaging
                 {
                     return;
                 }
-                catch (OperationCanceledException)
+                catch (IOException)
                 {
                     return;
                 }
-                catch (Exception ex)
-                {
-                    TinyIpcLogger.Error(
-                        nameof(UnixSidecarTinyMessageBus),
-                        "ReaderLoopFailed",
-                        "Sidecar reader loop failed.",
-                        ex,
-                        ("channel", _channelName));
+            }
+        }
 
-                    await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        private async Task DispatchLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await _pendingSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                while (!_disposed && _pendingMessages.TryDequeue(out byte[]? payload))
+                {
+                    try
+                    {
+                        MessageReceived?.Invoke(this, new XivMessageReceivedEventArgs(payload));
+                    }
+                    catch (Exception ex)
+                    {
+                        TinyIpcLogger.Error(
+                            nameof(UnixSidecarTinyMessageBus),
+                            "MessageHandlerFailed",
+                            "A broker-backed MessageReceived handler threw an exception.",
+                            ex,
+                            ("channel", _channelName));
+                    }
                 }
             }
         }
@@ -268,7 +222,7 @@ namespace XivIpc.Messaging
                     await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                     try
                     {
-                        await SidecarProtocol.WriteHeartbeatAsync(_writer, cancellationToken).ConfigureAwait(false);
+                        SidecarProtocol.WriteHeartbeat(_socket);
                     }
                     finally
                     {
@@ -284,26 +238,23 @@ namespace XivIpc.Messaging
                 TinyIpcLogger.Warning(
                     nameof(UnixSidecarTinyMessageBus),
                     "HeartbeatFailed",
-                    "Failed to send sidecar heartbeat.",
+                    "Failed to send broker heartbeat.",
                     ex,
                     ("channel", _channelName));
             }
         }
 
-        private static (string Host, int Port) ResolveEndpoint(UnixSidecarProcessManager.Lease lease)
+        private void DrainAvailableMessages()
         {
-            string? raw = Environment.GetEnvironmentVariable("TINYIPC_SIDECAR_ENDPOINT");
-            if (string.IsNullOrWhiteSpace(raw))
-                return ("127.0.0.1", lease.Port);
-
-            string[] parts = raw.Split(':', 2, StringSplitOptions.TrimEntries);
-            if (parts.Length != 2 || !int.TryParse(parts[1], out int port))
-                throw new InvalidOperationException($"Invalid TINYIPC_SIDECAR_ENDPOINT value '{raw}'. Expected host:port.");
-
-            return (parts[0], port);
+            List<byte[]> messages = _ring.Drain(_sessionId, ref _nextSequence);
+            foreach (byte[] payload in messages)
+            {
+                _pendingMessages.Enqueue(payload);
+                _pendingSignal.Release();
+            }
         }
 
-        private static TcpClient Connect(string host, int port)
+        private static Socket Connect(string socketPath)
         {
             Exception? last = null;
 
@@ -311,10 +262,9 @@ namespace XivIpc.Messaging
             {
                 try
                 {
-                    var client = new TcpClient();
-                    client.Connect(host, port);
-                    client.NoDelay = true;
-                    return client;
+                    var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    socket.Connect(new UnixDomainSocketEndPoint(socketPath));
+                    return socket;
                 }
                 catch (Exception ex)
                 {
@@ -323,7 +273,27 @@ namespace XivIpc.Messaging
                 }
             }
 
-            throw new InvalidOperationException($"Failed to connect to sidecar endpoint {host}:{port}.", last);
+            throw new InvalidOperationException($"Failed to connect to broker socket '{socketPath}'.", last);
+        }
+
+        private static BrokeredChannelRing AttachRingWithRetry(SidecarAttachRing attach)
+        {
+            Exception? last = null;
+
+            for (int attempt = 0; attempt < 40; attempt++)
+            {
+                try
+                {
+                    return BrokeredChannelRing.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes);
+                }
+                catch (IOException ex)
+                {
+                    last = ex;
+                    Thread.Sleep(25);
+                }
+            }
+
+            throw new IOException($"Failed to attach broker ring '{attach.RingPath}'.", last);
         }
 
         private static int ResolveHeartbeatIntervalMs()
@@ -340,13 +310,11 @@ namespace XivIpc.Messaging
 
         private void SafeDisposeCore()
         {
-            try { _client.Close(); } catch { }
-            try { _reader.Complete(); } catch { }
-            try { _writer.Complete(); } catch { }
-            try { _stream.Dispose(); } catch { }
-            try { _client.Dispose(); } catch { }
-            try { _writeLock.Dispose(); } catch { }
-            try { _cts.Dispose(); } catch { }
+            try { _ring?.Dispose(); } catch { }
+            try { _socket?.Dispose(); } catch { }
+            try { _pendingSignal?.Dispose(); } catch { }
+            try { _writeLock?.Dispose(); } catch { }
+            try { _cts?.Dispose(); } catch { }
             try { _lease.Dispose(); } catch { }
         }
 

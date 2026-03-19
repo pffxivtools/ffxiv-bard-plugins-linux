@@ -1,286 +1,176 @@
 using System.Diagnostics;
-using System.Globalization;
-using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using XivIpc.Internal;
 
 namespace XivIpc.Messaging;
 
 internal static class UnixSidecarProcessManager
 {
-    private const string NativeHostStagingDirectoryName = "tinyipc-native-host";
-    private const string SharedSidecarScopeName = "tinyipc-sidecar";
-    private const string EndpointFileName = "tinyipc-sidecar.endpoint";
+    private const string BrokerDirectoryName = "xivipc";
+    private const string BrokerSocketFileName = "tinyipc-sidecar.sock";
+    private const string StartupLockName = "tinyipc-broker";
     private const string StartupLockKind = "sidecar-startup";
     private const int StartupTimeoutMs = 10_000;
 
     private static readonly object Sync = new();
 
     private static Process? _process;
-    private static int _port;
     private static int _refCount;
-    private static string? _stdoutLogPath;
-    private static string? _stderrLogPath;
 
     internal static Lease Acquire()
     {
         lock (Sync)
         {
-            EnsureProcessStarted();
+            string socketPath = ResolveBrokerSocketPath();
+            EnsureBrokerStarted(socketPath);
             _refCount++;
-
-            TinyIpcLogger.Info(
-                nameof(UnixSidecarProcessManager),
-                "HelperLeaseAcquired",
-                "Acquired sidecar helper lease.",
-                ("port", _port),
-                ("refCount", _refCount));
-
-            return new Lease(_port);
+            return new Lease(socketPath);
         }
     }
 
-    private static void EnsureProcessStarted()
+    private static void EnsureBrokerStarted(string socketPath)
     {
-        if (_port > 0 && IsPortResponsive(_port, TimeSpan.FromMilliseconds(100)))
+        if (CanConnect(socketPath))
             return;
 
-        string sharedDirectoryNative = ResolveSharedDirectoryNativePath();
-        Directory.CreateDirectory(sharedDirectoryNative);
+        string brokerDirectory = Path.GetDirectoryName(socketPath) ?? throw new InvalidOperationException("Broker socket path must have a parent directory.");
+        Directory.CreateDirectory(UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(brokerDirectory));
 
-        string endpointPath = GetEndpointFilePath(sharedDirectoryNative);
-        var startupLock = new UnixSharedFileLock(SharedSidecarScopeName, StartupLockKind);
-
+        var startupLock = new UnixSharedFileLock(StartupLockName, StartupLockKind);
         startupLock.Execute(() =>
         {
-            if (TryReadLiveEndpoint(endpointPath, out int sharedPort))
-            {
-                _port = sharedPort;
-                TinyIpcLogger.Info(
-                    nameof(UnixSidecarProcessManager),
-                    "ReusedSharedEndpoint",
-                    "Reused existing shared sidecar endpoint.",
-                    ("port", _port),
-                    ("endpointPath", endpointPath));
+            if (CanConnect(socketPath))
                 return;
-            }
 
-            CleanupStaleEndpoint(endpointPath);
+            CleanupStaleSocket(socketPath);
 
-            if (_process is not null && SafeGetPid(_process) != 0)
-                DisposeOwnedProcessOnly();
-
-            if (!TryStartHelper(StartupMode.Shell, endpointPath, out string shellFailure))
+            if (!TryStartHelper(socketPath, out string failureDetails))
             {
-                TinyIpcLogger.Info(
-                    nameof(UnixSidecarProcessManager),
-                    "HelperStartFailed",
-                    "Failed to start native sidecar helper with shell. Attempting fallback.",
-                    ("failureDetails", shellFailure));
-
-                DisposeOwnedProcessOnly();
-
-                if (!TryStartHelper(StartupMode.CmdUnix, endpointPath, out string cmdUnixFailure))
-                {
-                    TinyIpcLogger.Info(
-                        nameof(UnixSidecarProcessManager),
-                        "CmdUnixLaunchFailed",
-                        "Failed to start native sidecar helper with cmd /unix.",
-                        ("failureDetails", cmdUnixFailure));
-
-                    DisposeOwnedProcessOnly();
-
-                    throw new InvalidOperationException(
-                        "Native host did not report a listening port."
-                        + $"{Environment.NewLine}ShellLaunchFailure:{Environment.NewLine}{shellFailure}"
-                        + $"{Environment.NewLine}CmdUnixLaunchFailure:{Environment.NewLine}{cmdUnixFailure}");
-                }
+                throw new InvalidOperationException(
+                    $"Failed to start native TinyIpc broker for socket '{socketPath}'.{Environment.NewLine}{failureDetails}");
             }
 
-            WriteEndpointFile(endpointPath, SafeGetPid(_process), _port);
-
-            TinyIpcLogger.Info(
-                nameof(UnixSidecarProcessManager),
-                "HelperStarted",
-                "Started native sidecar helper.",
-                ("port", _port),
-                ("pid", SafeGetPid(_process)),
-                ("endpointPath", endpointPath));
+            WaitForBroker(socketPath, TimeSpan.FromMilliseconds(StartupTimeoutMs));
         });
     }
 
-    private static bool TryStartHelper(StartupMode mode, string endpointPath, out string failureDetails)
+    private static void WaitForBroker(string socketPath, TimeSpan timeout)
     {
-        failureDetails = string.Empty;
-
-        ProcessStartInfo psi = BuildStartInfo(
-            mode,
-            out string stdoutLogPath,
-            out string stderrLogPath,
-            out string launchCommand,
-            out string hostPathUnix,
-            out string hostPathWindows);
-
-        Process process;
-        try
-        {
-            process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start XivIpc.NativeHost.");
-        }
-        catch (Exception ex)
-        {
-            failureDetails =
-                $"mode={mode}"
-                + $" launchCommand={launchCommand}"
-                + $" hostPathWindows={hostPathWindows}"
-                + $" hostPathUnix={hostPathUnix}"
-                + $"{Environment.NewLine}startFailure:{Environment.NewLine}{ex}";
-            return false;
-        }
-
-        _process = process;
-        _stdoutLogPath = stdoutLogPath;
-        _stderrLogPath = stderrLogPath;
-
-        if (WaitForStartupFromLogOrPort(stdoutLogPath, TimeSpan.FromMilliseconds(StartupTimeoutMs), out int actualPort))
-        {
-            _port = actualPort;
-            return true;
-        }
-
-        string stdout = ReadLogSnippet(stdoutLogPath);
-        string stderr = ReadLogSnippet(stderrLogPath);
-
-        try
-        {
-            if (_process is { HasExited: true })
-                stderr += $"{Environment.NewLine}<process exited with code {_process.ExitCode}>";
-        }
-        catch
-        {
-        }
-
-        failureDetails =
-            $"mode={mode}"
-            + $" launchCommand={launchCommand}"
-            + $" hostPathWindows={hostPathWindows}"
-            + $" hostPathUnix={hostPathUnix}"
-            + $" stdoutLog={stdoutLogPath}"
-            + $" stderrLog={stderrLogPath}"
-            + $" endpointPath={endpointPath}"
-            + $"{Environment.NewLine}stdout:{Environment.NewLine}{stdout}"
-            + $"{Environment.NewLine}stderr:{Environment.NewLine}{stderr}";
-
-        return false;
-    }
-
-    private static bool WaitForStartupFromLogOrPort(string stdoutLogPath, TimeSpan timeout, out int actualPort)
-    {
-        actualPort = 0;
         Stopwatch sw = Stopwatch.StartNew();
+        Exception? last = null;
 
         while (sw.Elapsed < timeout)
         {
-            if (TryParseReadyPort(stdoutLogPath, out int loggedPort))
+            try
             {
-                actualPort = loggedPort;
-                if (IsPortResponsive(loggedPort, TimeSpan.FromMilliseconds(150)))
-                    return true;
+                if (CanConnect(socketPath))
+                    return;
+
+                lock (Sync)
+                {
+                    if (_process is not null && _process.HasExited)
+                        throw new InvalidOperationException($"Native TinyIpc broker exited before socket '{socketPath}' became reachable. ExitCode={_process.ExitCode}.");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex is InvalidOperationException)
+                    throw;
+
+                last = ex;
             }
 
             Thread.Sleep(50);
         }
 
-        return false;
+        throw new TimeoutException($"Timed out waiting for broker socket '{socketPath}' to become reachable.", last);
     }
 
-    private static bool TryParseReadyPort(string path, out int port)
+    private static bool TryStartHelper(string socketPath, out string failureDetails)
     {
-        port = 0;
-
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            return false;
+        ProcessStartInfo psi = BuildStartInfo(socketPath, out string launchCommand, out string hostPathUnix, out string hostPathWindows);
 
         try
         {
-            foreach (string line in File.ReadLines(path))
-            {
-                if (line.StartsWith("PORT:", StringComparison.OrdinalIgnoreCase) &&
-                    int.TryParse(line[5..].Trim(), out int parsed) &&
-                    parsed > 0 && parsed <= 65535)
-                {
-                    port = parsed;
-                    TinyIpcLogger.Info(
-                        nameof(UnixSidecarProcessManager),
-                        "HelperReportedPort",
-                        "Native sidecar helper reported listening port in log.",
-                        ("loggedPort", port));
+            _process = Process.Start(psi) ?? throw new InvalidOperationException("Process.Start returned null.");
+            failureDetails = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            failureDetails =
+                $"launchCommand={launchCommand}"
+                + $" hostPathWindows={hostPathWindows}"
+                + $" hostPathUnix={hostPathUnix}"
+                + Environment.NewLine
+                + ex;
+            return false;
+        }
+    }
 
-                    return true;
-                }
-            }
+    private static ProcessStartInfo BuildStartInfo(string socketPath, out string launchCommand, out string hostPathUnix, out string hostPathWindows)
+    {
+        string shellPath = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL") ?? "/bin/sh";
+        hostPathWindows = ResolveNativeHostPath();
+        hostPathUnix = ConvertWindowsPathToUnix(hostPathWindows);
+
+        bool isDll = string.Equals(Path.GetExtension(hostPathUnix), ".dll", StringComparison.OrdinalIgnoreCase);
+        string executableCommand = isDll
+            ? "/usr/bin/env dotnet " + QuoteForShell(hostPathUnix)
+            : QuoteForShell(hostPathUnix);
+
+        launchCommand = executableCommand;
+
+        var psi = new ProcessStartInfo(shellPath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = AppContext.BaseDirectory
+        };
+
+        psi.ArgumentList.Add("-lc");
+        psi.ArgumentList.Add(launchCommand);
+
+        CopyPathEnvironment(psi, "TINYIPC_SHARED_DIR");
+        CopyPathEnvironment(psi, "TINYIPC_BROKER_DIR");
+        CopyVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING");
+        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL");
+        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD");
+        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES");
+        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT");
+        CopyVerbatimEnvironment(psi, "TINYIPC_SHARED_GROUP");
+
+        psi.Environment["TINYIPC_BROKER_SOCKET_PATH"] = ConvertUnixPathForChild(socketPath);
+        psi.Environment["TINYIPC_BUS_BACKEND"] = "sidecar-brokered";
+
+        return psi;
+    }
+
+    private static void CleanupStaleSocket(string socketPath)
+    {
+        if (CanConnect(socketPath))
+            return;
+
+        try
+        {
+            File.Delete(UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(socketPath));
         }
         catch
         {
         }
-
-        return false;
     }
 
-    private static bool TryReadLiveEndpoint(string endpointPath, out int port)
+    private static bool CanConnect(string socketPath)
     {
-        port = 0;
-
-        if (!TryReadEndpoint(endpointPath, out _, out int storedPort, out _))
-            return false;
-
-        if (!IsPortResponsive(storedPort, TimeSpan.FromMilliseconds(150)))
-            return false;
-
-        port = storedPort;
-        return true;
-    }
-
-    private static bool TryReadEndpoint(string endpointPath, out int pid, out int port, out long createdUnixMs)
-    {
-        pid = 0;
-        port = 0;
-        createdUnixMs = 0;
-
-        if (string.IsNullOrWhiteSpace(endpointPath) || !File.Exists(endpointPath))
+        if (string.IsNullOrWhiteSpace(socketPath))
             return false;
 
         try
         {
-            Dictionary<string, string> values = new(StringComparer.OrdinalIgnoreCase);
-
-            foreach (string rawLine in File.ReadAllLines(endpointPath))
-            {
-                if (string.IsNullOrWhiteSpace(rawLine))
-                    continue;
-
-                int separator = rawLine.IndexOf('=');
-                if (separator <= 0)
-                    continue;
-
-                string key = rawLine[..separator].Trim();
-                string value = rawLine[(separator + 1)..].Trim();
-                values[key] = value;
-            }
-
-            if (!values.TryGetValue("port", out string? portRaw) ||
-                !int.TryParse(portRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out port) ||
-                port <= 0 || port > 65535)
-            {
-                return false;
-            }
-
-            if (values.TryGetValue("pid", out string? pidRaw))
-                _ = int.TryParse(pidRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out pid);
-
-            if (values.TryGetValue("createdUnixMs", out string? createdRaw))
-                _ = long.TryParse(createdRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out createdUnixMs);
-
+            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            socket.ReceiveTimeout = 250;
+            socket.SendTimeout = 250;
+            socket.Connect(new UnixDomainSocketEndPoint(socketPath));
             return true;
         }
         catch
@@ -289,487 +179,107 @@ internal static class UnixSidecarProcessManager
         }
     }
 
-    private static void WriteEndpointFile(string endpointPath, int pid, int port)
+    private static string ResolveBrokerSocketPath()
     {
-        string directory = Path.GetDirectoryName(endpointPath) ?? string.Empty;
-        if (!string.IsNullOrWhiteSpace(directory))
-            Directory.CreateDirectory(directory);
+        string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH");
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+            return ResolveUnixPath(explicitPath);
 
-        string tempPath = endpointPath + ".tmp";
-
-        string[] lines =
-        {
-            $"pid={pid.ToString(CultureInfo.InvariantCulture)}",
-            $"port={port.ToString(CultureInfo.InvariantCulture)}",
-            $"createdUnixMs={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture)}"
-        };
-
-        File.WriteAllLines(tempPath, lines, Encoding.UTF8);
-        File.Move(tempPath, endpointPath, overwrite: true);
-
-        try
-        {
-            UnixSharedStorageHelpers.ApplyPermissions(endpointPath, isDirectory: false);
-        }
-        catch
-        {
-        }
-
-        TinyIpcLogger.Info(
-            nameof(UnixSidecarProcessManager),
-            "EndpointWritten",
-            "Wrote shared sidecar endpoint file.",
-            ("endpointPath", endpointPath),
-            ("pid", pid),
-            ("port", port));
+        string directory = ResolveBrokerDirectory();
+        Directory.CreateDirectory(directory);
+        return CombineUnixPath(directory, BrokerSocketFileName);
     }
 
-    private static void CleanupStaleEndpoint(string endpointPath)
+    private static string ResolveBrokerDirectory()
     {
-        try
-        {
-            if (!File.Exists(endpointPath))
-                return;
+        string? explicitDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR");
+        if (!string.IsNullOrWhiteSpace(explicitDirectory))
+            return ResolveUnixPath(explicitDirectory);
 
-            if (TryReadLiveEndpoint(endpointPath, out _))
-                return;
+        string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+        if (!string.IsNullOrWhiteSpace(sharedDirectory))
+            return ResolveUnixPath(sharedDirectory);
 
-            File.Delete(endpointPath);
-
-            TinyIpcLogger.Info(
-                nameof(UnixSidecarProcessManager),
-                "EndpointDeleted",
-                "Deleted stale shared sidecar endpoint file.",
-                ("endpointPath", endpointPath));
-        }
-        catch (Exception ex)
-        {
-            TinyIpcLogger.Warning(
-                nameof(UnixSidecarProcessManager),
-                "EndpointCleanupFailed",
-                "Failed to delete stale sidecar endpoint file.",
-                ex,
-                ("endpointPath", endpointPath));
-        }
-    }
-
-    private static int SafeGetPid(Process? process)
-    {
-        try
-        {
-            return process?.Id ?? 0;
-        }
-        catch
-        {
-            return 0;
-        }
-    }
-
-    private static ProcessStartInfo BuildStartInfo(
-        StartupMode mode,
-        out string stdoutLogPath,
-        out string stderrLogPath,
-        out string launchCommand,
-        out string hostPathUnix,
-        out string hostPathWindows)
-    {
-        string shellPath = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL") ?? @"Z:\bin\sh";
-
-        string diagnosticsDirectoryWindows = ResolveDiagnosticsDirectoryWindowsPath();
-        string diagnosticsDirectoryNative = ResolveDiagnosticsDirectoryNativePath();
-        Directory.CreateDirectory(diagnosticsDirectoryNative);
-
-        string suffix = $"{Process.GetCurrentProcess().Id}-{Guid.NewGuid():N}";
-        stdoutLogPath = Path.Combine(diagnosticsDirectoryNative, $"tinyipc-sidecar-{suffix}.stdout.log");
-        stderrLogPath = Path.Combine(diagnosticsDirectoryNative, $"tinyipc-sidecar-{suffix}.stderr.log");
-
-        string stdoutLogUnixPath = ConvertWindowsPathToUnix(stdoutLogPath);
-        string stderrLogUnixPath = ConvertWindowsPathToUnix(stderrLogPath);
-
-        hostPathWindows = ResolveNativeHostPath();
-        hostPathUnix = ConvertWindowsPathToUnix(hostPathWindows);
-
-        ProcessStartInfo psi;
-
-        switch (mode)
-        {
-            case StartupMode.CmdUnix:
-            {
-                string commandInterpreter = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
-                launchCommand = $"{commandInterpreter} /c start \"\" /b /unix {hostPathUnix}";
-
-                psi = new ProcessStartInfo(commandInterpreter)
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = AppContext.BaseDirectory
-                };
-
-                psi.ArgumentList.Add("/c");
-                psi.ArgumentList.Add("start");
-                psi.ArgumentList.Add("");
-                psi.ArgumentList.Add("/b");
-                psi.ArgumentList.Add("/unix");
-                psi.ArgumentList.Add(hostPathUnix);
-                break;
-            }
-
-            default:
-            {
-                launchCommand = QuoteForShell(hostPathUnix) + " </dev/null >" + QuoteForShell(stdoutLogUnixPath) + " 2>" + QuoteForShell(stderrLogUnixPath);
-
-                psi = new ProcessStartInfo(shellPath)
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = AppContext.BaseDirectory
-                };
-
-                psi.ArgumentList.Add("-lc");
-                psi.ArgumentList.Add(launchCommand);
-                break;
-            }
-        }
-
-        CopyUnixPathEnvironment(psi, "TINYIPC_SHARED_DIR");
-        CopyUnixPathEnvironment(psi, "TINYIPC_LOG_DIR");
-        CopyVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT");
-        CopyVerbatimEnvironment(psi, "TINYIPC_FILE_NOTIFIER");
-        CopyVerbatimEnvironment(psi, "TINYIPC_SHARED_GROUP");
-        CopyVerbatimEnvironment(psi, "TINYIPC_SIDECAR_HEARTBEAT_INTERVAL_MS");
-        CopyVerbatimEnvironment(psi, "TINYIPC_SIDECAR_HEARTBEAT_TIMEOUT_MS");
-
-        psi.Environment["TINYIPC_BUS_BACKEND"] = "sidecar-memory";
-
-        TinyIpcLogger.Info(
-            nameof(UnixSidecarProcessManager),
-            "BuildStartInfo",
-            "Prepared native sidecar start info.",
-            ("mode", mode),
-            ("diagnosticsDirectoryWindows", diagnosticsDirectoryWindows),
-            ("diagnosticsDirectoryNative", diagnosticsDirectoryNative),
-            ("stdoutLogPath", stdoutLogPath),
-            ("stderrLogPath", stderrLogPath),
-            ("hostPathWindows", hostPathWindows),
-            ("hostPathUnix", hostPathUnix));
-
-        return psi;
+        return Path.Combine("/run", BrokerDirectoryName);
     }
 
     internal static string ResolveNativeHostPath()
     {
-        string? configuredExecutable = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
-        if (!string.IsNullOrWhiteSpace(configuredExecutable))
+        string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
+        if (!string.IsNullOrWhiteSpace(explicitPath))
         {
-            string? resolvedConfigured = FirstExistingPath(
-                NormalizeWindowsPath(configuredExecutable),
-                TryConvertWinePathToUnix(configuredExecutable));
-
-            if (!string.IsNullOrWhiteSpace(resolvedConfigured))
-                return resolvedConfigured;
+            string resolved = ResolveNativePath(explicitPath);
+            if (File.Exists(resolved))
+                return resolved;
         }
 
-        string[] probeDirectories = GetNativeHostProbeDirectories();
-        LogNativeHostProbeContext(probeDirectories);
-
-        string? firstCandidate = null;
-
-        foreach (string directory in probeDirectories)
+        string baseDir = AppContext.BaseDirectory;
+        string[] candidates =
         {
-            foreach (string fileName in new[] { "XivIpc.NativeHost", "XivIpc.NativeHost.dll" })
-            {
-                string candidate = NormalizePathForProbe(Path.Combine(directory, fileName));
-                firstCandidate ??= candidate;
+            Path.Combine(baseDir, "XivIpc.NativeHost"),
+            Path.Combine(baseDir, "XivIpc.NativeHost.dll"),
+            Path.Combine(baseDir, "XivIpc.NativeHost.exe"),
 
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-        }
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Debug", "net10.0", "XivIpc.NativeHost")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Debug", "net10.0", "XivIpc.NativeHost.dll")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Debug", "net9.0", "XivIpc.NativeHost")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Debug", "net9.0", "XivIpc.NativeHost.dll")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Release", "net10.0", "XivIpc.NativeHost")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Release", "net10.0", "XivIpc.NativeHost.dll")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Release", "net9.0", "XivIpc.NativeHost")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Release", "net9.0", "XivIpc.NativeHost.dll"))
+        };
 
-        throw new InvalidOperationException(
-            $"XivIpc.NativeHost executable or dll was not found. First candidate was '{firstCandidate ?? "XivIpc.NativeHost"}'. " +
-            "Set TINYIPC_NATIVE_HOST_PATH or ensure it exists in the shared staging directory.");
+        string? existing = candidates.FirstOrDefault(File.Exists);
+        return existing ?? throw new InvalidOperationException("XivIpc.NativeHost executable or dll was not found.");
     }
 
-    internal static string[] GetNativeHostProbeDirectories()
+    internal static int GetOwnedProcessIdForDiagnostics()
     {
-        return GetNativeHostProbeDirectories(
-            typeof(UnixSidecarProcessManager).Assembly.Location,
-            AppContext.BaseDirectory,
-            GetKnownPluginAssemblyLocations().Concat(AppDomain.CurrentDomain.GetAssemblies().Select(a => a.Location)),
-            Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR"));
-    }
-
-    internal static string[] GetNativeHostProbeDirectories(
-        string? assemblyLocation,
-        string appContextBaseDirectory,
-        IEnumerable<string>? loadedAssemblyLocations = null,
-        string? sharedDirectory = null)
-    {
-        var directories = new List<string>();
-
-        void AddDirectory(string? path)
+        lock (Sync)
         {
-            if (string.IsNullOrWhiteSpace(path))
-                return;
-
-            foreach (string normalized in ExpandProbePath(path))
-            {
-                if (!directories.Any(existing => string.Equals(existing, normalized, StringComparison.OrdinalIgnoreCase)))
-                    directories.Add(normalized);
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(assemblyLocation))
-            AddDirectory(Path.GetDirectoryName(assemblyLocation));
-
-        foreach (string stagingDirectory in GetNativeHostStagingDirectories(sharedDirectory))
-            AddDirectory(stagingDirectory);
-
-        if (loadedAssemblyLocations is not null)
-        {
-            foreach (string location in loadedAssemblyLocations)
-            {
-                if (string.IsNullOrWhiteSpace(location))
-                    continue;
-
-                try
-                {
-                    if (!ShouldProbeAssemblyLocation(location))
-                        continue;
-
-                    AddDirectory(Path.GetDirectoryName(location));
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        AddDirectory(appContextBaseDirectory);
-        return directories.ToArray();
-    }
-
-    internal static string[] GetNativeHostStagingDirectories(string? sharedDirectory)
-    {
-        if (string.IsNullOrWhiteSpace(sharedDirectory))
-            return Array.Empty<string>();
-
-        var results = new List<string>();
-
-        foreach (string root in ExpandProbePath(sharedDirectory))
-            results.Add(Path.Combine(root, NativeHostStagingDirectoryName));
-
-        return results.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-    }
-
-    internal static IEnumerable<string> GetKnownPluginAssemblyLocations()
-    {
-        yield return typeof(UnixSidecarProcessManager).Assembly.Location;
-
-        foreach (string typeName in new[]
-        {
-            "TinyIpc.IO.TinyMemoryMappedFile, TinyIpc",
-            "TinyIpc.Messaging.TinyMessageBus, TinyIpc",
-            "TinyIpc.Messaging.ITinyMessageBus, TinyIpc"
-        })
-        {
-            Type? type = Type.GetType(typeName, throwOnError: false);
-            string? location = type?.Assembly.Location;
-            if (!string.IsNullOrWhiteSpace(location))
-                yield return location;
-        }
-    }
-
-    private static IEnumerable<string> ExpandProbePath(string path)
-    {
-        string normalized = NormalizeWindowsPath(path);
-        yield return normalized;
-
-        string? unix = TryConvertWinePathToUnix(path);
-        if (!string.IsNullOrWhiteSpace(unix) &&
-            !string.Equals(unix, normalized, StringComparison.OrdinalIgnoreCase))
-        {
-            yield return unix;
-        }
-    }
-
-    private static bool ShouldProbeAssemblyLocation(string location)
-    {
-        string fileName = Path.GetFileName(location);
-        return string.Equals(fileName, "TinyIpc.dll", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(fileName, "XivIpc.dll", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(fileName, "XivIpc.NativeHost", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(fileName, "XivIpc.NativeHost.dll", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static void LogNativeHostProbeContext(IReadOnlyList<string> probeDirectories)
-    {
-        if (!TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Info))
-            return;
-
-        TinyIpcLogger.Info(
-            nameof(UnixSidecarProcessManager),
-            "NativeHostProbe",
-            "Resolving native sidecar host path.",
-            ("appContextBaseDirectory", AppContext.BaseDirectory),
-            ("sharedDirectory", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR") ?? string.Empty),
-            ("sidecarAssemblyLocation", typeof(UnixSidecarProcessManager).Assembly.Location ?? string.Empty),
-            ("probeDirectories", string.Join(" | ", probeDirectories)));
-    }
-
-    private static string NormalizePathForProbe(string path)
-    {
-        string normalized = NormalizeWindowsPath(path);
-        string? unix = TryConvertWinePathToUnix(normalized);
-
-        if (!string.IsNullOrWhiteSpace(unix) && File.Exists(unix))
-            return unix;
-
-        return normalized;
-    }
-
-    private static string NormalizeWindowsPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return path;
-
-        try
-        {
-            string fullPath = Path.GetFullPath(path);
-            return fullPath.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
-        }
-        catch
-        {
-            return path.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
-        }
-    }
-
-    private static string ResolveDiagnosticsDirectoryWindowsPath()
-    {
-        string? logDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
-        if (!string.IsNullOrWhiteSpace(logDir))
-            return NormalizeWindowsPath(logDir);
-
-        string? sharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
-        if (!string.IsNullOrWhiteSpace(sharedDir))
-            return NormalizeWindowsPath(sharedDir);
-
-        return NormalizeWindowsPath(Path.GetTempPath());
-    }
-
-    private static string ResolveDiagnosticsDirectoryNativePath()
-    {
-        string? logDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
-        if (!string.IsNullOrWhiteSpace(logDir))
-            return TryConvertWinePathToUnix(logDir) ?? ConvertWindowsPathToUnix(logDir);
-
-        string? sharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
-        if (!string.IsNullOrWhiteSpace(sharedDir))
-            return TryConvertWinePathToUnix(sharedDir) ?? ConvertWindowsPathToUnix(sharedDir);
-
-        return "/tmp";
-    }
-
-    private static string ResolveSharedDirectoryNativePath()
-    {
-        string? sharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
-        if (!string.IsNullOrWhiteSpace(sharedDir))
-            return TryConvertWinePathToUnix(sharedDir) ?? ConvertWindowsPathToUnix(sharedDir);
-
-        return "/tmp";
-    }
-
-    private static string GetEndpointFilePath(string sharedDirectoryNative)
-        => Path.Combine(sharedDirectoryNative, EndpointFileName);
-
-    private static void CopyVerbatimEnvironment(ProcessStartInfo psi, string name)
-    {
-        string? value = Environment.GetEnvironmentVariable(name);
-        if (!string.IsNullOrWhiteSpace(value))
-            psi.Environment[name] = value;
-    }
-
-    private static void CopyUnixPathEnvironment(ProcessStartInfo psi, string name)
-    {
-        string? value = Environment.GetEnvironmentVariable(name);
-        if (string.IsNullOrWhiteSpace(value))
-            return;
-
-        psi.Environment[name] = TryConvertWinePathToUnix(value) ?? ConvertWindowsPathToUnix(value);
-    }
-
-    private static string ConvertWindowsPathToUnix(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return path;
-
-        string normalized = path.Replace('\\', '/');
-
-        if (normalized.Length >= 3 && char.IsLetter(normalized[0]) && normalized[1] == ':' && normalized[2] == '/')
-        {
-            char drive = char.ToUpperInvariant(normalized[0]);
-            string remainder = normalized[3..];
-
-            if (drive == 'Z')
-                return "/" + remainder;
-
-            return $"/mnt/{char.ToLowerInvariant(drive)}/{remainder}";
-        }
-
-        return normalized;
-    }
-
-    private static string? TryConvertWinePathToUnix(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return null;
-
-        string normalized = path.Replace('/', '\\').Trim();
-
-        if (normalized.Length >= 3 &&
-            (normalized[0] == 'Z' || normalized[0] == 'z') &&
-            normalized[1] == ':' &&
-            normalized[2] == '\\')
-        {
-            string suffix = normalized[2..].Replace('\\', '/');
-            return suffix;
-        }
-
-        return null;
-    }
-
-    private static string QuoteForShell(string value)
-        => "'" + value.Replace("'", "'\"'\"'") + "'";
-
-    private static bool IsPortResponsive(int port, TimeSpan connectTimeout)
-    {
-        try
-        {
-            using var client = new TcpClient();
-            IAsyncResult result = client.BeginConnect(IPAddress.Loopback.ToString(), port, null, null);
             try
             {
-                if (result.AsyncWaitHandle.WaitOne(connectTimeout))
+                return _process is { HasExited: false } ? _process.Id : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+    }
+
+    internal static bool WaitForOwnedProcessExitForDiagnostics(TimeSpan timeout)
+    {
+        Process? process;
+
+        lock (Sync)
+            process = _process;
+
+        if (process is null)
+            return true;
+
+        try
+        {
+            bool exited = process.WaitForExit((int)timeout.TotalMilliseconds);
+            if (exited)
+            {
+                lock (Sync)
                 {
-                    client.EndConnect(result);
-                    return true;
+                    if (ReferenceEquals(_process, process))
+                    {
+                        try { _process.Dispose(); } catch { }
+                        _process = null;
+                    }
                 }
             }
-            finally
-            {
-                result.AsyncWaitHandle.Dispose();
-            }
+
+            return exited;
         }
         catch
         {
+            return false;
         }
-
-        return false;
     }
 
     private static void Release()
@@ -779,87 +289,129 @@ internal static class UnixSidecarProcessManager
             if (_refCount > 0)
                 _refCount--;
 
-            TinyIpcLogger.Info(
-                nameof(UnixSidecarProcessManager),
-                "HelperLeaseReleased",
-                "Released sidecar helper lease.",
-                ("port", _port),
-                ("refCount", _refCount));
+            if (_process is null)
+                return;
+
+            bool hasExited;
+            try
+            {
+                hasExited = _process.HasExited;
+            }
+            catch
+            {
+                hasExited = true;
+            }
+
+            if (!hasExited)
+                return;
+
+            try
+            {
+                _process.Dispose();
+            }
+            catch
+            {
+            }
+
+            _process = null;
         }
     }
 
-    private static void DisposeOwnedProcessOnly()
+    private static void CopyVerbatimEnvironment(ProcessStartInfo psi, string variableName)
     {
-        Process? ownedProcess = _process;
-        int pid = SafeGetPid(ownedProcess);
-
-        try
-        {
-            ownedProcess?.Kill(entireProcessTree: true);
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            ownedProcess?.Dispose();
-        }
-        catch
-        {
-        }
-
-        if (ownedProcess is not null)
-        {
-            TinyIpcLogger.Info(
-                nameof(UnixSidecarProcessManager),
-                "HelperStopped",
-                "Stopped owned native sidecar helper.",
-                ("pid", pid));
-        }
-
-        _process = null;
-        _port = 0;
-        _stdoutLogPath = null;
-        _stderrLogPath = null;
+        string? value = Environment.GetEnvironmentVariable(variableName);
+        if (!string.IsNullOrWhiteSpace(value))
+            psi.Environment[variableName] = value;
     }
 
-    private static string ReadLogSnippet(string? path)
+    private static void CopyPathEnvironment(ProcessStartInfo psi, string variableName)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            return "<missing>";
-
-        try
-        {
-            return File.ReadAllText(path);
-        }
-        catch (Exception ex)
-        {
-            return "<unreadable:" + ex.GetType().Name + ">";
-        }
+        string? value = Environment.GetEnvironmentVariable(variableName);
+        if (!string.IsNullOrWhiteSpace(value))
+            psi.Environment[variableName] = ResolveUnixPath(value);
     }
 
-    private static string? FirstExistingPath(params string?[] paths)
+    private static string ResolveNativePath(string rawPath)
     {
-        foreach (string? path in paths)
+        RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+        if (runtime.IsWindowsProcess)
         {
-            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
-                return path;
+            string windowsPath = ConvertUnixPathToWindows(rawPath);
+            return Path.IsPathRooted(windowsPath) ? windowsPath : Path.GetFullPath(windowsPath);
         }
 
-        return null;
+        string unixPath = ConvertWindowsPathToUnix(rawPath);
+        return Path.IsPathRooted(unixPath) ? unixPath : Path.GetFullPath(unixPath);
     }
 
-    private enum StartupMode
+    private static string ResolveUnixPath(string rawPath)
     {
-        Shell,
-        CmdUnix
+        string unixPath = ConvertWindowsPathToUnix(rawPath);
+        return Path.IsPathRooted(unixPath) ? unixPath : Path.GetFullPath(unixPath);
     }
+
+    private static string ConvertUnixPathForChild(string path)
+    {
+        return ResolveUnixPath(path);
+    }
+
+    private static string ConvertWindowsPathToUnix(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path;
+
+        string normalized = path.Replace('\\', '/');
+        if (normalized.Length >= 3 &&
+            char.IsLetter(normalized[0]) &&
+            normalized[1] == ':' &&
+            normalized[2] == '/')
+        {
+            char drive = char.ToUpperInvariant(normalized[0]);
+            string remainder = normalized[3..];
+            return drive == 'Z' ? "/" + remainder : $"/mnt/{char.ToLowerInvariant(drive)}/{remainder}";
+        }
+
+        return normalized;
+    }
+
+    private static string ConvertUnixPathToWindows(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path;
+
+        if (IsWindowsStylePath(path))
+            return path.Replace('/', '\\');
+
+        string normalized = path.Replace('\\', '/');
+        if (normalized[0] == '/')
+            return "Z:" + normalized.Replace('/', '\\');
+
+        return path.Replace('/', '\\');
+    }
+
+    private static string ConvertUnixPathToWine(string path)
+        => "Z:" + path.Replace('/', '\\');
+
+    private static string CombineUnixPath(string directory, string fileName)
+    {
+        string normalizedDirectory = ResolveUnixPath(directory).TrimEnd('/');
+        return normalizedDirectory.Length == 0 ? "/" + fileName : normalizedDirectory + "/" + fileName;
+    }
+
+    private static bool IsWindowsStylePath(string path)
+        => !string.IsNullOrWhiteSpace(path)
+           && path.Length >= 3
+           && char.IsLetter(path[0])
+           && path[1] == ':'
+           && (path[2] == '\\' || path[2] == '/');
+
+    private static string QuoteForShell(string value)
+        => "'" + value.Replace("'", "'\"'\"'") + "'";
 
     internal readonly struct Lease : IDisposable
     {
-        internal Lease(int port) => Port = port;
-        internal int Port { get; }
+        internal Lease(string socketPath) => SocketPath = socketPath;
+        internal string SocketPath { get; }
         public void Dispose() => Release();
     }
 }
