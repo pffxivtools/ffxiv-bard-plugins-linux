@@ -1,0 +1,107 @@
+name: Publish Semver
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semver tag to publish, without a v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-semver-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish semver release
+    runs-on: ubuntu-latest
+
+    env:
+      DOTNET_NOLOGO: true
+      RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Generate release assets and manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SCHEME: semver
+        run: bash scripts/publish-release.sh
+
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: contoso-bot # Recommended: use a secret like ${{ secrets.NUGET_USER }} for your nuget.org username (profile name), NOT your email address
+
+      - name: Publish NuGet packages
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(dist/github/assets/*.nupkg)
+          if [[ "${#packages[@]}" -eq 0 ]]; then
+            echo "No NuGet packages were generated"
+            exit 1
+          fi
+
+          dotnet nuget push "${packages[@]}" \
+            --api-key "${{steps.login.outputs.NUGET_API_KEY}}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          release="$(jq -c '.releases[0]' dist/github/metadata/releases.json)"
+          tag="$(jq -r '.tag' <<<"${release}")"
+          title="$(jq -r '.title' <<<"${release}")"
+          notes_file="$(mktemp)"
+          jq -r '.notes' <<<"${release}" > "${notes_file}"
+          mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --clobber
+            gh release edit "${tag}" --title "${title}" --notes-file "${notes_file}"
+          else
+            gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}"
+          fi
+
+      - name: Commit pluginmaster.json to default branch
+        shell: bash
+        run: |
+          cp dist/github/pluginmaster.json "${RUNNER_TEMP}/pluginmaster.json"
+          git fetch origin "${DEFAULT_BRANCH}"
+          git checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+          cp "${RUNNER_TEMP}/pluginmaster.json" pluginmaster.json
+
+          if git diff --quiet -- pluginmaster.json; then
+            echo "pluginmaster.json unchanged"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git commit -m "Update pluginmaster.json for ${RELEASE_VERSION}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"

@@ -4,8 +4,11 @@
     <AssemblyName>TinyIpc</AssemblyName>
     <RootNamespace>TinyIpc</RootNamespace>
     <PackageId>TinyIpc.Shim</PackageId>
-    <Description>TinyIpc shim focused on Unix direct shared-memory and sidecar-backed shared-memory
-      transports.</Description>
+    <Authors>TinyIpc.Shim</Authors>
+    <Description>TinyIpc-compatible public API backed by the XivIpc Unix shared-file and sidecar transports.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>tinyipc;ipc;linux;wine;proton</PackageTags>
+    <RepositoryType>git</RepositoryType>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TinyIpcAbiFlavor Condition="'$(TinyIpcAbiFlavor)' == ''">compat</TinyIpcAbiFlavor>
   </PropertyGroup>
@@ -40,5 +43,9 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="9.0.0" />
     <PackageReference Include="System.Memory.Data" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,95 @@
+name: Publish Plugins
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: Which plugin(s) to publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - BardToolbox
+          - MidiBard2
+          - MasterOfPuppets
+      force:
+        description: Re-upload the asset if the release already exists
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-plugins
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish plugin tracking releases
+    runs-on: ubuntu-latest
+
+    env:
+      DOTNET_NOLOGO: true
+      TOOL_SELECTION: ${{ github.event_name == 'workflow_dispatch' && inputs.tool || 'all' }}
+      FORCE_REPUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Generate plugin assets and manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SCHEME: plugins
+        run: bash scripts/publish-release.sh
+
+      - name: Publish GitHub releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          force="$(printf '%s' "${FORCE_REPUBLISH}" | tr '[:upper:]' '[:lower:]')"
+          jq -c '.releases[]' dist/github/metadata/releases.json | while IFS= read -r release; do
+            tag="$(jq -r '.tag' <<<"${release}")"
+            title="$(jq -r '.title' <<<"${release}")"
+            notes_file="$(mktemp)"
+            jq -r '.notes' <<<"${release}" > "${notes_file}"
+            mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
+
+            if gh release view "${tag}" >/dev/null 2>&1; then
+              if [[ "${force}" == "true" ]]; then
+                gh release upload "${tag}" "${assets[@]}" --clobber
+                gh release edit "${tag}" --title "${title}" --notes-file "${notes_file}"
+              else
+                echo "Release ${tag} already exists; skipping upload"
+              fi
+            else
+              gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}"
+            fi
+          done
+
+      - name: Commit updated pluginmaster.json
+        shell: bash
+        run: |
+          if git diff --quiet -- pluginmaster.json; then
+            echo "pluginmaster.json unchanged"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git commit -m "Update pluginmaster.json"
+          git push

@@ -137,10 +137,16 @@ scripts/publish-local.sh
 Dalamud publish packaging:
 
 ```bash
-scripts/publish-dalamud.sh
+PUBLISH_SCHEME=plugins GITHUB_REPOSITORY=owner/repo scripts/publish-release.sh
 ```
 
-Those scripts also stage `XivIpc.NativeHost` into the shared directory. In brokered sidecar mode, staged directories and files should be group-owned and non-world-accessible.
+Semver asset packaging:
+
+```bash
+PUBLISH_SCHEME=semver RELEASE_VERSION=1.2.3 GITHUB_REPOSITORY=owner/repo scripts/publish-release.sh
+```
+
+`scripts/publish-local.sh` still stages `XivIpc.NativeHost` into the shared directory. In brokered sidecar mode, staged directories and files should be group-owned and non-world-accessible.
 
 ## Troubleshooting
 

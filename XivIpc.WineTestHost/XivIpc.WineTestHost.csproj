@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Description>Windows-side test client used under Wine and Proton to validate the public TinyIpc shim.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TinyIpc.Shim\TinyIpc.Shim.csproj" />
