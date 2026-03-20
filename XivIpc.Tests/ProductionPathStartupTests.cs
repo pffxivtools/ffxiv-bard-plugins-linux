@@ -16,13 +16,14 @@ public sealed class ProductionPathStartupTests
         using var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, 4096), disposeFile: true);
 
         scope.WaitForSocket();
+        string clientLog = scope.WaitForClientLog("BrokerLaunchPrepared");
+        string nativeLog = scope.WaitForUnixProcessLog("BrokerStartupObservedEnvironment");
 
-        string clientLog = scope.ReadLatestLogOrEmpty();
-        string nativeLog = scope.ReadLatestUnixProcessLogOrEmpty();
         ProductionPathTestEnvironment.AssertStartedSidecar(clientLog);
         ProductionPathTestEnvironment.AssertHealthyNativeBrokerLog(nativeLog);
         ProductionPathTestEnvironment.AssertLaunchContract(clientLog, nativeLog, scope.UnixSharedDirectory, scope.SocketPath, scope.StagedHostPath);
         Assert.True(File.Exists(scope.SocketPath));
+        scope.WaitForStateFile();
         Assert.True(File.Exists(scope.StatePath));
         Assert.Empty(scope.FindSharedFiles("tinyipc_sidecar-startup_*.bin"));
         Assert.Empty(scope.FindSharedFiles("tinyipc_mmf_*.bin"));
@@ -36,10 +37,12 @@ public sealed class ProductionPathStartupTests
 
         scope.WaitForSocket();
 
-        string nativeLog = scope.ReadLatestUnixProcessLogOrEmpty();
+        string clientLog = scope.WaitForClientLog("BrokerLaunchPrepared");
+        string nativeLog = scope.WaitForUnixProcessLog("BrokerStartupObservedEnvironment");
         ProductionPathTestEnvironment.AssertHealthyNativeBrokerLog(nativeLog);
-        ProductionPathTestEnvironment.AssertLaunchContract(scope.ReadLatestLogOrEmpty(), nativeLog, scope.UnixSharedDirectory, scope.SocketPath, scope.StagedHostPath);
+        ProductionPathTestEnvironment.AssertLaunchContract(clientLog, nativeLog, scope.UnixSharedDirectory, scope.SocketPath, scope.StagedHostPath);
         Assert.True(File.Exists(scope.SocketPath));
+        scope.WaitForStateFile();
         Assert.True(File.Exists(scope.StatePath));
     }
 
@@ -49,8 +52,8 @@ public sealed class ProductionPathStartupTests
         using TestEnvironmentScope scope = new(StagedHostMode.Invalid);
         using var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, 4096), disposeFile: true);
 
-        string log = scope.ReadLatestLogOrEmpty();
-        ProductionPathTestEnvironment.AssertBrokerRequiredNoOp(log);
+        string log = scope.WaitForClientLog("ReconnectAttemptFailed");
+        ProductionPathTestEnvironment.AssertSidecarReconnectFailureLogged(log);
         Assert.False(File.Exists(scope.SocketPath));
         Assert.False(File.Exists(scope.StatePath));
         Assert.Empty(scope.FindSharedFiles("tinyipc_sidecar-startup_*.bin"));
@@ -63,8 +66,8 @@ public sealed class ProductionPathStartupTests
         using TestEnvironmentScope scope = new(StagedHostMode.Invalid, setSharedGroup: false);
         using var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, 4096), disposeFile: true);
 
-        string log = scope.ReadLatestLogOrEmpty();
-        ProductionPathTestEnvironment.AssertFellBackToDirect(log);
+        string log = scope.WaitForClientLog("ReconnectAttemptFailed");
+        ProductionPathTestEnvironment.AssertSidecarReconnectFailureLogged(log);
         Assert.False(File.Exists(scope.SocketPath));
         Assert.False(File.Exists(scope.StatePath));
         Assert.Empty(scope.FindSharedFiles("tinyipc_sidecar-startup_*.bin"));
@@ -170,11 +173,67 @@ public sealed class ProductionPathStartupTests
             throw new TimeoutException($"Expected broker socket '{SocketPath}' to become connectable.", last);
         }
 
+        public void WaitForStateFile()
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (File.Exists(StatePath))
+                    return;
+
+                Thread.Sleep(50);
+            }
+
+            throw new TimeoutException($"Expected broker state file '{StatePath}' to be created.");
+        }
+
         public string ReadLatestLogOrEmpty()
             => ProductionPathTestEnvironment.ReadLatestClientLogOrEmpty(UnixSharedDirectory);
 
         public string ReadLatestUnixProcessLogOrEmpty()
             => ProductionPathTestEnvironment.ReadLatestUnixProcessLogOrEmpty(UnixSharedDirectory);
+
+        public string ReadAllLogsOrEmpty()
+        {
+            if (!Directory.Exists(UnixSharedDirectory))
+                return string.Empty;
+
+            return string.Join(
+                Environment.NewLine,
+                Directory.EnumerateFiles(UnixSharedDirectory, "tinyipc-*.log", SearchOption.TopDirectoryOnly)
+                    .OrderBy(path => path, StringComparer.Ordinal)
+                    .Select(static path => File.ReadAllText(path)));
+        }
+
+        public string WaitForClientLog(string marker)
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                string log = ReadAllLogsOrEmpty();
+                if (log.Contains(marker, StringComparison.Ordinal))
+                    return log;
+
+                Thread.Sleep(50);
+            }
+
+            return ReadAllLogsOrEmpty();
+        }
+
+        public string WaitForUnixProcessLog(string marker)
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                string log = ReadLatestUnixProcessLogOrEmpty();
+                if (log.Contains(marker, StringComparison.Ordinal))
+                    return log;
+
+                Thread.Sleep(50);
+            }
+
+            return ReadLatestUnixProcessLogOrEmpty();
+        }
 
         public string[] FindSharedFiles(string pattern)
             => Directory.Exists(UnixSharedDirectory)

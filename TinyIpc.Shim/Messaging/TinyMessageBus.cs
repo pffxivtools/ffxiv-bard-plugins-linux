@@ -11,7 +11,8 @@ namespace TinyIpc.Messaging;
 
 public sealed class TinyMessageBus : ITinyMessageBus
 {
-    private readonly IShimTinyMessageBus _impl;
+    private readonly object _implGate = new();
+    private IShimTinyMessageBus _impl;
     private long _messagesPublished;
     private long _messagesReceived;
     private bool _disposed;
@@ -100,9 +101,25 @@ public sealed class TinyMessageBus : ITinyMessageBus
             throw new ArgumentException("TinyMessageBus requires the TinyIpc.Shim TinyMemoryMappedFile implementation.", nameof(memoryMappedFile));
 
         Name = shimFile.Name;
-        ChannelInfo channelInfo = new ChannelInfo(Name ?? throw new InvalidOperationException("Memory-mapped file must have a name."),
-            checked((int)shimFile.DeclaredMaxFileSize));
-        _impl = UnixMessageBusBackendFactory.Create(channelInfo);
+        try
+        {
+            ChannelInfo channelInfo = new ChannelInfo(Name ?? throw new InvalidOperationException("Memory-mapped file must have a name."),
+                checked((int)shimFile.DeclaredMaxFileSize));
+            _impl = UnixMessageBusBackendFactory.Create(channelInfo);
+            _impl.MessageReceived += OnImplMessageReceived;
+        }
+        catch (Exception ex)
+        {
+            _impl = CreateDisabledImpl("Constructor", "TinyMessageBus initialization failed and the bus was disabled.", ex);
+            _impl.MessageReceived += OnImplMessageReceived;
+        }
+    }
+
+    internal TinyMessageBus(string name, IShimTinyMessageBus impl)
+    {
+        TinyIpcLogger.EnsureInitialized(RuntimeEnvironmentDetector.Detect());
+        Name = name ?? throw new ArgumentNullException(nameof(name));
+        _impl = impl ?? throw new ArgumentNullException(nameof(impl));
         _impl.MessageReceived += OnImplMessageReceived;
     }
 
@@ -117,8 +134,16 @@ public sealed class TinyMessageBus : ITinyMessageBus
     public void ResetMetrics()
     {
         ThrowIfDisposed();
-        Interlocked.Exchange(ref _messagesPublished, 0);
-        Interlocked.Exchange(ref _messagesReceived, 0);
+
+        try
+        {
+            Interlocked.Exchange(ref _messagesPublished, 0);
+            Interlocked.Exchange(ref _messagesReceived, 0);
+        }
+        catch (Exception ex)
+        {
+            HandleEntryPointFailure("ResetMetrics", ex);
+        }
     }
 
     public Task PublishAsync(byte[] message)
@@ -197,8 +222,26 @@ public sealed class TinyMessageBus : ITinyMessageBus
 
         try
         {
-            while (await channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            while (true)
             {
+                bool canRead;
+                try
+                {
+                    canRead = await channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    HandleEntryPointFailure("SubscribeAsync", ex);
+                    yield break;
+                }
+
+                if (!canRead)
+                    break;
+
                 while (channel.Reader.TryRead(out IReadOnlyList<byte> item))
                     yield return item;
             }
@@ -230,8 +273,26 @@ public sealed class TinyMessageBus : ITinyMessageBus
 
         try
         {
-            while (await channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            while (true)
             {
+                bool canRead;
+                try
+                {
+                    canRead = await channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    HandleEntryPointFailure("SubscribeAsync", ex);
+                    yield break;
+                }
+
+                if (!canRead)
+                    break;
+
                 while (channel.Reader.TryRead(out BinaryData item))
                     yield return item;
             }
@@ -250,8 +311,24 @@ public sealed class TinyMessageBus : ITinyMessageBus
             return;
 
         _disposed = true;
-        _impl.MessageReceived -= OnImplMessageReceived;
-        _impl.Dispose();
+        IShimTinyMessageBus impl = GetCurrentImpl();
+        try
+        {
+            impl.MessageReceived -= OnImplMessageReceived;
+        }
+        catch (Exception ex)
+        {
+            LogDisposeFailure("Dispose", ex, impl);
+        }
+
+        try
+        {
+            impl.Dispose();
+        }
+        catch (Exception ex)
+        {
+            LogDisposeFailure("Dispose", ex, impl);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -260,20 +337,58 @@ public sealed class TinyMessageBus : ITinyMessageBus
             return;
 
         _disposed = true;
-        _impl.MessageReceived -= OnImplMessageReceived;
-        await _impl.DisposeAsync().ConfigureAwait(false);
+        IShimTinyMessageBus impl = GetCurrentImpl();
+
+        try
+        {
+            impl.MessageReceived -= OnImplMessageReceived;
+        }
+        catch (Exception ex)
+        {
+            LogDisposeFailure("DisposeAsync", ex, impl);
+        }
+
+        try
+        {
+            await impl.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogDisposeFailure("DisposeAsync", ex, impl);
+        }
     }
 
     private async Task PublishCoreAsync(byte[] message)
     {
-        await _impl.PublishAsync(message).ConfigureAwait(false);
-        Interlocked.Increment(ref _messagesPublished);
+        try
+        {
+            await GetCurrentImpl().PublishAsync(message).ConfigureAwait(false);
+            Interlocked.Increment(ref _messagesPublished);
+        }
+        catch (Exception ex)
+        {
+            HandleEntryPointFailure("PublishAsync", ex);
+        }
     }
 
     private void OnImplMessageReceived(object? sender, TinyMessageReceivedEventArgs e)
     {
         Interlocked.Increment(ref _messagesReceived);
-        MessageReceived?.Invoke(this, e);
+
+        try
+        {
+            MessageReceived?.Invoke(this, e);
+        }
+        catch (Exception ex)
+        {
+            TinyIpcLogger.Error(
+                nameof(TinyMessageBus),
+                "ShimMessageReceivedHandlerFailed",
+                "A TinyIpc message handler threw while processing a received message.",
+                ex,
+                ("channel", Name),
+                ("backendType", sender?.GetType().FullName ?? string.Empty));
+        }
     }
 
 #if !TINYIPC_ABI_4X
@@ -291,6 +406,99 @@ public sealed class TinyMessageBus : ITinyMessageBus
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(TinyMessageBus));
+    }
+
+    private IShimTinyMessageBus GetCurrentImpl()
+    {
+        lock (_implGate)
+            return _impl;
+    }
+
+    internal Task WaitForConnectedForDiagnosticsAsync(TimeSpan timeout)
+    {
+        IShimTinyMessageBus impl = GetCurrentImpl();
+        if (impl is XivMessageBusAdapter adapter)
+            return adapter.WaitForConnectedForDiagnosticsAsync(timeout);
+
+        return Task.CompletedTask;
+    }
+
+    private DisabledShimMessageBus CreateDisabledImpl(string entryPoint, string reason, Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            nameof(TinyMessageBus),
+            "ShimEntryPointFailed",
+            "A TinyIpc shim entrypoint failed.",
+            ex,
+            ("channel", Name),
+            ("entryPoint", entryPoint),
+            ("backendType", _impl?.GetType().FullName ?? string.Empty),
+            ("alreadyDisabled", _impl is DisabledShimMessageBus));
+
+        var disabled = new DisabledShimMessageBus(Name ?? string.Empty, reason, ex);
+        TinyIpcLogger.Warning(
+            nameof(TinyMessageBus),
+            "ShimDegradedToDisabled",
+            "TinyIpc degraded this bus instance into disabled/no-op behavior after an entrypoint failure.",
+            ex,
+            ("channel", Name),
+            ("entryPoint", entryPoint));
+        return disabled;
+    }
+
+    private void HandleEntryPointFailure(string entryPoint, Exception ex)
+    {
+        IShimTinyMessageBus? previousImpl = null;
+
+        lock (_implGate)
+        {
+            if (_impl is DisabledShimMessageBus)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(TinyMessageBus),
+                    "ShimEntryPointFailed",
+                    "A TinyIpc shim entrypoint failed while the bus was already disabled.",
+                    ex,
+                    ("channel", Name),
+                    ("entryPoint", entryPoint),
+                    ("backendType", _impl.GetType().FullName ?? string.Empty),
+                    ("alreadyDisabled", true));
+                return;
+            }
+
+            previousImpl = _impl;
+            try
+            {
+                previousImpl.MessageReceived -= OnImplMessageReceived;
+            }
+            catch
+            {
+            }
+
+            _impl = CreateDisabledImpl(entryPoint, $"TinyIpc entrypoint '{entryPoint}' failed and the bus was disabled.", ex);
+            _impl.MessageReceived += OnImplMessageReceived;
+        }
+
+        try
+        {
+            previousImpl?.Dispose();
+        }
+        catch (Exception disposeEx)
+        {
+            LogDisposeFailure(entryPoint, disposeEx, previousImpl);
+        }
+    }
+
+    private void LogDisposeFailure(string entryPoint, Exception ex, IShimTinyMessageBus? impl)
+    {
+        TinyIpcLogger.Warning(
+            nameof(TinyMessageBus),
+            "ShimDisposeFailed",
+            "TinyIpc encountered a backend cleanup failure while disposing a bus instance.",
+            ex,
+            ("channel", Name),
+            ("entryPoint", entryPoint),
+            ("backendType", impl?.GetType().FullName ?? string.Empty));
     }
 }
 
@@ -324,6 +532,14 @@ internal sealed class XivMessageBusAdapter : IShimTinyMessageBus
     {
         _inner.MessageReceived -= OnInnerMessageReceived;
         return _inner.DisposeAsync();
+    }
+
+    internal Task WaitForConnectedForDiagnosticsAsync(TimeSpan timeout)
+    {
+        if (_inner is UnixSidecarTinyMessageBus sidecar)
+            return sidecar.WaitForConnectedForDiagnosticsAsync(timeout);
+
+        return Task.CompletedTask;
     }
 
     private void OnInnerMessageReceived(object? sender, XivMessageReceivedEventArgs e)

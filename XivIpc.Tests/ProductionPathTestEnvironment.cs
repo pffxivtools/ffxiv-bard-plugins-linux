@@ -167,15 +167,7 @@ internal static class ProductionPathTestEnvironment
     }
 
     internal static string ReadLatestClientLogOrEmpty(string unixLogDirectory)
-    {
-        string? path = FindLatestLogContaining(
-            unixLogDirectory,
-            "event=BrokerLaunchPrepared",
-            "event=AutoBrokerRequiredFailed",
-            "event=AutoFallbackToDirect",
-            "event=Disabled");
-        return path is null ? string.Empty : File.ReadAllText(path);
-    }
+        => ReadLatestWindowsProcessLogOrEmpty(unixLogDirectory);
 
     internal static string? FindLatestUnixProcessLogFile(string unixLogDirectory)
     {
@@ -261,16 +253,13 @@ internal static class ProductionPathTestEnvironment
             Assert.Equal(expectedLaunchId, ExtractField(nativeLogContents, "event=BrokerStartupObservedEnvironment", "launchId"));
     }
 
-    internal static void AssertFellBackToDirect(string logContents)
+    internal static void AssertSidecarReconnectFailureLogged(string logContents)
     {
-        Assert.Contains("AutoFallbackToDirect", logContents, StringComparison.Ordinal);
-        Assert.Contains("UnixInMemoryTinyMessageBus", logContents, StringComparison.Ordinal);
-    }
-
-    internal static void AssertBrokerRequiredNoOp(string logContents)
-    {
-        Assert.Contains("AutoBrokerRequiredFailed", logContents, StringComparison.Ordinal);
-        Assert.Contains("DisabledShimMessageBus", logContents, StringComparison.Ordinal);
+        Assert.Contains("event=InitialConnectScheduled", logContents, StringComparison.Ordinal);
+        Assert.Contains("event=ReconnectAttemptFailed", logContents, StringComparison.Ordinal);
+        Assert.DoesNotContain("AutoFallbackToDirect", logContents, StringComparison.Ordinal);
+        Assert.DoesNotContain("AutoBrokerRequiredFailed", logContents, StringComparison.Ordinal);
+        Assert.DoesNotContain("DisabledShimMessageBus", logContents, StringComparison.Ordinal);
         Assert.DoesNotContain("UnixInMemoryTinyMessageBus", logContents, StringComparison.Ordinal);
     }
 

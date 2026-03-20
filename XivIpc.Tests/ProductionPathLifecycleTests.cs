@@ -59,13 +59,16 @@ public sealed class ProductionPathLifecycleTests
     public async Task LargerRequestedCapacity_WhileBrokerLive_UsesLoggedNoOpBus()
     {
         using TestEnvironmentScope scope = new();
-        using var smaller = scope.CreateBus(maxPayloadBytes: 1024);
+        using var smaller = scope.CreateBus(maxPayloadBytes: 64 * 1024);
         await scope.WaitForLiveSocketAsync();
+        await smaller.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10));
 
-        using var larger = scope.CreateBus(maxPayloadBytes: 4096);
+        using var larger = scope.CreateBus(maxPayloadBytes: 128 * 1024);
+        await Task.Delay(500);
 
-        string log = scope.ReadLatestLogOrEmpty();
-        ProductionPathTestEnvironment.AssertBrokerRequiredNoOp(log);
+        string log = scope.ReadAllLogsOrEmpty();
+        Assert.Contains("AttachRejectedByBroker", log, StringComparison.Ordinal);
+        Assert.Contains("smaller than requested", log, StringComparison.OrdinalIgnoreCase);
         Assert.True(File.Exists(scope.SocketPath));
     }
 
@@ -98,6 +101,10 @@ public sealed class ProductionPathLifecycleTests
         => Inner.LargeRequestedBuffer_IsBudgetedWithoutOverflow(ProductionPathTestEnvironment.BackendName);
 
     [Fact]
+    public Task RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail()
+        => Inner.RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail(ProductionPathTestEnvironment.BackendName);
+
+    [Fact]
     public Task RawUdsClient_CanPublishToTinyMessageBusSubscriber()
         => Inner.RawUdsClient_CanPublishToTinyMessageBusSubscriber(ProductionPathTestEnvironment.BackendName);
 
@@ -119,8 +126,11 @@ public sealed class ProductionPathLifecycleTests
         using TestEnvironmentScope scope = new(sharedGroup: "group-that-should-not-exist");
         using var bus = scope.CreateBus();
 
-        string log = scope.ReadLatestLogOrEmpty();
-        ProductionPathTestEnvironment.AssertBrokerRequiredNoOp(log);
+        Thread.Sleep(500);
+        string log = scope.ReadAllLogsOrEmpty();
+        Assert.Contains("event=ReconnectAttemptFailed", log, StringComparison.Ordinal);
+        Assert.Contains("could not be resolved", log, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("event=ReconnectSucceeded", log, StringComparison.Ordinal);
         Assert.False(File.Exists(scope.SocketPath));
     }
 
@@ -170,7 +180,7 @@ public sealed class ProductionPathLifecycleTests
         public string SharedDirectory { get; }
         public string SocketPath { get; }
 
-        public TinyMessageBus CreateBus(int maxPayloadBytes = 1024)
+        public TinyMessageBus CreateBus(int maxPayloadBytes = 64 * 1024)
             => new(new TinyMemoryMappedFile(ChannelName, maxPayloadBytes), disposeFile: true);
 
         public async Task WaitForLiveSocketAsync()
@@ -202,6 +212,18 @@ public sealed class ProductionPathLifecycleTests
 
         public string ReadLatestLogOrEmpty()
             => ProductionPathTestEnvironment.ReadLatestLogOrEmpty(SharedDirectory);
+
+        public string ReadAllLogsOrEmpty()
+        {
+            if (!Directory.Exists(SharedDirectory))
+                return string.Empty;
+
+            return string.Join(
+                Environment.NewLine,
+                Directory.EnumerateFiles(SharedDirectory, "tinyipc-*.log", SearchOption.TopDirectoryOnly)
+                    .OrderBy(path => path, StringComparer.Ordinal)
+                    .Select(static path => File.ReadAllText(path)));
+        }
 
         public void Dispose()
         {

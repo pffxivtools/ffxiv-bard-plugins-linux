@@ -41,23 +41,11 @@ internal static class UnixMessageBusBackendFactory
     private static IShimTinyMessageBus CreateAuto(ChannelInfo channelInfo)
     {
         bool brokerRequired = IsBrokerRequiredForAuto();
-        Exception? sidecarFailure = null;
-        try
+        bool nativeHostAvailable = UnixSidecarProcessManager.TryResolveNativeHostPath(out _);
+
+        if (brokerRequired || nativeHostAvailable)
         {
             return CreateSidecar(channelInfo);
-        }
-        catch (Exception ex)
-        {
-            sidecarFailure = ex;
-            LogAutoSidecarFailure(channelInfo, ex, brokerRequired);
-
-            if (brokerRequired)
-            {
-                return new DisabledShimMessageBus(
-                    channelInfo.Name,
-                    "Brokered startup was required for this process and sidecar initialization failed.",
-                    ex);
-            }
         }
 
         try
@@ -80,7 +68,7 @@ internal static class UnixMessageBusBackendFactory
                 "Auto backend could not initialize either sidecar or direct/in-memory backend.",
                 new AggregateException(
                     "TinyIpc backend startup failures.",
-                    sidecarFailure ?? new InvalidOperationException("Unknown sidecar startup failure."),
+                    new InvalidOperationException("Sidecar backend was not selected for this auto-start path."),
                     directEx));
         }
     }

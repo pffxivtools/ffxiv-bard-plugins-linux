@@ -91,6 +91,16 @@ try
             }
             catch (Exception ex)
             {
+                TinyIpcLogger.Error(
+                    "NativeHost",
+                    "SessionProcessingFailed",
+                    "Broker session processing failed.",
+                    ex,
+                    ("hasSession", session is not null),
+                    ("sessionId", session?.SessionId ?? 0),
+                    ("channel", session?.Channel ?? string.Empty),
+                    ("peerUid", session?.PeerCredentials.Uid ?? 0),
+                    ("peerGid", session?.PeerCredentials.Gid ?? 0));
                 try
                 {
                     SidecarProtocol.WriteError(socket, ex.Message);
@@ -240,7 +250,22 @@ async Task ProcessSessionAsync(BrokerSession session, CancellationToken cancella
             case SidecarFrameType.Publish:
                 session.TouchHeartbeat();
                 if (channels.TryGetValue(session.Channel, out BrokerChannel? publishChannel))
+                {
                     publishChannel.Publish(session, frame.Payload.ToArray());
+                }
+                else
+                {
+                    TinyIpcLogger.Warning(
+                        "NativeHost",
+                        "PublishChannelMissing",
+                        "Received a publish for a channel that no longer has a live broker ring.",
+                        null,
+                        ("sessionId", session.SessionId),
+                        ("channel", session.Channel),
+                        ("payloadLength", frame.Payload.Length));
+                    session.MarkDead();
+                    return;
+                }
                 break;
 
             case SidecarFrameType.Heartbeat:
@@ -369,7 +394,7 @@ static uint? ResolveGroupId(string groupName)
 static int ResolveSlotCount()
 {
     string? raw = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SLOT_COUNT");
-    return int.TryParse(raw, out int value) && value >= 8 ? value : 256;
+    return int.TryParse(raw, out int value) && value >= 8 ? value : 64;
 }
 
 static TimeSpan ResolveIdleShutdownDelay()
@@ -473,6 +498,9 @@ sealed class BrokerChannel : IDisposable
     private readonly object _gate = new();
     private readonly Dictionary<long, BrokerSession> _sessions = new();
     private readonly string _ringPath;
+    private long _publishCount;
+    private long _overwriteCount;
+    private long _peakRetainedDepth;
 
     public BrokerChannel(string channelName, int requestedBufferBytes, int slotCount, string brokerDirectory, string instanceId)
     {
@@ -480,6 +508,18 @@ sealed class BrokerChannel : IDisposable
         _ringPath = UnixSharedStorageHelpers.BuildSharedFilePath(brokerDirectory, $"{channelName}_{instanceId}", "broker-ring");
         Sizing = RingSizingPolicy.Compute(requestedBufferBytes, slotCount, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
         Ring = BrokeredChannelRing.Create(_ringPath, Sizing.SlotCount, Sizing.SlotPayloadBytes);
+        TinyIpcLogger.Info(
+            "NativeHost",
+            "ChannelCreated",
+            "Created a broker channel ring with derived sizing.",
+            ("channel", ChannelName),
+            ("requestedBufferBytes", Sizing.RequestedBufferBytes),
+            ("effectiveBudgetBytes", Sizing.BudgetBytes),
+            ("budgetWasCapped", Sizing.WasCapped),
+            ("slotCount", Ring.SlotCount),
+            ("slotPayloadBytes", Ring.SlotPayloadBytes),
+            ("ringLength", Ring.Length),
+            ("ringPath", Ring.FilePath));
     }
 
     public string ChannelName { get; }
@@ -520,11 +560,35 @@ sealed class BrokerChannel : IDisposable
     public void Publish(BrokerSession sender, byte[] payload)
     {
         BrokerSession[] recipients;
+        BrokeredRingPublishResult publishResult;
 
         lock (_gate)
         {
-            Ring.Publish(sender.SessionId, payload);
+            publishResult = Ring.Publish(sender.SessionId, payload);
+            Interlocked.Increment(ref _publishCount);
+            UpdatePeakRetainedDepth(publishResult.RetainedDepth);
+            if (publishResult.OverwroteOldest)
+                Interlocked.Increment(ref _overwriteCount);
             recipients = _sessions.Values.Where(x => !x.IsDead).ToArray();
+        }
+
+        if (publishResult.OverwroteOldest)
+        {
+            TinyIpcLogger.Warning(
+                "NativeHost",
+                "RingOverwriteOccurred",
+                "A broker channel overwrote its oldest retained message to admit a new publish.",
+                null,
+                ("channel", ChannelName),
+                ("senderSessionId", sender.SessionId),
+                ("payloadLength", payload.Length),
+                ("slotCount", Ring.SlotCount),
+                ("slotPayloadBytes", Ring.SlotPayloadBytes),
+                ("headBefore", publishResult.HeadBefore),
+                ("tailBefore", publishResult.TailBefore),
+                ("headAfter", publishResult.HeadAfter),
+                ("tailAfter", publishResult.TailAfter),
+                ("retainedDepth", publishResult.RetainedDepth));
         }
 
         foreach (BrokerSession recipient in recipients)
@@ -533,8 +597,16 @@ sealed class BrokerChannel : IDisposable
             {
                 SidecarProtocol.WriteNotify(recipient.Socket);
             }
-            catch
+            catch (Exception ex)
             {
+                TinyIpcLogger.Warning(
+                    "NativeHost",
+                    "NotifyRecipientFailed",
+                    "Failed to notify a broker session about newly published data.",
+                    ex,
+                    ("channel", ChannelName),
+                    ("recipientSessionId", recipient.SessionId),
+                    ("senderSessionId", sender.SessionId));
                 recipient.MarkDead();
             }
         }
@@ -542,6 +614,23 @@ sealed class BrokerChannel : IDisposable
 
     public void Dispose()
     {
+        TinyIpcLogger.Info(
+            "NativeHost",
+            "ChannelLifetimeSummary",
+            "Completed broker channel lifetime summary.",
+            ("channel", ChannelName),
+            ("requestedBufferBytes", Sizing.RequestedBufferBytes),
+            ("effectiveBudgetBytes", Sizing.BudgetBytes),
+            ("budgetWasCapped", Sizing.WasCapped),
+            ("slotCount", Ring.SlotCount),
+            ("slotPayloadBytes", Ring.SlotPayloadBytes),
+            ("ringLength", Ring.Length),
+            ("currentHead", Ring.CaptureHead()),
+            ("currentTail", Ring.CaptureTail()),
+            ("currentRetainedDepth", Ring.CaptureHead() - Ring.CaptureTail()),
+            ("publishCount", Interlocked.Read(ref _publishCount)),
+            ("overwriteCount", Interlocked.Read(ref _overwriteCount)),
+            ("peakRetainedDepth", Interlocked.Read(ref _peakRetainedDepth)));
         Ring.Dispose();
         try
         {
@@ -551,6 +640,34 @@ sealed class BrokerChannel : IDisposable
         }
         catch
         {
+        }
+    }
+
+    private void UpdatePeakRetainedDepth(int retainedDepth)
+    {
+        long current = Volatile.Read(ref _peakRetainedDepth);
+        while (retainedDepth > current)
+        {
+            long observed = Interlocked.CompareExchange(ref _peakRetainedDepth, retainedDepth, current);
+            if (observed == current)
+            {
+                if (retainedDepth >= Math.Max(1, Ring.SlotCount * 3 / 4))
+                {
+                    TinyIpcLogger.Info(
+                        "NativeHost",
+                        "ChannelHighRetainedDepthObserved",
+                        "Observed a high retained message depth for a broker channel.",
+                        ("channel", ChannelName),
+                        ("retainedDepth", retainedDepth),
+                        ("slotCount", Ring.SlotCount),
+                        ("slotPayloadBytes", Ring.SlotPayloadBytes),
+                        ("publishCount", Interlocked.Read(ref _publishCount)));
+                }
+
+                return;
+            }
+
+            current = observed;
         }
     }
 }

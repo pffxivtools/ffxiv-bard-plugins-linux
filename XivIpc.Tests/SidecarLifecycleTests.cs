@@ -15,6 +15,8 @@ namespace XivIpc.Tests;
 [Collection("TinyIpc Serial")]
 public sealed class SidecarLifecycleTests
 {
+    private const int DefaultRequestedBufferBytes = 64 * 1024;
+
     public static IEnumerable<object[]> Modes()
     {
         yield return new object[] { "sidecar" };
@@ -195,7 +197,7 @@ public sealed class SidecarLifecycleTests
         await scope.WaitForLiveSocketAsync();
 
         using Socket leakedSocket = ConnectRawSocket(scope.SocketPath);
-        _ = AttachRawSession(scope.ChannelName, 1024, leakedSocket);
+        _ = AttachRawSession(scope.ChannelName, DefaultRequestedBufferBytes, leakedSocket);
         await scope.WaitForBrokerStateAsync(state => state.SessionCount == 2);
 
         managedClient.Dispose();
@@ -220,7 +222,7 @@ public sealed class SidecarLifecycleTests
 
         SidecarProtocol.WriteHello(socket, new SidecarHello(
             scope.ChannelName,
-            1024,
+            DefaultRequestedBufferBytes,
             Environment.ProcessId,
             HeartbeatIntervalMs: 100,
             HeartbeatTimeoutMs: 5_000));
@@ -264,13 +266,16 @@ public sealed class SidecarLifecycleTests
     {
         using TestEnvironmentScope scope = new(mode);
 
-        using var smaller = scope.CreateBus(maxPayloadBytes: 1024);
+        using var smaller = scope.CreateBus(maxPayloadBytes: 64 * 1024);
         await scope.WaitForLiveSocketAsync();
+        await smaller.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10));
 
-        InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
-            () => scope.CreateBus(maxPayloadBytes: 4096));
+        using var larger = scope.CreateBus(maxPayloadBytes: 128 * 1024);
+        await Task.Delay(500);
 
-        Assert.Contains("payload capacity", ex.Message, StringComparison.OrdinalIgnoreCase);
+        string logs = scope.ReadAllLogsOrEmpty();
+        Assert.Contains("AttachRejectedByBroker", logs, StringComparison.Ordinal);
+        Assert.Contains("smaller than requested", logs, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -279,16 +284,17 @@ public sealed class SidecarLifecycleTests
     {
         using TestEnvironmentScope scope = new(mode);
 
-        using (TinyMessageBus smaller = scope.CreateBus(maxPayloadBytes: 1024))
+        using (TinyMessageBus smaller = scope.CreateBus(maxPayloadBytes: 64 * 1024))
         {
             await scope.WaitForLiveSocketAsync();
         }
 
         await scope.WaitForBrokerShutdownAsync();
 
-        using var publisher = scope.CreateBus(maxPayloadBytes: 4096);
-        using var subscriber = scope.CreateBus(maxPayloadBytes: 4096);
+        using var publisher = scope.CreateBus(maxPayloadBytes: 128 * 1024);
+        using var subscriber = scope.CreateBus(maxPayloadBytes: 128 * 1024);
         await scope.WaitForLiveSocketAsync();
+        await WaitForConnectedAsync(new[] { publisher, subscriber }, TimeSpan.FromSeconds(10));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         Task<byte[]> receiveTask = ReceiveSingleMessageAsync(subscriber, cts.Token);
@@ -297,7 +303,15 @@ public sealed class SidecarLifecycleTests
         byte[] expected = Enumerable.Range(0, 3072).Select(i => (byte)(i % 251)).ToArray();
         await PublishBytesAsync(publisher, expected);
 
-        byte[] actual = await receiveTask;
+        byte[] actual;
+        try
+        {
+            actual = await receiveTask;
+        }
+        catch (OperationCanceledException ex)
+        {
+            throw new TimeoutException($"Timed out receiving broker-restart message. Logs:{Environment.NewLine}{scope.ReadAllLogsOrEmpty()}", ex);
+        }
         Assert.Equal(expected, actual);
     }
 
@@ -313,7 +327,7 @@ public sealed class SidecarLifecycleTests
 
         SidecarProtocol.WriteHello(socket, new SidecarHello(
             scope.ChannelName,
-            1024,
+            DefaultRequestedBufferBytes,
             Environment.ProcessId,
             HeartbeatIntervalMs: 100,
             HeartbeatTimeoutMs: 500));
@@ -362,12 +376,15 @@ public sealed class SidecarLifecycleTests
     {
         using TestEnvironmentScope scope = new(mode);
 
-        using var channelAPublisher = scope.CreateBus("channel-a", maxPayloadBytes: 1024);
-        using var channelASubscriber = scope.CreateBus("channel-a", maxPayloadBytes: 1024);
-        using var channelBPublisher = scope.CreateBus("channel-b", maxPayloadBytes: 1024);
-        using var channelBSubscriber = scope.CreateBus("channel-b", maxPayloadBytes: 1024);
+        using var channelAPublisher = scope.CreateBus("channel-a", maxPayloadBytes: 64 * 1024);
+        using var channelASubscriber = scope.CreateBus("channel-a", maxPayloadBytes: 64 * 1024);
+        using var channelBPublisher = scope.CreateBus("channel-b", maxPayloadBytes: 64 * 1024);
+        using var channelBSubscriber = scope.CreateBus("channel-b", maxPayloadBytes: 64 * 1024);
 
         await scope.WaitForLiveSocketAsync();
+        await WaitForConnectedAsync(
+            new[] { channelAPublisher, channelASubscriber, channelBPublisher, channelBSubscriber },
+            TimeSpan.FromSeconds(10));
         int pid = UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics();
         Assert.NotEqual(0, pid);
 
@@ -376,14 +393,22 @@ public sealed class SidecarLifecycleTests
             Task<byte[]> receiveTask = ReceiveSingleMessageAsync(channelBSubscriber, cts.Token);
             await Task.Delay(750, cts.Token);
             await PublishBytesAsync(channelBPublisher, Encoding.UTF8.GetBytes("before-recreate"));
-            Assert.Equal(Encoding.UTF8.GetBytes("before-recreate"), await receiveTask);
+            try
+            {
+                Assert.Equal(Encoding.UTF8.GetBytes("before-recreate"), await receiveTask);
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new TimeoutException($"Timed out receiving channel-b pre-recreate message. Logs:{Environment.NewLine}{scope.ReadAllLogsOrEmpty()}", ex);
+            }
         }
 
         channelAPublisher.Dispose();
         channelASubscriber.Dispose();
 
-        using var largerChannelAPublisher = await scope.CreateBusWhenAvailableAsync("channel-a", maxPayloadBytes: 4096);
-        using var largerChannelASubscriber = await scope.CreateBusWhenAvailableAsync("channel-a", maxPayloadBytes: 4096);
+        using var largerChannelAPublisher = await scope.CreateBusWhenAvailableAsync("channel-a", maxPayloadBytes: 128 * 1024);
+        using var largerChannelASubscriber = await scope.CreateBusWhenAvailableAsync("channel-a", maxPayloadBytes: 128 * 1024);
+        await WaitForConnectedAsync(new[] { largerChannelAPublisher, largerChannelASubscriber, channelBPublisher, channelBSubscriber }, TimeSpan.FromSeconds(10));
 
         Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
 
@@ -393,7 +418,14 @@ public sealed class SidecarLifecycleTests
             Task<byte[]> receiveTask = ReceiveSingleMessageAsync(largerChannelASubscriber, cts.Token);
             await Task.Delay(750, cts.Token);
             await PublishBytesAsync(largerChannelAPublisher, payloadA);
-            Assert.Equal(payloadA, await receiveTask);
+            try
+            {
+                Assert.Equal(payloadA, await receiveTask);
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new TimeoutException($"Timed out receiving larger channel-a message. Logs:{Environment.NewLine}{scope.ReadAllLogsOrEmpty()}", ex);
+            }
         }
 
         using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
@@ -401,7 +433,14 @@ public sealed class SidecarLifecycleTests
             Task<byte[]> receiveTask = ReceiveSingleMessageAsync(channelBSubscriber, cts.Token);
             await Task.Delay(750, cts.Token);
             await PublishBytesAsync(channelBPublisher, Encoding.UTF8.GetBytes("after-recreate"));
-            Assert.Equal(Encoding.UTF8.GetBytes("after-recreate"), await receiveTask);
+            try
+            {
+                Assert.Equal(Encoding.UTF8.GetBytes("after-recreate"), await receiveTask);
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new TimeoutException($"Timed out receiving channel-b post-recreate message. Logs:{Environment.NewLine}{scope.ReadAllLogsOrEmpty()}", ex);
+            }
         }
     }
 
@@ -497,73 +536,67 @@ public sealed class SidecarLifecycleTests
         try
         {
             await scope.WaitForLiveSocketAsync();
+            await WaitForConnectedAsync(publishers.Concat(subscribers), TimeSpan.FromSeconds(10));
             int pid = UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics();
             Assert.NotEqual(0, pid);
 
-            var ringPathsByChannel = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
-            using var lease = UnixSidecarProcessManager.Acquire();
-            Socket[] ringSockets = channelNames
-                .Select(_ => ConnectRawSocket(lease.SocketPath))
+            var observedByChannel = channelNames.ToDictionary(
+                static name => name,
+                static _ => new ConcurrentQueue<string>(),
+                StringComparer.Ordinal);
+
+            Task<string[]>[] subscriberTasks = channelNames
+                .Select((channelName, index) => CaptureMessagesAsync(subscribers[index], messagesPerChannel, observedByChannel[channelName], cts.Token))
                 .ToArray();
 
+            await WaitForSubscriptionToSettleAsync(cts.Token);
+
+            var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task[] publisherTasks = channelNames
+                .Select((channelName, index) => Task.Run(async () =>
+                {
+                    await startGate.Task;
+
+                    for (int messageIndex = 0; messageIndex < messagesPerChannel; messageIndex++)
+                    {
+                        string payload = $"ch-{index:D2}-msg-{messageIndex:D4}";
+                        await PublishBytesAsync(publishers[index], Encoding.UTF8.GetBytes(payload));
+
+                        if ((messageIndex % 5) == 0)
+                            await Task.Delay(1, cts.Token);
+                    }
+                }, cts.Token))
+                .ToArray();
+
+            startGate.TrySetResult();
+
+            await Task.WhenAll(publisherTasks);
+
+            string[][] observed;
             try
             {
-                foreach ((string channelName, int index) in channelNames.Select((name, index) => (name, index)))
-                {
-                    SidecarAttachRing attach = AttachRawSession(channelName, requestedBufferBytes, ringSockets[index]);
-                    ringPathsByChannel[channelName] = attach.RingPath;
-                }
-
-                Assert.Equal(channelCount, ringPathsByChannel.Count);
-                Assert.Equal(channelCount, ringPathsByChannel.Values.Distinct(StringComparer.Ordinal).Count());
-                foreach (string ringPath in ringPathsByChannel.Values)
-                    Assert.True(File.Exists(ringPath));
-
-                Task<string[]>[] subscriberTasks = channelNames
-                    .Select((channelName, index) => ReceiveMessagesAsync(subscribers[index], messagesPerChannel, cts.Token))
-                    .ToArray();
-
-                await WaitForSubscriptionToSettleAsync(cts.Token);
-
-                var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                Task[] publisherTasks = channelNames
-                    .Select((channelName, index) => Task.Run(async () =>
-                    {
-                        await startGate.Task;
-
-                        for (int messageIndex = 0; messageIndex < messagesPerChannel; messageIndex++)
-                        {
-                            string payload = $"ch-{index:D2}-msg-{messageIndex:D4}";
-                            await PublishBytesAsync(publishers[index], Encoding.UTF8.GetBytes(payload));
-
-                            if ((messageIndex % 5) == 0)
-                                await Task.Delay(1, cts.Token);
-                        }
-                    }, cts.Token))
-                    .ToArray();
-
-                startGate.TrySetResult();
-
-                await Task.WhenAll(publisherTasks);
-                string[][] observed = await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(30), cts.Token);
-
-                for (int channelIndex = 0; channelIndex < channelCount; channelIndex++)
-                {
-                    string[] expected = Enumerable.Range(0, messagesPerChannel)
-                        .Select(messageIndex => $"ch-{channelIndex:D2}-msg-{messageIndex:D4}")
-                        .ToArray();
-
-                    Assert.Equal(expected, observed[channelIndex]);
-                    Assert.All(observed[channelIndex], message => Assert.StartsWith($"ch-{channelIndex:D2}-", message, StringComparison.Ordinal));
-                }
-
-                Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
+                observed = await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(30), cts.Token);
             }
-            finally
+            catch (TimeoutException ex)
             {
-                foreach (Socket socket in ringSockets)
-                    socket.Dispose();
+                string details = string.Join(
+                    ", ",
+                    channelNames.Select((name, index) =>
+                        $"{name}=observed:{observedByChannel[name].Count}/published:{publishers[index].MessagesPublished}/received:{subscribers[index].MessagesReceived}"));
+                throw new TimeoutException($"Timed out waiting for all channel subscribers. Partial counters: {details}", ex);
             }
+
+            for (int channelIndex = 0; channelIndex < channelCount; channelIndex++)
+            {
+                string[] expected = Enumerable.Range(0, messagesPerChannel)
+                    .Select(messageIndex => $"ch-{channelIndex:D2}-msg-{messageIndex:D4}")
+                    .ToArray();
+
+                Assert.Equal(expected, observed[channelIndex]);
+                Assert.All(observed[channelIndex], message => Assert.StartsWith($"ch-{channelIndex:D2}-", message, StringComparison.Ordinal));
+            }
+
+            Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
         }
         finally
         {
@@ -589,10 +622,62 @@ public sealed class SidecarLifecycleTests
         using Socket socket = ConnectRawSocket(lease.SocketPath);
         SidecarAttachRing attach = AttachRawSession("large-buffer-channel", requestedBufferBytes, socket);
 
-        RingSizing expected = RingSizingPolicy.Compute(requestedBufferBytes, 256, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
+        RingSizing expected = RingSizingPolicy.Compute(requestedBufferBytes, 64, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
         Assert.Equal(expected.SlotPayloadBytes, attach.SlotPayloadBytes);
         Assert.Equal(expected.ImageSize, attach.RingLength);
         Assert.True(File.Exists(attach.RingPath));
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+        const int requestedBufferBytes = 1 << 20;
+
+        using TinyMessageBus publisher = scope.CreateBus("backlog-channel", requestedBufferBytes);
+        await scope.WaitForLiveSocketAsync();
+        await publisher.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(5));
+
+        using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
+        using Socket rawSocket = ConnectRawSocket(lease.SocketPath);
+        SidecarAttachRing attach = AttachRawSession("backlog-channel", requestedBufferBytes, rawSocket);
+        int messageCount = attach.SlotCount + 32;
+
+        for (int index = 0; index < messageCount; index++)
+        {
+            byte[] payload = Encoding.UTF8.GetBytes($"backlog-{index:D3}");
+            await PublishBytesAsync(publisher, payload);
+        }
+
+        using BrokeredChannelRing ring = BrokeredChannelRing.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes);
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (ring.CaptureHead() >= messageCount)
+                break;
+
+            await Task.Delay(25);
+        }
+
+        long nextSequence = 0;
+        BrokeredRingDrainResult drain = ring.Drain(selfSessionId: long.MaxValue, ref nextSequence);
+
+        string[] expected = Enumerable.Range(messageCount - attach.SlotCount, attach.SlotCount)
+            .Select(index => $"backlog-{index:D3}")
+            .ToArray();
+        Assert.Equal(attach.SlotCount, drain.Messages.Count);
+        Assert.Equal(expected, drain.Messages.Select(static payload => Encoding.UTF8.GetString(payload)).ToArray());
+        Assert.True(drain.TailObserved >= messageCount - attach.SlotCount);
+
+        rawSocket.Dispose();
+        publisher.Dispose();
+        await scope.WaitForBrokerShutdownAsync();
+
+        string log = scope.ReadAllLogsOrEmpty();
+        Assert.Contains("event=ChannelCreated", log, StringComparison.Ordinal);
+        Assert.Contains("event=RingOverwriteOccurred", log, StringComparison.Ordinal);
+        Assert.Contains("event=ChannelLifetimeSummary", log, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -604,7 +689,7 @@ public sealed class SidecarLifecycleTests
         await scope.WaitForLiveSocketAsync();
 
         using var socket = ConnectRawSocket(scope.SocketPath);
-        AttachRawSession(scope.ChannelName, 1024, socket);
+        AttachRawSession(scope.ChannelName, DefaultRequestedBufferBytes, socket);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         Task<byte[]> receiveTask = ReceiveSingleMessageAsync(subscriber, cts.Token);
@@ -630,7 +715,7 @@ public sealed class SidecarLifecycleTests
 
         using (Socket socket = ConnectRawSocket(scope.SocketPath))
         {
-            _ = AttachRawSession(scope.ChannelName, 1024, socket);
+            _ = AttachRawSession(scope.ChannelName, DefaultRequestedBufferBytes, socket);
         }
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -710,9 +795,10 @@ public sealed class SidecarLifecycleTests
         using TestEnvironmentScope scope = new(mode);
         scope.SetSharedGroup("tinyipc-group-that-does-not-exist");
 
-        InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() => scope.CreateBus());
-        Assert.Contains("shared group", ex.Message, StringComparison.OrdinalIgnoreCase);
-        await scope.WaitForBrokerShutdownAsync();
+        using var bus = scope.CreateBus();
+        string logs = await scope.WaitForLogMarkerAsync("ReconnectAttemptFailed");
+        Assert.Contains("could not be resolved", logs, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("event=ReconnectSucceeded", logs, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -721,22 +807,23 @@ public sealed class SidecarLifecycleTests
     {
         using TestEnvironmentScope scope = new(mode);
 
-        using (TinyMessageBus firstClient = scope.CreateBus())
-        {
-            await scope.WaitForLiveSocketAsync();
-            int pid = UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics();
-            Assert.NotEqual(0, pid);
+        using UnixSidecarProcessManager.Lease starter = UnixSidecarProcessManager.Acquire();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot liveState = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 0);
+        int pid = liveState.Pid;
+        Assert.NotEqual(0, pid);
 
-            using Process broker = Process.GetProcessById(pid);
+        using (Process broker = Process.GetProcessById(pid))
+        {
             broker.Kill(entireProcessTree: true);
             broker.WaitForExit();
         }
 
-        _ = UnixSidecarProcessManager.WaitForOwnedProcessExitForDiagnostics(TimeSpan.FromSeconds(5));
-
         using var publisher = scope.CreateBus();
         using var subscriber = scope.CreateBus();
         await scope.WaitForLiveSocketAsync();
+        await publisher.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(5));
+        await subscriber.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(5));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         Task<byte[]> receiveTask = ReceiveSingleMessageAsync(subscriber, cts.Token);
@@ -760,7 +847,7 @@ public sealed class SidecarLifecycleTests
 
         SidecarProtocol.WriteHello(socket, new SidecarHello(
             scope.ChannelName,
-            1024,
+            DefaultRequestedBufferBytes,
             Environment.ProcessId,
             HeartbeatIntervalMs: 100,
             HeartbeatTimeoutMs: 5_000));
@@ -788,13 +875,15 @@ public sealed class SidecarLifecycleTests
         throw new InvalidOperationException("SubscribeAsync completed before receiving a message.");
     }
 
-    private static async Task<string[]> ReceiveMessagesAsync(TinyMessageBus bus, int expectedCount, CancellationToken cancellationToken)
+    private static async Task<string[]> ReceiveMessagesAsync(TinyMessageBus bus, int expectedCount, ConcurrentQueue<string> observedMessages, CancellationToken cancellationToken)
     {
         var messages = new List<string>(expectedCount);
 
         await foreach (var item in bus.SubscribeAsync(cancellationToken))
         {
-            messages.Add(Encoding.UTF8.GetString(GetBytes(item)));
+            string message = Encoding.UTF8.GetString(GetBytes(item));
+            messages.Add(message);
+            observedMessages.Enqueue(message);
             if (messages.Count >= expectedCount)
                 break;
         }
@@ -803,6 +892,36 @@ public sealed class SidecarLifecycleTests
             throw new InvalidOperationException($"Expected {expectedCount} messages but observed {messages.Count}.");
 
         return messages.ToArray();
+    }
+
+    private static Task<string[]> CaptureMessagesAsync(TinyMessageBus bus, int expectedCount, ConcurrentQueue<string> observedMessages, CancellationToken cancellationToken)
+    {
+        var messages = new List<string>(expectedCount);
+        var tcs = new TaskCompletionSource<string[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+        EventHandler<TinyMessageReceivedEventArgs>? handler = null;
+
+        handler = (_, args) =>
+        {
+            string message = Encoding.UTF8.GetString(GetBytes(args));
+            observedMessages.Enqueue(message);
+            messages.Add(message);
+            if (messages.Count >= expectedCount)
+            {
+                bus.MessageReceived -= handler;
+                registration.Dispose();
+                tcs.TrySetResult(messages.ToArray());
+            }
+        };
+
+        bus.MessageReceived += handler;
+        registration = cancellationToken.Register(() =>
+        {
+            bus.MessageReceived -= handler;
+            tcs.TrySetCanceled(cancellationToken);
+        });
+
+        return tcs.Task;
     }
 
     private static async Task PublishBytesAsync(TinyMessageBus bus, byte[] bytes)
@@ -967,6 +1086,9 @@ public sealed class SidecarLifecycleTests
     private static async Task WaitForSubscriptionToSettleAsync(CancellationToken cancellationToken)
         => await Task.Delay(750, cancellationToken);
 
+    private static Task WaitForConnectedAsync(IEnumerable<TinyMessageBus> buses, TimeSpan timeout)
+        => Task.WhenAll(buses.Select(bus => bus.WaitForConnectedForDiagnosticsAsync(timeout)));
+
     private sealed class TestEnvironmentScope : IDisposable
     {
         private readonly string? _previousBackend;
@@ -1021,6 +1143,10 @@ public sealed class SidecarLifecycleTests
                 Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
                 Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
                 Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
+                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
+                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
                 Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", brokerIdleShutdownMs?.ToString());
             }
 
@@ -1034,13 +1160,43 @@ public sealed class SidecarLifecycleTests
         public string SocketPath { get; }
         public string StatePath { get; }
 
-        public TinyMessageBus CreateBus(int maxPayloadBytes = 1024)
+        public TinyMessageBus CreateBus(int maxPayloadBytes = DefaultRequestedBufferBytes)
             => CreateBus(ChannelName, maxPayloadBytes);
 
-        public TinyMessageBus CreateBus(string channelName, int maxPayloadBytes = 1024)
+        public TinyMessageBus CreateBus(string channelName, int maxPayloadBytes = DefaultRequestedBufferBytes)
             => new(new TinyMemoryMappedFile(channelName, maxPayloadBytes), disposeFile: true);
 
-        public async Task<TinyMessageBus> CreateBusWhenAvailableAsync(string channelName, int maxPayloadBytes = 1024)
+        public string ReadLatestLogOrEmpty()
+            => ProductionPathTestEnvironment.ReadLatestLogOrEmpty(SharedDirectory);
+
+        public string ReadAllLogsOrEmpty()
+        {
+            if (!Directory.Exists(SharedDirectory))
+                return string.Empty;
+
+            return string.Join(
+                Environment.NewLine,
+                Directory.EnumerateFiles(SharedDirectory, "tinyipc-*.log", SearchOption.TopDirectoryOnly)
+                    .OrderBy(path => path, StringComparer.Ordinal)
+                    .Select(static path => File.ReadAllText(path)));
+        }
+
+        public async Task<string> WaitForLogMarkerAsync(string marker, TimeSpan? timeout = null)
+        {
+            DateTime deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+            while (DateTime.UtcNow < deadline)
+            {
+                string logs = ReadAllLogsOrEmpty();
+                if (logs.Contains(marker, StringComparison.Ordinal))
+                    return logs;
+
+                await Task.Delay(50);
+            }
+
+            return ReadAllLogsOrEmpty();
+        }
+
+        public async Task<TinyMessageBus> CreateBusWhenAvailableAsync(string channelName, int maxPayloadBytes = DefaultRequestedBufferBytes)
         {
             DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
             Exception? last = null;
@@ -1093,7 +1249,10 @@ public sealed class SidecarLifecycleTests
                 await Task.Delay(50);
             }
 
-            throw new TimeoutException($"Timed out waiting for live broker socket '{SocketPath}'.", last);
+            string logs = ReadAllLogsOrEmpty();
+            throw new TimeoutException(
+                $"Timed out waiting for live broker socket '{SocketPath}'. Logs:{Environment.NewLine}{logs}",
+                last);
         }
 
         public async Task<BrokerStateSnapshot> WaitForBrokerStateAsync(Func<BrokerStateSnapshot, bool> predicate)

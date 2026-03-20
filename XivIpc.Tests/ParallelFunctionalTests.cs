@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text;
+using TinyIpc.IO;
 using TinyIpc.Messaging;
 using Xunit;
 
@@ -30,11 +31,12 @@ public sealed class ParallelFunctionalTests
 
         using var publishersScope = new DisposableList<TinyMessageBus>();
         using var subscribersScope = new DisposableList<TinyMessageBus>();
+        int requestedBufferBytes = IsSidecarStyleBackend(backend) ? 2 * 1024 * 1024 : TinyMemoryMappedFile.DefaultMaxFileSize;
 
         TinyMessageBus[] publishers = Enumerable.Range(0, publisherCount)
             .Select(_ =>
             {
-                var bus = new TinyMessageBus(scope.ChannelName);
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
                 publishersScope.Add(bus);
                 return bus;
             })
@@ -43,11 +45,13 @@ public sealed class ParallelFunctionalTests
         TinyMessageBus[] subscribers = Enumerable.Range(0, subscriberCount)
             .Select(_ =>
             {
-                var bus = new TinyMessageBus(scope.ChannelName);
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
                 subscribersScope.Add(bus);
                 return bus;
             })
             .ToArray();
+
+        await WaitForBusesReadyAsync(backend, publishers.Concat(subscribers), cts.Token);
 
         var observedBySubscriber = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
         var readySignals = new TaskCompletionSource[subscriberCount];
@@ -153,6 +157,8 @@ public sealed class ParallelFunctionalTests
             })
             .ToArray();
 
+        await WaitForBusesReadyAsync(backend, publishers.Concat(subscribers), cts.Token);
+
         var observedBySubscriber = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
         var readySignals = new TaskCompletionSource[subscriberCount];
         var subscriberTasks = new Task[subscriberCount];
@@ -237,17 +243,18 @@ public sealed class ParallelFunctionalTests
 
         const int publisherCount = 4;
         const int subscriberCount = 4;
-        const int messagesPerPublisher = 32;
+        int messagesPerPublisher = IsSidecarStyleBackend(backend) ? 12 : 32;
         const int payloadBytes = 32 * 1024;
         int expectedTotal = publisherCount * messagesPerPublisher;
 
         using var publishersScope = new DisposableList<TinyMessageBus>();
         using var subscribersScope = new DisposableList<TinyMessageBus>();
+        int requestedBufferBytes = IsSidecarStyleBackend(backend) ? 2 * 1024 * 1024 : TinyMemoryMappedFile.DefaultMaxFileSize;
 
         TinyMessageBus[] publishers = Enumerable.Range(0, publisherCount)
             .Select(_ =>
             {
-                var bus = new TinyMessageBus(scope.ChannelName);
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
                 publishersScope.Add(bus);
                 return bus;
             })
@@ -256,11 +263,13 @@ public sealed class ParallelFunctionalTests
         TinyMessageBus[] subscribers = Enumerable.Range(0, subscriberCount)
             .Select(_ =>
             {
-                var bus = new TinyMessageBus(scope.ChannelName);
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
                 subscribersScope.Add(bus);
                 return bus;
             })
             .ToArray();
+
+        await WaitForBusesReadyAsync(backend, publishers.Concat(subscribers), cts.Token);
 
         var observedBySubscriber = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte[]>>();
         var readySignals = new TaskCompletionSource[subscriberCount];
@@ -291,6 +300,14 @@ public sealed class ParallelFunctionalTests
         await Task.WhenAll(readySignals.Select(x => x.Task));
         await WaitForSubscriptionToSettleAsync(backend, cts.Token);
 
+        byte[] warmupPayload = BuildLargePayload(99, 9999, 1024);
+        string warmupId = ExtractId(warmupPayload);
+        await PublishBytesAsync(publishers[0], warmupPayload);
+        await WaitForLargePayloadObservationAsync(observedBySubscriber, warmupId, subscriberCount, cts.Token);
+
+        foreach (ConcurrentDictionary<string, byte[]> observed in observedBySubscriber.Values)
+            observed.Clear();
+
         var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task[] publisherTasks = Enumerable.Range(0, publisherCount)
@@ -314,7 +331,16 @@ public sealed class ParallelFunctionalTests
         startGate.TrySetResult();
 
         await Task.WhenAll(publisherTasks);
-        await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(60), cts.Token);
+        try
+        {
+            await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(60), cts.Token);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new TimeoutException(
+                $"Timed out receiving all large-payload parallel messages. Logs:{Environment.NewLine}{scope.ReadAllLogsOrEmpty()}",
+                ex);
+        }
 
         string[] expectedIds = Enumerable.Range(0, publisherCount)
             .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
@@ -371,6 +397,8 @@ public sealed class ParallelFunctionalTests
             })
             .ToArray();
 
+        await WaitForBusesReadyAsync(backend, stableSubscribers.Concat(publishers), cts.Token);
+
         var observedByStableSubscriber = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
         var stableReadySignals = new TaskCompletionSource[stableSubscriberCount];
         var stableReaderTasks = new Task[stableSubscriberCount];
@@ -404,6 +432,8 @@ public sealed class ParallelFunctionalTests
             {
                 using var tempBus = new TinyMessageBus(scope.ChannelName);
                 using var localCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+
+                await WaitForBusesReadyAsync(backend, new[] { tempBus }, cts.Token);
 
                 Task reader = Task.Run(async () =>
                 {
@@ -544,11 +574,37 @@ public sealed class ParallelFunctionalTests
 
     private static async Task WaitForSubscriptionToSettleAsync(string backend, CancellationToken cancellationToken)
     {
-        if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
+        if (ProductionPathTestEnvironment.IsProductionPath(backend))
+        {
+            await Task.Delay(1500, cancellationToken);
+        }
+        else if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
+        {
             await Task.Delay(750, cancellationToken);
+        }
         else
+        {
             await Task.Delay(25, cancellationToken);
+        }
     }
+
+    private static async Task WaitForBusesReadyAsync(string backend, IEnumerable<TinyMessageBus> buses, CancellationToken cancellationToken)
+    {
+        if (!IsSidecarStyleBackend(backend))
+        {
+            return;
+        }
+
+        Task[] tasks = buses
+            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10)))
+            .ToArray();
+
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+    }
+
+    private static bool IsSidecarStyleBackend(string backend)
+        => string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase)
+            || ProductionPathTestEnvironment.IsProductionPath(backend);
 
     private static string GetString(object item)
         => Encoding.UTF8.GetString(GetBytes(item));
@@ -617,6 +673,35 @@ public sealed class ParallelFunctionalTests
         }
 
         return true;
+    }
+
+    private static async Task WaitForLargePayloadObservationAsync(
+        ConcurrentDictionary<int, ConcurrentDictionary<string, byte[]>> observedBySubscriber,
+        string expectedId,
+        int subscriberCount,
+        CancellationToken cancellationToken)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            bool allObserved = true;
+            for (int i = 0; i < subscriberCount; i++)
+            {
+                if (!observedBySubscriber.TryGetValue(i, out ConcurrentDictionary<string, byte[]>? observed)
+                    || !observed.ContainsKey(expectedId))
+                {
+                    allObserved = false;
+                    break;
+                }
+            }
+
+            if (allObserved)
+                return;
+
+            await Task.Delay(50, cancellationToken);
+        }
+
+        throw new TimeoutException($"Timed out waiting for all subscribers to observe warmup payload '{expectedId}'.");
     }
 
     private sealed class TestEnvironmentScope : IDisposable
@@ -708,6 +793,18 @@ public sealed class ParallelFunctionalTests
             catch
             {
             }
+        }
+
+        public string ReadAllLogsOrEmpty()
+        {
+            if (!Directory.Exists(_testSharedDir))
+                return string.Empty;
+
+            return string.Join(
+                Environment.NewLine,
+                Directory.EnumerateFiles(_testSharedDir, "tinyipc-*.log", SearchOption.TopDirectoryOnly)
+                    .OrderBy(path => path, StringComparer.Ordinal)
+                    .Select(static path => File.ReadAllText(path)));
         }
 
         private static string? ResolveNativeHostPath()

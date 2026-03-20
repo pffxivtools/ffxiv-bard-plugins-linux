@@ -17,17 +17,56 @@ internal static class UnixSidecarProcessManager
     private static int _refCount;
 
     internal static Lease Acquire()
+        => Acquire(CaptureSettings());
+
+    internal static Lease Acquire(RuntimeSettings settings)
     {
         lock (Sync)
         {
-            string socketPath = ResolveBrokerSocketPath();
-            EnsureBrokerStarted(socketPath);
+            string socketPath = settings.SocketPath;
+            EnsureBrokerStarted(settings, socketPath);
             _refCount++;
             return new Lease(socketPath);
         }
     }
 
-    private static void EnsureBrokerStarted(string socketPath)
+    internal static RuntimeSettings CaptureSettings()
+    {
+        string? brokerDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR");
+        string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+        string? logDirectory = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
+        string? sharedGroup = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+        string? enableLogging = Environment.GetEnvironmentVariable("TINYIPC_ENABLE_LOGGING");
+        string? logLevel = Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL");
+        string? logPayload = Environment.GetEnvironmentVariable("TINYIPC_LOG_PAYLOAD");
+        string? logMaxBytes = Environment.GetEnvironmentVariable("TINYIPC_LOG_MAX_BYTES");
+        string? logFileCount = Environment.GetEnvironmentVariable("TINYIPC_LOG_FILE_COUNT");
+        string? fileNotifier = Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER");
+        string? explicitHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
+        string? explicitSocketPath = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH");
+
+        string resolvedBrokerDirectory = ResolveBrokerDirectory(sharedDirectory, brokerDirectory);
+        string socketPath = string.IsNullOrWhiteSpace(explicitSocketPath)
+            ? CombineUnixPath(resolvedBrokerDirectory, BrokerSocketFileName)
+            : ResolveUnixPath(explicitSocketPath);
+        string diagnosticsDirectory = ResolveDiagnosticsLogDirectory(socketPath, logDirectory);
+
+        return new RuntimeSettings(
+            socketPath,
+            resolvedBrokerDirectory,
+            string.IsNullOrWhiteSpace(sharedDirectory) ? string.Empty : ResolveUnixPath(sharedDirectory),
+            diagnosticsDirectory,
+            sharedGroup,
+            enableLogging,
+            logLevel,
+            logPayload,
+            logMaxBytes,
+            logFileCount,
+            fileNotifier,
+            explicitHostPath);
+    }
+
+    private static void EnsureBrokerStarted(RuntimeSettings settings, string socketPath)
     {
         string statePath = BrokerStateSnapshot.ResolvePath(socketPath);
         if (CanConnect(socketPath))
@@ -49,13 +88,13 @@ internal static class UnixSidecarProcessManager
             CleanupOwnedProcess(state.Pid);
         }
 
-        if (!TryStartHelper(socketPath, out string failureDetails))
+        if (!TryStartHelper(settings, socketPath, out string failureDetails))
             throw new SidecarStartupException($"Failed to start native TinyIpc broker for socket '{socketPath}'.{Environment.NewLine}{failureDetails}");
 
-        WaitForBroker(socketPath, statePath, TimeSpan.FromMilliseconds(StartupTimeoutMs));
+        WaitForBroker(settings, socketPath, statePath, TimeSpan.FromMilliseconds(StartupTimeoutMs));
     }
 
-    private static void WaitForBroker(string socketPath, string statePath, TimeSpan timeout)
+    private static void WaitForBroker(RuntimeSettings settings, string socketPath, string statePath, TimeSpan timeout)
     {
         Stopwatch sw = Stopwatch.StartNew();
         Exception? last = null;
@@ -79,15 +118,16 @@ internal static class UnixSidecarProcessManager
             Thread.Sleep(50);
         }
 
-        string diagnostics = BuildBrokerStartupDiagnostics(socketPath, statePath);
+        string diagnostics = BuildBrokerStartupDiagnostics(settings, socketPath, statePath);
         throw new SidecarStartupException(
             $"Timed out waiting for broker socket '{socketPath}' to become reachable.{Environment.NewLine}{diagnostics}",
             last ?? new TimeoutException());
     }
 
-    private static bool TryStartHelper(string socketPath, out string failureDetails)
+    private static bool TryStartHelper(RuntimeSettings settings, string socketPath, out string failureDetails)
     {
         ProcessStartInfo psi = BuildStartInfo(
+            settings,
             socketPath,
             out string launchMode,
             out string launchCommand,
@@ -120,6 +160,7 @@ internal static class UnixSidecarProcessManager
     }
 
     private static ProcessStartInfo BuildStartInfo(
+        RuntimeSettings settings,
         string socketPath,
         out string launchMode,
         out string launchCommand,
@@ -129,11 +170,11 @@ internal static class UnixSidecarProcessManager
         out string stdoutLogPath,
         out string stderrLogPath)
     {
-        hostPathWindows = ResolveNativeHostPath();
+        hostPathWindows = ResolveNativeHostPath(settings);
         hostPathUnix = ConvertWindowsPathToUnix(hostPathWindows);
         launchId = Guid.NewGuid().ToString("N");
 
-        string diagnosticsDirectory = ResolveDiagnosticsLogDirectory(socketPath);
+        string diagnosticsDirectory = settings.DiagnosticsDirectory;
         Directory.CreateDirectory(diagnosticsDirectory);
         stdoutLogPath = Path.Combine(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stdout.log");
         stderrLogPath = Path.Combine(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stderr.log");
@@ -165,16 +206,16 @@ internal static class UnixSidecarProcessManager
             };
         }
 
-        CopyPathEnvironment(psi, "TINYIPC_SHARED_DIR");
-        CopyPathEnvironment(psi, "TINYIPC_BROKER_DIR");
-        CopyVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING");
-        CopyPathEnvironment(psi, "TINYIPC_LOG_DIR");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES");
-        CopyVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT");
-        CopyVerbatimEnvironment(psi, "TINYIPC_SHARED_GROUP");
-        CopyVerbatimEnvironment(psi, "TINYIPC_FILE_NOTIFIER");
+        CopyFixedPathEnvironment(psi, "TINYIPC_SHARED_DIR", settings.SharedDirectory);
+        CopyFixedPathEnvironment(psi, "TINYIPC_BROKER_DIR", settings.BrokerDirectory);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING", settings.EnableLogging);
+        CopyFixedPathEnvironment(psi, "TINYIPC_LOG_DIR", settings.DiagnosticsDirectory);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL", settings.LogLevel);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD", settings.LogPayload);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES", settings.LogMaxBytes);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT", settings.LogFileCount);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_SHARED_GROUP", settings.SharedGroup);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_FILE_NOTIFIER", settings.FileNotifier);
 
         psi.Environment["TINYIPC_BROKER_SOCKET_PATH"] = ConvertUnixPathForChild(socketPath);
         psi.Environment["TINYIPC_BUS_BACKEND"] = "sidecar-brokered";
@@ -230,31 +271,30 @@ internal static class UnixSidecarProcessManager
 
     private static string ResolveBrokerSocketPath()
     {
-        string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH");
-        if (!string.IsNullOrWhiteSpace(explicitPath))
-            return ResolveUnixPath(explicitPath);
-
-        string directory = ResolveBrokerDirectory();
-        Directory.CreateDirectory(directory);
-        return CombineUnixPath(directory, BrokerSocketFileName);
+        return CaptureSettings().SocketPath;
     }
 
     private static string ResolveBrokerDirectory()
     {
-        string? explicitDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR");
+        return ResolveBrokerDirectory(
+            Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR"),
+            Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR"));
+    }
+
+    private static string ResolveBrokerDirectory(string? sharedDirectory, string? explicitDirectory)
+    {
         if (!string.IsNullOrWhiteSpace(explicitDirectory))
             return ResolveUnixPath(explicitDirectory);
 
-        string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
         if (!string.IsNullOrWhiteSpace(sharedDirectory))
             return ResolveUnixPath(sharedDirectory);
 
         return Path.Combine("/run", BrokerDirectoryName);
     }
 
-    private static string BuildBrokerStartupDiagnostics(string socketPath, string statePath)
+    private static string BuildBrokerStartupDiagnostics(RuntimeSettings settings, string socketPath, string statePath)
     {
-        string logDirectory = ResolveDiagnosticsLogDirectory(socketPath);
+        string logDirectory = settings.DiagnosticsDirectory;
         string latestNativeLog = FindLatestNativeBrokerLog(logDirectory);
         string nativeLogTail = string.IsNullOrWhiteSpace(latestNativeLog)
             ? "<none>"
@@ -286,8 +326,11 @@ internal static class UnixSidecarProcessManager
     }
 
     internal static string ResolveNativeHostPath()
+        => ResolveNativeHostPath(CaptureSettings());
+
+    internal static string ResolveNativeHostPath(RuntimeSettings settings)
     {
-        string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
+        string? explicitPath = settings.ExplicitNativeHostPath;
         if (!string.IsNullOrWhiteSpace(explicitPath))
         {
             string resolved = ResolveNativePath(explicitPath);
@@ -295,7 +338,7 @@ internal static class UnixSidecarProcessManager
                 return resolved;
         }
 
-        string[] candidates = GetNativeHostCandidatePathsForDiagnostics();
+        string[] candidates = GetNativeHostCandidatePathsForDiagnostics(settings);
 
         string? existing = candidates.FirstOrDefault(File.Exists);
         return existing ?? throw new SidecarStartupException("XivIpc.NativeHost executable or dll was not found.");
@@ -316,6 +359,9 @@ internal static class UnixSidecarProcessManager
     }
 
     internal static string[] GetNativeHostCandidatePathsForDiagnostics()
+        => GetNativeHostCandidatePathsForDiagnostics(CaptureSettings());
+
+    private static string[] GetNativeHostCandidatePathsForDiagnostics(RuntimeSettings settings)
     {
         var candidates = new List<string>();
 
@@ -330,11 +376,11 @@ internal static class UnixSidecarProcessManager
             candidates.Add(Path.Combine(resolvedBase, "XivIpc.NativeHost.exe"));
         }
 
-        string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+        string? sharedDirectory = settings.SharedDirectory;
         if (!string.IsNullOrWhiteSpace(sharedDirectory))
             AddCandidates(Path.Combine(sharedDirectory, "tinyipc-native-host"));
 
-        string? brokerDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR");
+        string? brokerDirectory = settings.BrokerDirectory;
         if (!string.IsNullOrWhiteSpace(brokerDirectory))
             AddCandidates(Path.Combine(brokerDirectory, "tinyipc-native-host"));
 
@@ -472,9 +518,21 @@ internal static class UnixSidecarProcessManager
             psi.Environment[variableName] = value;
     }
 
+    private static void CopyFixedVerbatimEnvironment(ProcessStartInfo psi, string variableName, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+            psi.Environment[variableName] = value;
+    }
+
     private static void CopyPathEnvironment(ProcessStartInfo psi, string variableName)
     {
         string? value = Environment.GetEnvironmentVariable(variableName);
+        if (!string.IsNullOrWhiteSpace(value))
+            psi.Environment[variableName] = ResolveUnixPath(value);
+    }
+
+    private static void CopyFixedPathEnvironment(ProcessStartInfo psi, string variableName, string? value)
+    {
         if (!string.IsNullOrWhiteSpace(value))
             psi.Environment[variableName] = ResolveUnixPath(value);
     }
@@ -499,8 +557,10 @@ internal static class UnixSidecarProcessManager
     }
 
     private static string ResolveDiagnosticsLogDirectory(string socketPath)
+        => ResolveDiagnosticsLogDirectory(socketPath, Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR"));
+
+    private static string ResolveDiagnosticsLogDirectory(string socketPath, string? configured)
     {
-        string? configured = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
         if (!string.IsNullOrWhiteSpace(configured))
             return ResolveUnixPath(configured);
 
@@ -606,4 +666,18 @@ internal static class UnixSidecarProcessManager
         internal string SocketPath { get; }
         public void Dispose() => Release();
     }
+
+    internal readonly record struct RuntimeSettings(
+        string SocketPath,
+        string BrokerDirectory,
+        string SharedDirectory,
+        string DiagnosticsDirectory,
+        string? SharedGroup,
+        string? EnableLogging,
+        string? LogLevel,
+        string? LogPayload,
+        string? LogMaxBytes,
+        string? LogFileCount,
+        string? FileNotifier,
+        string? ExplicitNativeHostPath);
 }

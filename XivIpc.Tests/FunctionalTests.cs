@@ -279,10 +279,18 @@ public sealed class FunctionalTests
 
     private static async Task WaitForSubscriptionToSettleAsync(string backend, CancellationToken cancellationToken)
     {
-        if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
+        if (ProductionPathTestEnvironment.IsProductionPath(backend))
+        {
+            await Task.Delay(1500, cancellationToken);
+        }
+        else if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
+        {
             await Task.Delay(750, cancellationToken);
+        }
         else
+        {
             await Task.Delay(25, cancellationToken);
+        }
     }
 
     private static string GetString(object item)

@@ -10,7 +10,7 @@ internal readonly record struct RingSizing(
 
 internal static class RingSizingPolicy
 {
-    internal const int MaxBudgetBytes = 64 * 1024 * 1024;
+    internal const int MaxBudgetBytes = 128 * 1024 * 1024;
 
     internal static RingSizing Compute(int requestedBufferBytes, int slotCount, int headerSize, int slotHeaderSize)
     {

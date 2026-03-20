@@ -16,7 +16,7 @@ MANIFESTS_DIR="${OUTPUT_DIR}/manifests"
 
 : "${PUBLISH_TFM:=net9.0}"
 : "${TINYIPC_ABI_FLAVOR_OVERRIDE:=}"
-: "${TINYIPC_SHARED_DIR:=/tmp/tinyipc-shared-ffxiv}"
+: "${TINYIPC_SHARED_DIR:=/home/shared/tinyipc-shared-ffxiv}"
 
 BASE_URL="https://example.com/dalamud"
 

@@ -5,6 +5,24 @@ using XivIpc.Internal;
 
 namespace XivIpc.Messaging
 {
+    internal readonly record struct BrokeredRingPublishResult(
+        long HeadBefore,
+        long TailBefore,
+        long HeadAfter,
+        long TailAfter,
+        bool OverwroteOldest,
+        int RetainedDepth);
+
+    internal readonly record struct BrokeredRingDrainResult(
+        List<byte[]> Messages,
+        bool CaughtUpToTail,
+        long TailObserved,
+        long HeadObserved,
+        long NextSequenceBefore,
+        long NextSequenceAfter,
+        long LagBefore,
+        int RetainedDepth);
+
     internal sealed unsafe class BrokeredChannelRing : IDisposable
     {
         private const uint RingMagic = 0x54494242;   // "TIBB"
@@ -127,10 +145,13 @@ namespace XivIpc.Messaging
         internal long CaptureHead()
             => Volatile.Read(ref *(long*)((byte*)Pointer + HeaderHeadSeqOffset));
 
+        internal long CaptureTail()
+            => Volatile.Read(ref *(long*)((byte*)Pointer + HeaderTailSeqOffset));
+
         internal static int ComputeRequiredImageSize(int slotCount, int slotPayloadBytes)
             => checked(HeaderBytes + (slotCount * (SlotHeaderBytes + slotPayloadBytes)));
 
-        internal void Publish(long senderSessionId, byte[] message)
+        internal BrokeredRingPublishResult Publish(long senderSessionId, byte[] message)
         {
             if (message.Length > SlotPayloadBytes)
                 throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {SlotPayloadBytes}.");
@@ -142,9 +163,14 @@ namespace XivIpc.Messaging
                 byte* image = (byte*)Pointer;
                 long head = ReadInt64(image, HeaderHeadSeqOffset);
                 long tail = ReadInt64(image, HeaderTailSeqOffset);
+                long originalTail = tail;
+                bool overwroteOldest = false;
 
                 if (head - tail >= SlotCount)
+                {
                     tail = head - SlotCount + 1;
+                    overwroteOldest = true;
+                }
 
                 int slotIndex = checked((int)(head % SlotCount));
                 int slotOffset = GetSlotOffset(slotIndex);
@@ -166,19 +192,33 @@ namespace XivIpc.Messaging
                 WriteInt64(image, HeaderHeadSeqOffset, head + 1);
                 WriteInt64(image, HeaderTailSeqOffset, tail);
                 _view.Flush();
+
+                return new BrokeredRingPublishResult(
+                    HeadBefore: head,
+                    TailBefore: originalTail,
+                    HeadAfter: head + 1,
+                    TailAfter: tail,
+                    OverwroteOldest: overwroteOldest,
+                    RetainedDepth: checked((int)((head + 1) - tail)));
             }
         }
 
-        internal List<byte[]> Drain(long selfSessionId, ref long nextSequence)
+        internal BrokeredRingDrainResult Drain(long selfSessionId, ref long nextSequence)
         {
             Validate();
 
             byte* image = (byte*)Pointer;
             long head = Volatile.Read(ref *(long*)(image + HeaderHeadSeqOffset));
             long tail = Volatile.Read(ref *(long*)(image + HeaderTailSeqOffset));
+            long nextSequenceBefore = nextSequence;
+            long lagBefore = head - nextSequenceBefore;
+            bool caughtUpToTail = false;
 
             if (nextSequence < tail)
+            {
                 nextSequence = tail;
+                caughtUpToTail = true;
+            }
 
             var messages = new List<byte[]>();
             while (nextSequence < head)
@@ -207,7 +247,15 @@ namespace XivIpc.Messaging
                 nextSequence++;
             }
 
-            return messages;
+            return new BrokeredRingDrainResult(
+                Messages: messages,
+                CaughtUpToTail: caughtUpToTail,
+                TailObserved: tail,
+                HeadObserved: head,
+                NextSequenceBefore: nextSequenceBefore,
+                NextSequenceAfter: nextSequence,
+                LagBefore: lagBefore,
+                RetainedDepth: checked((int)(head - tail)));
         }
 
         public void Dispose()
