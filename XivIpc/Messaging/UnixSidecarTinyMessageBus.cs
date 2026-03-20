@@ -10,7 +10,7 @@ namespace XivIpc.Messaging
         private const int DefaultHeartbeatTimeoutMs = 60000;
 
         private readonly string _channelName;
-        private readonly int _maxPayloadBytes;
+        private readonly int _requestedBufferBytes;
         private readonly UnixSidecarProcessManager.Lease _lease;
         private readonly Socket _socket;
         private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -22,6 +22,7 @@ namespace XivIpc.Messaging
         private readonly Task _heartbeatTask;
         private readonly BrokeredChannelRing _ring;
         private readonly long _sessionId;
+        private readonly int _effectiveSlotPayloadBytes;
         private long _nextSequence;
         private bool _disposed;
 
@@ -39,7 +40,7 @@ namespace XivIpc.Messaging
                 throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
 
             _channelName = channelName;
-            _maxPayloadBytes = maxPayloadBytes;
+            _requestedBufferBytes = maxPayloadBytes;
 
             try
             {
@@ -48,7 +49,7 @@ namespace XivIpc.Messaging
 
                 SidecarProtocol.WriteHello(_socket, new SidecarHello(
                     _channelName,
-                    _maxPayloadBytes,
+                    _requestedBufferBytes,
                     RuntimeEnvironmentDetector.GetCurrentProcessId(),
                     ResolveHeartbeatIntervalMs(),
                     ResolveHeartbeatTimeoutMs()));
@@ -57,6 +58,7 @@ namespace XivIpc.Messaging
                 LogAttachFrameReceived(attachFrame);
                 SidecarAttachRing attach = DecodeAttachFrame(attachFrame);
                 _ring = AttachRingWithRetry(attach);
+                _effectiveSlotPayloadBytes = attach.SlotPayloadBytes;
                 _sessionId = attach.SessionId;
                 _nextSequence = attach.StartSequence;
 
@@ -85,8 +87,12 @@ namespace XivIpc.Messaging
             ArgumentNullException.ThrowIfNull(message);
             ThrowIfDisposed();
 
-            if (message.Length > _maxPayloadBytes)
-                throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {_maxPayloadBytes}.");
+            if (message.Length > _effectiveSlotPayloadBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Message length {message.Length} exceeds the configured per-message capacity of {_effectiveSlotPayloadBytes} bytes. " +
+                    $"requestedBufferBytes={_requestedBufferBytes}.");
+            }
 
             return WritePublishAsync(message, _cts.Token);
         }
@@ -281,6 +287,22 @@ namespace XivIpc.Messaging
 
         private SidecarAttachRing DecodeAttachFrame(SidecarFrame frame)
         {
+            if (frame.Type == SidecarFrameType.Error)
+            {
+                string message = frame.Payload.Length == 0
+                    ? "Broker attach failed."
+                    : System.Text.Encoding.UTF8.GetString(frame.Payload.Span);
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "AttachRejectedByBroker",
+                    "Broker rejected sidecar attach.",
+                    null,
+                    ("channel", _channelName),
+                    ("payloadLength", frame.Payload.Length),
+                    ("brokerError", message));
+                throw new InvalidOperationException(message);
+            }
+
             try
             {
                 return SidecarProtocol.DecodeAttachRing(frame);

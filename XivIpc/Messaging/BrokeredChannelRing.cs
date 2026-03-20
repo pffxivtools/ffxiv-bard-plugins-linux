@@ -18,7 +18,7 @@ namespace XivIpc.Messaging
         private const int HeaderHeadSeqOffset = 16;
         private const int HeaderTailSeqOffset = 24;
         private const int HeaderReservedOffset = 32;
-        private const int HeaderSize = 64;
+        internal const int HeaderBytes = 64;
 
         private const int SlotMagicOffset = 0;
         private const int SlotPayloadLenOffset = 4;
@@ -27,7 +27,7 @@ namespace XivIpc.Messaging
         private const int SlotSenderSessionOffset = 24;
         private const int SlotFlagsOffset = 32;
         private const int SlotReservedOffset = 36;
-        private const int SlotHeaderSize = 40;
+        internal const int SlotHeaderBytes = 40;
 
         private readonly object _gate = new();
         private readonly FileStream _stream;
@@ -128,7 +128,7 @@ namespace XivIpc.Messaging
             => Volatile.Read(ref *(long*)((byte*)Pointer + HeaderHeadSeqOffset));
 
         internal static int ComputeRequiredImageSize(int slotCount, int slotPayloadBytes)
-            => checked(HeaderSize + (slotCount * (SlotHeaderSize + slotPayloadBytes)));
+            => checked(HeaderBytes + (slotCount * (SlotHeaderBytes + slotPayloadBytes)));
 
         internal void Publish(long senderSessionId, byte[] message)
         {
@@ -148,12 +148,12 @@ namespace XivIpc.Messaging
 
                 int slotIndex = checked((int)(head % SlotCount));
                 int slotOffset = GetSlotOffset(slotIndex);
-                ClearBytes(image + slotOffset, SlotHeaderSize + SlotPayloadBytes);
+                ClearBytes(image + slotOffset, SlotHeaderBytes + SlotPayloadBytes);
 
                 if (message.Length > 0)
                 {
                     fixed (byte* source = message)
-                        Buffer.MemoryCopy(source, image + slotOffset + SlotHeaderSize, SlotPayloadBytes, message.Length);
+                        Buffer.MemoryCopy(source, image + slotOffset + SlotHeaderBytes, SlotPayloadBytes, message.Length);
                 }
 
                 WriteInt32(image, slotOffset + SlotPayloadLenOffset, message.Length);
@@ -199,7 +199,7 @@ namespace XivIpc.Messaging
                 {
                     byte[] payload = new byte[payloadLen];
                     if (payloadLen > 0)
-                        MarshalCopy(image + slotOffset + SlotHeaderSize, payload);
+                        MarshalCopy(image + slotOffset + SlotHeaderBytes, payload);
 
                     messages.Add(payload);
                 }
@@ -253,7 +253,7 @@ namespace XivIpc.Messaging
         }
 
         private int GetSlotOffset(int slotIndex)
-            => checked(HeaderSize + (slotIndex * (SlotHeaderSize + SlotPayloadBytes)));
+            => checked(HeaderBytes + (slotIndex * (SlotHeaderBytes + SlotPayloadBytes)));
 
         private static FileStream OpenFileStream(string path, int length, bool create)
         {

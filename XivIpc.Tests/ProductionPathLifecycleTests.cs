@@ -86,6 +86,18 @@ public sealed class ProductionPathLifecycleTests
         => Inner.DifferentChannels_ShareSingleBroker_AndChannelTeardownIsIndependent(ProductionPathTestEnvironment.BackendName);
 
     [Fact]
+    public Task FiveChannels_CreateDistinctRingFiles_AndChannelTeardownIsIndependent()
+        => Inner.FiveChannels_CreateDistinctRingFiles_AndChannelTeardownIsIndependent(ProductionPathTestEnvironment.BackendName);
+
+    [Fact]
+    public Task FiveChannels_ParallelTraffic_HasNoCrosstalk_AndPreservesPerChannelOrder()
+        => Inner.FiveChannels_ParallelTraffic_HasNoCrosstalk_AndPreservesPerChannelOrder(ProductionPathTestEnvironment.BackendName);
+
+    [Fact]
+    public Task LargeRequestedBuffer_IsBudgetedWithoutOverflow()
+        => Inner.LargeRequestedBuffer_IsBudgetedWithoutOverflow(ProductionPathTestEnvironment.BackendName);
+
+    [Fact]
     public Task RawUdsClient_CanPublishToTinyMessageBusSubscriber()
         => Inner.RawUdsClient_CanPublishToTinyMessageBusSubscriber(ProductionPathTestEnvironment.BackendName);
 

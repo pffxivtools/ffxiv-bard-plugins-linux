@@ -46,7 +46,8 @@ namespace XivIpc.Messaging
         private const int MetadataVersion = 2;
 
         private readonly string _channelName;
-        private readonly int _maxPayloadBytes;
+        private readonly int _requestedBufferBytes;
+        private readonly RingSizing _sizing;
         private readonly UnixSharedFileLock _writerLock;
         private readonly UnixSharedMemoryRegion _region;
         private readonly string _metadataPath;
@@ -76,10 +77,11 @@ namespace XivIpc.Messaging
                 throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
 
             _channelName = channelName;
-            _maxPayloadBytes = maxPayloadBytes;
+            _requestedBufferBytes = maxPayloadBytes;
 
             int requestedSlotCount = ResolveSlotCount();
-            int requestedImageSize = ComputeRequiredImageSize(requestedSlotCount, maxPayloadBytes);
+            _sizing = RingSizingPolicy.Compute(maxPayloadBytes, requestedSlotCount, HeaderSize, SlotHeaderSize);
+            int requestedImageSize = _sizing.ImageSize;
 
             UnixSharedStorageHelpers.EnsureSharedDirectoryExists();
             _metadataPath = UnixSharedStorageHelpers.BuildSharedFilePath(channelName, "busmeta");
@@ -108,10 +110,13 @@ namespace XivIpc.Messaging
                 "Initialized shared-memory TinyMessageBus.",
                 ("channel", _channelName),
                 ("instanceId", _instanceId),
-                ("maxPayloadBytes", _maxPayloadBytes),
-                ("requestedSlotCount", requestedSlotCount),
+                ("requestedBufferBytes", _requestedBufferBytes),
+                ("effectiveBudgetBytes", _sizing.BudgetBytes),
+                ("effectiveSlotPayloadBytes", _sizing.SlotPayloadBytes),
+                ("requestedSlotCount", _sizing.SlotCount),
                 ("requestedImageSize", requestedImageSize),
                 ("mappedImageSize", mappedImageSize),
+                ("budgetWasCapped", _sizing.WasCapped),
                 ("metadataPath", _metadataPath));
 
             EnsureInitialized(existingMetadata, desiredMetadata);
@@ -128,8 +133,12 @@ namespace XivIpc.Messaging
             ArgumentNullException.ThrowIfNull(message);
             ThrowIfDisposed();
 
-            if (message.Length > _maxPayloadBytes)
-                throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {_maxPayloadBytes}.");
+            if (message.Length > _sizing.SlotPayloadBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Message length {message.Length} exceeds the configured per-message capacity of {_sizing.SlotPayloadBytes} bytes. " +
+                    $"requestedBufferBytes={_requestedBufferBytes}, effectiveBudgetBytes={_sizing.BudgetBytes}.");
+            }
 
             if (TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Debug))
             {
@@ -526,19 +535,19 @@ namespace XivIpc.Messaging
         {
             int slotCount = ReadInt32(image, HeaderSlotCountOffset);
             int slotPayloadBytes = ReadInt32(image, HeaderSlotPayloadOffset);
-            int expectedSlotCount = ResolveSlotCount();
             Guid generation = ReadGuid(image, HeaderGenerationOffset);
 
-            if (slotPayloadBytes < _maxPayloadBytes)
+            if (slotPayloadBytes < _sizing.SlotPayloadBytes)
             {
                 throw new InvalidOperationException(
-                    $"Existing shared bus payload capacity is {slotPayloadBytes} bytes, which is smaller than requested {_maxPayloadBytes} bytes.");
+                    $"Existing shared bus payload capacity is {slotPayloadBytes} bytes, which is smaller than requested {_sizing.SlotPayloadBytes} bytes. " +
+                    $"requestedBufferBytes={_requestedBufferBytes}, effectiveBudgetBytes={_sizing.BudgetBytes}.");
             }
 
-            if (slotCount < expectedSlotCount)
+            if (slotCount < _sizing.SlotCount)
             {
                 throw new InvalidOperationException(
-                    $"Existing shared bus slot count is {slotCount}, which is smaller than requested {expectedSlotCount}.");
+                    $"Existing shared bus slot count is {slotCount}, which is smaller than requested {_sizing.SlotCount}.");
             }
 
             if (generation == Guid.Empty)
@@ -547,17 +556,15 @@ namespace XivIpc.Messaging
 
         private BusMetadata BuildDesiredMetadata()
         {
-            int slotCount = ResolveSlotCount();
             long ttlMs = ResolveMessageTtlMs();
-            int imageSize = ComputeRequiredImageSize(slotCount, _maxPayloadBytes);
 
             return new BusMetadata(
                 MetadataMagic,
                 MetadataVersion,
                 _channelName,
-                slotCount,
-                _maxPayloadBytes,
-                imageSize,
+                _sizing.SlotCount,
+                _sizing.SlotPayloadBytes,
+                _sizing.ImageSize,
                 ttlMs,
                 Guid.NewGuid(),
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
