@@ -14,25 +14,40 @@ namespace XivIpc.Tests;
 [Collection("TinyIpc Serial")]
 public sealed class SidecarLifecycleTests
 {
-    [Fact]
-    public async Task FirstClient_StartsBrokerAndCreatesSocket()
+    public static IEnumerable<object[]> Modes()
     {
-        using TestEnvironmentScope scope = new();
+        yield return new object[] { "sidecar" };
+    }
+
+    public static IEnumerable<object[]> SidecarOnlyModes()
+    {
+        yield return new object[] { "sidecar" };
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task FirstClient_StartsBrokerAndCreatesSocket(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
 
         Assert.False(File.Exists(scope.SocketPath));
+        Assert.False(File.Exists(scope.StatePath));
 
         using var bus = scope.CreateBus();
 
         await scope.WaitForLiveSocketAsync();
+        await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
 
         Assert.True(File.Exists(scope.SocketPath));
+        Assert.True(File.Exists(scope.StatePath));
         Assert.NotEqual(0, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
     }
 
-    [Fact]
-    public async Task ConcurrentClientStartup_ReusesSingleBrokerProcess()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task ConcurrentClientStartup_ReusesSingleBrokerProcess(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         TinyMessageBus[] buses = await Task.WhenAll(Enumerable.Range(0, 8)
             .Select(_ => Task.Run(() => scope.CreateBus())));
@@ -57,10 +72,29 @@ public sealed class SidecarLifecycleTests
         }
     }
 
-    [Fact]
-    public async Task StaleSocket_IsRemovedAndBrokerRestarts()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task Acquire_WhenBrokerAlreadyRunning_DoesNotSpawnReplacement(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
+
+        using UnixSidecarProcessManager.Lease firstLease = UnixSidecarProcessManager.Acquire();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot firstState = await scope.WaitForBrokerStateAsync(static state => state.SessionCount == 0);
+
+        using UnixSidecarProcessManager.Lease secondLease = UnixSidecarProcessManager.Acquire();
+        BrokerStateSnapshot secondState = await scope.WaitForBrokerStateAsync(static state => state.SessionCount == 0);
+
+        Assert.Equal(firstLease.SocketPath, secondLease.SocketPath);
+        Assert.Equal(firstState.Pid, secondState.Pid);
+        Assert.Equal(firstState.InstanceId, secondState.InstanceId);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task StaleSocket_IsRemovedAndBrokerRestarts(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
 
         Directory.CreateDirectory(scope.SharedDirectory);
         await File.WriteAllTextAsync(scope.SocketPath, "stale");
@@ -72,10 +106,11 @@ public sealed class SidecarLifecycleTests
         Assert.NotEqual(0, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
     }
 
-    [Fact]
-    public async Task LastClientDisconnect_ShutsDownBrokerAndRemovesSocket()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task LastClientDisconnect_ShutsDownBrokerAndRemovesSocket(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         var publisher = scope.CreateBus();
         var subscriber = scope.CreateBus();
@@ -88,12 +123,95 @@ public sealed class SidecarLifecycleTests
         subscriber.Dispose();
 
         await scope.WaitForBrokerShutdownAsync();
+        Assert.False(File.Exists(scope.StatePath));
     }
 
-    [Fact]
-    public async Task RingFile_IsCreatedAndRemovedWithBrokerLifecycle()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task DisposeSingleClient_RemovesSessionAndShutsDownBroker(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
+
+        var bus = scope.CreateBus();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot liveState = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
+
+        bus.Dispose();
+
+        await scope.WaitForBrokerShutdownAsync();
+        Assert.False(File.Exists(scope.StatePath));
+        Assert.NotEqual(0, liveState.Pid);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task DeletingSocketWhileBrokerAlive_ReplacesBrokerWithoutParallelHosts(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+
+        using var bus = scope.CreateBus();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot before = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
+
+        File.Delete(scope.SocketPath);
+
+        using var replacementClient = scope.CreateBus();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot after = await scope.WaitForBrokerStateAsync(state => state.SessionCount >= 1 && state.InstanceId != before.InstanceId);
+
+        Assert.NotEqual(before.InstanceId, after.InstanceId);
+        Assert.NotEqual(before.Pid, after.Pid);
+        scope.AssertProcessExited(before.Pid);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task DeletingBrokerStateWhileBrokerAlive_DoesNotSpawnReplacementBroker(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+
+        using var first = scope.CreateBus();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot before = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
+
+        File.Delete(scope.StatePath);
+        Assert.False(File.Exists(scope.StatePath));
+
+        using var second = scope.CreateBus();
+        BrokerStateSnapshot after = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 2);
+
+        Assert.Equal(before.Pid, after.Pid);
+        Assert.Equal(before.InstanceId, after.InstanceId);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task LeakedRawSession_KeepsBrokerAlive_AfterManagedClientDisposes(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+
+        using var managedClient = scope.CreateBus();
+        await scope.WaitForLiveSocketAsync();
+
+        using Socket leakedSocket = ConnectRawSocket(scope.SocketPath);
+        _ = AttachRawSession(scope.ChannelName, 1024, leakedSocket);
+        await scope.WaitForBrokerStateAsync(state => state.SessionCount == 2);
+
+        managedClient.Dispose();
+        BrokerStateSnapshot stillLive = await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
+
+        Assert.True(File.Exists(scope.SocketPath));
+        Assert.NotEqual(0, stillLive.Pid);
+
+        leakedSocket.Dispose();
+        await scope.WaitForBrokerShutdownAsync();
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task RingFile_IsCreatedAndRemovedWithBrokerLifecycle(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
 
         using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
         using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
@@ -118,10 +236,32 @@ public sealed class SidecarLifecycleTests
         Assert.False(File.Exists(attach.RingPath));
     }
 
-    [Fact]
-    public async Task LargerRequestedCapacity_WhileBrokerLive_Throws()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task BrokerWithoutClients_DoesNotExitWithinLegacyTwoSecondWindow(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode, brokerIdleShutdownMs: null);
+
+        using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
+        await scope.WaitForLiveSocketAsync();
+        BrokerStateSnapshot state = await scope.WaitForBrokerStateAsync(static snapshot => snapshot.SessionCount == 0);
+
+        await Task.Delay(TimeSpan.FromSeconds(3));
+
+        BrokerStateSnapshot? stillLive = BrokerStateSnapshot.TryRead(scope.StatePath);
+        Assert.NotNull(stillLive);
+        Assert.Equal(state.Pid, stillLive!.Pid);
+        Assert.True(File.Exists(scope.SocketPath));
+
+        scope.KillBrokerProcess(stillLive.Pid);
+        scope.AssertProcessExited(stillLive.Pid);
+    }
+
+    [Theory]
+    [MemberData(nameof(SidecarOnlyModes))]
+    public async Task LargerRequestedCapacity_WhileBrokerLive_Throws(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
 
         using var smaller = scope.CreateBus(maxPayloadBytes: 1024);
         await scope.WaitForLiveSocketAsync();
@@ -132,10 +272,11 @@ public sealed class SidecarLifecycleTests
         Assert.Contains("payload capacity", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public async Task BrokerRestart_RecreatesRingWithLargerRequestedCapacity()
+    [Theory]
+    [MemberData(nameof(SidecarOnlyModes))]
+    public async Task BrokerRestart_RecreatesRingWithLargerRequestedCapacity(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         using (TinyMessageBus smaller = scope.CreateBus(maxPayloadBytes: 1024))
         {
@@ -159,10 +300,11 @@ public sealed class SidecarLifecycleTests
         Assert.Equal(expected, actual);
     }
 
-    [Fact]
-    public async Task HeartbeatTimeout_ShutsDownBrokerAfterIdleClientStopsHeartbeating()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task HeartbeatTimeout_ShutsDownBrokerAfterIdleClientStopsHeartbeating(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
         using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
@@ -179,14 +321,16 @@ public sealed class SidecarLifecycleTests
         SidecarFrame ready = SidecarProtocol.ReadFrame(socket);
 
         Assert.Equal(SidecarFrameType.Ready, ready.Type);
+        await scope.WaitForBrokerStateAsync(state => state.SessionCount == 1);
 
         await scope.WaitForBrokerShutdownAsync();
     }
 
-    [Fact]
-    public async Task DisposingOneClient_DoesNotInterruptOtherLiveClients()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task DisposingOneClient_DoesNotInterruptOtherLiveClients(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         using var publisher = scope.CreateBus();
         using var droppedSubscriber = scope.CreateBus();
@@ -211,10 +355,11 @@ public sealed class SidecarLifecycleTests
         Assert.True(File.Exists(scope.SocketPath));
     }
 
-    [Fact]
-    public async Task DifferentChannels_ShareSingleBroker_AndChannelTeardownIsIndependent()
+    [Theory]
+    [MemberData(nameof(SidecarOnlyModes))]
+    public async Task DifferentChannels_ShareSingleBroker_AndChannelTeardownIsIndependent(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         using var channelAPublisher = scope.CreateBus("channel-a", maxPayloadBytes: 1024);
         using var channelASubscriber = scope.CreateBus("channel-a", maxPayloadBytes: 1024);
@@ -259,10 +404,11 @@ public sealed class SidecarLifecycleTests
         }
     }
 
-    [Fact]
-    public async Task RawUdsClient_CanPublishToTinyMessageBusSubscriber()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task RawUdsClient_CanPublishToTinyMessageBusSubscriber(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         using var subscriber = scope.CreateBus();
         await scope.WaitForLiveSocketAsync();
 
@@ -279,10 +425,11 @@ public sealed class SidecarLifecycleTests
         Assert.Equal(payload, await receiveTask);
     }
 
-    [Fact]
-    public async Task AbruptSocketDisconnect_LeavesBrokerOperational()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task AbruptSocketDisconnect_LeavesBrokerOperational(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         using var publisher = scope.CreateBus();
         using var subscriber = scope.CreateBus();
 
@@ -306,10 +453,11 @@ public sealed class SidecarLifecycleTests
         Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
     }
 
-    [Fact]
-    public async Task MalformedHello_DoesNotKillBroker_AndGoodClientsStillWork()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task MalformedHello_DoesNotKillBroker_AndGoodClientsStillWork(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         using var publisher = scope.CreateBus();
         using var subscriber = scope.CreateBus();
 
@@ -335,10 +483,11 @@ public sealed class SidecarLifecycleTests
         Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
     }
 
-    [Fact]
-    public async Task UnexpectedFrameBeforeHello_DoesNotKillBroker_AndGoodClientsStillWork()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task UnexpectedFrameBeforeHello_DoesNotKillBroker_AndGoodClientsStillWork(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         using var publisher = scope.CreateBus();
         using var subscriber = scope.CreateBus();
 
@@ -363,21 +512,23 @@ public sealed class SidecarLifecycleTests
         Assert.Equal(pid, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
     }
 
-    [Fact]
-    public async Task UnauthorizedGroup_IsRejected()
+    [Theory]
+    [MemberData(nameof(SidecarOnlyModes))]
+    public async Task UnauthorizedGroup_IsRejected(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         scope.SetSharedGroup("tinyipc-group-that-does-not-exist");
 
         InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() => scope.CreateBus());
-        Assert.Contains("exited before socket", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("shared group", ex.Message, StringComparison.OrdinalIgnoreCase);
         await scope.WaitForBrokerShutdownAsync();
     }
 
-    [Fact]
-    public async Task BrokerKill_IsRecoveredByNextClient()
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task BrokerKill_IsRecoveredByNextClient(string mode)
     {
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
 
         using (TinyMessageBus firstClient = scope.CreateBus())
         {
@@ -404,6 +555,38 @@ public sealed class SidecarLifecycleTests
         await PublishBytesAsync(publisher, payload);
 
         Assert.Equal(payload, await receiveTask);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task BrokerArtifacts_AreCreatedWithStrictGroupPermissions(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+
+        using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
+        using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        socket.Connect(new UnixDomainSocketEndPoint(lease.SocketPath));
+
+        SidecarProtocol.WriteHello(socket, new SidecarHello(
+            scope.ChannelName,
+            1024,
+            Environment.ProcessId,
+            HeartbeatIntervalMs: 100,
+            HeartbeatTimeoutMs: 5_000));
+
+        SidecarAttachRing attach = SidecarProtocol.ReadAttachRing(socket);
+        SidecarFrame ready = SidecarProtocol.ReadFrame(socket);
+        Assert.Equal(SidecarFrameType.Ready, ready.Type);
+
+        BrokerStateSnapshot state = await scope.WaitForBrokerStateAsync(current => current.SessionCount == 1);
+        Assert.Equal($"{scope.SharedGroup} 2770", GetStat(scope.SharedDirectory, "%G %a"));
+        Assert.Equal($"{scope.SharedGroup} 660", GetStat(scope.SocketPath, "%G %a"));
+        Assert.Equal($"{scope.SharedGroup} 660", GetStat(attach.RingPath, "%G %a"));
+        Assert.Equal($"{scope.SharedGroup} 660", GetStat(scope.StatePath, "%G %a"));
+        Assert.Equal(scope.SocketPath, state.SocketPath);
+
+        socket.Dispose();
+        await scope.WaitForBrokerShutdownAsync();
     }
 
     private static async Task<byte[]> ReceiveSingleMessageAsync(TinyMessageBus bus, CancellationToken cancellationToken)
@@ -539,6 +722,26 @@ public sealed class SidecarLifecycleTests
         }
     }
 
+    private static string GetStat(string path, string format)
+    {
+        using var process = Process.Start(new ProcessStartInfo("stat")
+        {
+            ArgumentList = { "-c", format, path },
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        }) ?? throw new InvalidOperationException("Failed to start stat.");
+
+        string output = process.StandardOutput.ReadToEnd().Trim();
+        string error = process.StandardError.ReadToEnd().Trim();
+        process.WaitForExit();
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"stat failed for '{path}': {error}");
+
+        return output;
+    }
+
     private sealed class TestEnvironmentScope : IDisposable
     {
         private readonly string? _previousBackend;
@@ -546,24 +749,55 @@ public sealed class SidecarLifecycleTests
         private readonly string? _previousUnixShell;
         private readonly string? _previousSharedDir;
         private readonly string? _previousSharedGroup;
+        private readonly string? _previousLogDir;
+        private readonly string? _previousLogLevel;
+        private readonly string? _previousLoggingEnabled;
+        private readonly string? _previousFileNotifier;
+        private readonly string? _previousBrokerIdleShutdownMs;
 
-        public TestEnvironmentScope()
+        public TestEnvironmentScope(string mode, int? brokerIdleShutdownMs = 2_000)
         {
             ChannelName = $"xivipc-lifecycle-{Guid.NewGuid():N}";
             SharedDirectory = Path.Combine(Path.GetTempPath(), "xivipc-lifecycle-tests", Guid.NewGuid().ToString("N"));
             SocketPath = Path.Combine(SharedDirectory, "tinyipc-sidecar.sock");
+            StatePath = Path.Combine(SharedDirectory, "tinyipc-sidecar.state.json");
+            SharedGroup = ResolveCurrentSharedGroup();
 
             _previousBackend = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
             _previousHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
             _previousUnixShell = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL");
             _previousSharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
             _previousSharedGroup = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+            _previousLogDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
+            _previousLogLevel = Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL");
+            _previousLoggingEnabled = Environment.GetEnvironmentVariable("TINYIPC_ENABLE_LOGGING");
+            _previousFileNotifier = Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER");
+            _previousBrokerIdleShutdownMs = Environment.GetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
 
             Directory.CreateDirectory(SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+            ProductionPathTestEnvironment.ResetLogger();
+
+            if (ProductionPathTestEnvironment.IsProductionPath(mode))
+            {
+                ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
+                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
+                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", brokerIdleShutdownMs?.ToString());
+            }
+            else
+            {
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", brokerIdleShutdownMs?.ToString());
+            }
 
             if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(_previousUnixShell))
                 Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", "/bin/sh");
@@ -571,7 +805,9 @@ public sealed class SidecarLifecycleTests
 
         public string ChannelName { get; }
         public string SharedDirectory { get; }
+        public string SharedGroup { get; }
         public string SocketPath { get; }
+        public string StatePath { get; }
 
         public TinyMessageBus CreateBus(int maxPayloadBytes = 1024)
             => CreateBus(ChannelName, maxPayloadBytes);
@@ -635,6 +871,27 @@ public sealed class SidecarLifecycleTests
             throw new TimeoutException($"Timed out waiting for live broker socket '{SocketPath}'.", last);
         }
 
+        public async Task<BrokerStateSnapshot> WaitForBrokerStateAsync(Func<BrokerStateSnapshot, bool> predicate)
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            BrokerStateSnapshot? last = null;
+
+            while (DateTime.UtcNow < deadline)
+            {
+                BrokerStateSnapshot? state = BrokerStateSnapshot.TryRead(StatePath);
+                if (state is not null)
+                {
+                    last = state;
+                    if (predicate(state))
+                        return state;
+                }
+
+                await Task.Delay(50);
+            }
+
+            throw new TimeoutException($"Timed out waiting for broker state predicate. last={last}");
+        }
+
         public async Task WaitForSocketRemovedAsync()
         {
             DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
@@ -652,9 +909,43 @@ public sealed class SidecarLifecycleTests
         public async Task WaitForBrokerShutdownAsync()
         {
             await WaitForSocketRemovedAsync();
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (!File.Exists(StatePath))
+                    break;
+
+                await Task.Delay(50);
+            }
 
             if (UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics() != 0)
                 _ = UnixSidecarProcessManager.WaitForOwnedProcessExitForDiagnostics(TimeSpan.FromSeconds(10));
+        }
+
+        public void AssertProcessExited(int pid)
+        {
+            try
+            {
+                using Process process = Process.GetProcessById(pid);
+                bool exited = process.WaitForExit((int)TimeSpan.FromSeconds(10).TotalMilliseconds);
+                Assert.True(exited, $"Expected process {pid} to exit.");
+            }
+            catch (ArgumentException)
+            {
+            }
+        }
+
+        public void KillBrokerProcess(int pid)
+        {
+            try
+            {
+                using Process process = Process.GetProcessById(pid);
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch (ArgumentException)
+            {
+            }
         }
 
         public void Dispose()
@@ -664,6 +955,12 @@ public sealed class SidecarLifecycleTests
             Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", _previousUnixShell);
             Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _previousSharedDir);
             Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", _previousSharedGroup);
+            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", _previousLogDir);
+            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", _previousLogLevel);
+            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", _previousLoggingEnabled);
+            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", _previousFileNotifier);
+            Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", _previousBrokerIdleShutdownMs);
+            ProductionPathTestEnvironment.ResetLogger();
 
             try
             {

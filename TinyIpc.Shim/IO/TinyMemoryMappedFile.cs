@@ -9,7 +9,7 @@ namespace TinyIpc.IO;
 
 public class TinyMemoryMappedFile : ITinyMemoryMappedFile, IDisposable
 {
-    private readonly UnixTinyMemoryMappedFile _impl;
+    private readonly Lazy<UnixTinyMemoryMappedFile> _impl;
 
     public const int DefaultMaxFileSize = TinyIpcOptions.DefaultMaxFileSize;
 
@@ -38,7 +38,7 @@ public class TinyMemoryMappedFile : ITinyMemoryMappedFile, IDisposable
 
         Name = name;
         DeclaredMaxFileSize = maxFileSize;
-        _impl = new UnixTinyMemoryMappedFile(name, maxFileSize);
+        _impl = new Lazy<UnixTinyMemoryMappedFile>(() => new UnixTinyMemoryMappedFile(name, maxFileSize), isThreadSafe: true);
     }
 
     public TinyMemoryMappedFile(string name, long maxFileSize, ILogger<TinyMemoryMappedFile> logger)
@@ -102,34 +102,42 @@ public class TinyMemoryMappedFile : ITinyMemoryMappedFile, IDisposable
             "CreateEventWaitHandle is not supported by this Unix-focused shim.");
     }
 
-    internal UnixTinyMemoryMappedFile GetImplementation() => _impl;
+    internal UnixTinyMemoryMappedFile GetImplementation() => _impl.Value;
 
     public event EventHandler? FileUpdated
     {
-        add => _impl.FileUpdated += value;
-        remove => _impl.FileUpdated -= value;
+        add => GetImplementation().FileUpdated += value;
+        remove
+        {
+            if (_impl.IsValueCreated)
+                _impl.Value.FileUpdated -= value;
+        }
     }
 
-    public long MaxFileSize => _impl.MaxFileSize;
+    public long MaxFileSize => DeclaredMaxFileSize;
 
-    public int GetFileSize() => _impl.GetFileSize();
+    public int GetFileSize() => GetImplementation().GetFileSize();
 
-    public int GetFileSize(CancellationToken cancellationToken = default) => _impl.GetFileSize(cancellationToken);
+    public int GetFileSize(CancellationToken cancellationToken = default) => GetImplementation().GetFileSize(cancellationToken);
 
-    public byte[] Read() => _impl.Read();
+    public byte[] Read() => GetImplementation().Read();
 
     public T Read<T>(Func<MemoryStream, T> readData, CancellationToken cancellationToken = default)
-        => _impl.Read(readData, cancellationToken);
+        => GetImplementation().Read(readData, cancellationToken);
 
-    public void Write(byte[] data) => _impl.Write(data);
+    public void Write(byte[] data) => GetImplementation().Write(data);
 
     public void Write(MemoryStream data, CancellationToken cancellationToken = default)
-        => _impl.Write(data, cancellationToken);
+        => GetImplementation().Write(data, cancellationToken);
 
-    public void ReadWrite(Func<byte[], byte[]> updateFunc) => _impl.ReadWrite(updateFunc);
+    public void ReadWrite(Func<byte[], byte[]> updateFunc) => GetImplementation().ReadWrite(updateFunc);
 
     public void ReadWrite(Action<MemoryStream, MemoryStream> updateFunc, CancellationToken cancellationToken = default)
-        => _impl.ReadWrite(updateFunc, cancellationToken);
+        => GetImplementation().ReadWrite(updateFunc, cancellationToken);
 
-    public void Dispose() => _impl.Dispose();
+    public void Dispose()
+    {
+        if (_impl.IsValueCreated)
+            _impl.Value.Dispose();
+    }
 }

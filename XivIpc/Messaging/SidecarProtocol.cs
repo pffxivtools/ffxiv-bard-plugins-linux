@@ -45,6 +45,7 @@ namespace XivIpc.Internal
     internal static class SidecarProtocol
     {
         private const int LengthPrefixBytes = 4;
+        private const int AttachRingFixedPayloadBytes = 4 + 4 + 4 + 4 + 8 + 8 + 4;
 
         public static void WriteHello(Socket socket, SidecarHello hello)
         {
@@ -113,6 +114,11 @@ namespace XivIpc.Internal
         public static SidecarAttachRing ReadAttachRing(Socket socket)
         {
             SidecarFrame frame = ReadFrame(socket);
+            return DecodeAttachRing(frame);
+        }
+
+        public static SidecarAttachRing DecodeAttachRing(SidecarFrame frame)
+        {
             SidecarFrameType frameType = frame.Type;
             if (frameType == SidecarFrameType.Error)
             {
@@ -126,6 +132,9 @@ namespace XivIpc.Internal
                 throw new InvalidDataException("Expected ATTACH_RING from the broker.");
 
             ReadOnlySpan<byte> span = frame.Payload.Span;
+            if (span.Length < AttachRingFixedPayloadBytes)
+                throw new InvalidDataException($"ATTACH_RING payload is truncated. length={span.Length} minimum={AttachRingFixedPayloadBytes}.");
+
             int offset = 0;
             int version = ReadInt32(span, ref offset);
             int ringPathLength = ReadInt32(span, ref offset);
@@ -135,8 +144,33 @@ namespace XivIpc.Internal
             long sessionId = ReadInt64(span, ref offset);
             int ringLength = ReadInt32(span, ref offset);
 
-            if (ringPathLength < 0 || offset + ringPathLength > span.Length)
-                throw new InvalidDataException("ATTACH_RING ring path payload is invalid.");
+            if (version != 3)
+                throw new InvalidDataException($"ATTACH_RING protocol version '{version}' is unsupported.");
+
+            if (ringPathLength < 0)
+                throw new InvalidDataException($"ATTACH_RING ring path length is invalid. ringPathLength={ringPathLength}.");
+
+            int remainingBytes = span.Length - offset;
+            if (ringPathLength > remainingBytes)
+            {
+                throw new InvalidDataException(
+                    $"ATTACH_RING ring path payload is invalid. ringPathLength={ringPathLength} remainingBytes={remainingBytes} payloadLength={span.Length}.");
+            }
+
+            if (slotCount <= 0)
+                throw new InvalidDataException($"ATTACH_RING slot count is invalid. slotCount={slotCount}.");
+
+            if (slotPayloadBytes <= 0)
+                throw new InvalidDataException($"ATTACH_RING slot payload size is invalid. slotPayloadBytes={slotPayloadBytes}.");
+
+            if (ringLength <= 0)
+                throw new InvalidDataException($"ATTACH_RING ring length is invalid. ringLength={ringLength}.");
+
+            if (startSequence < 0)
+                throw new InvalidDataException($"ATTACH_RING start sequence is invalid. startSequence={startSequence}.");
+
+            if (sessionId <= 0)
+                throw new InvalidDataException($"ATTACH_RING session id is invalid. sessionId={sessionId}.");
 
             string ringPath = System.Text.Encoding.UTF8.GetString(span.Slice(offset, ringPathLength));
             return new SidecarAttachRing(ringPath, slotCount, slotPayloadBytes, startSequence, sessionId, ringLength, version);

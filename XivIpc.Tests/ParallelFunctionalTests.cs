@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Reflection;
 using System.Text;
 using TinyIpc.Messaging;
@@ -624,6 +625,11 @@ public sealed class ParallelFunctionalTests
         private readonly string? _previousHostPath;
         private readonly string? _previousUnixShell;
         private readonly string? _previousSharedDir;
+        private readonly string? _previousSharedGroup;
+        private readonly string? _previousLogDir;
+        private readonly string? _previousLogLevel;
+        private readonly string? _previousLoggingEnabled;
+        private readonly string? _previousFileNotifier;
         private readonly string _testSharedDir;
 
         public string Backend { get; }
@@ -638,14 +644,39 @@ public sealed class ParallelFunctionalTests
             _previousHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
             _previousUnixShell = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL");
             _previousSharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+            _previousSharedGroup = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+            _previousLogDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
+            _previousLogLevel = Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL");
+            _previousLoggingEnabled = Environment.GetEnvironmentVariable("TINYIPC_ENABLE_LOGGING");
+            _previousFileNotifier = Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER");
             _testSharedDir = Path.Combine(Path.GetTempPath(), "xivipc-parallel-tests", Guid.NewGuid().ToString("N"));
 
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", backend);
+            ProductionPathTestEnvironment.ResetLogger();
+
+            if (ProductionPathTestEnvironment.IsProductionPath(backend))
+            {
+                Directory.CreateDirectory(_testSharedDir);
+                ProductionPathTestEnvironment.PrepareStagedNativeHost(_testSharedDir);
+
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir));
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ProductionPathTestEnvironment.ResolveSharedGroup());
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir));
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
+                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
+                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+            }
+            else
+            {
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", backend);
+            }
 
             if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
             {
                 Directory.CreateDirectory(_testSharedDir);
                 Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _testSharedDir);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
 
                 string? hostPath = ResolveNativeHostPath();
                 if (!string.IsNullOrWhiteSpace(hostPath))
@@ -662,6 +693,12 @@ public sealed class ParallelFunctionalTests
             Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", _previousHostPath);
             Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", _previousUnixShell);
             Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _previousSharedDir);
+            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", _previousSharedGroup);
+            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", _previousLogDir);
+            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", _previousLogLevel);
+            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", _previousLoggingEnabled);
+            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", _previousFileNotifier);
+            ProductionPathTestEnvironment.ResetLogger();
 
             try
             {
@@ -699,6 +736,24 @@ public sealed class ParallelFunctionalTests
             };
 
             return candidates.FirstOrDefault(File.Exists);
+        }
+
+        private static string ResolveCurrentSharedGroup()
+        {
+            using var process = Process.Start(new ProcessStartInfo("id", "-gn")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            }) ?? throw new InvalidOperationException("Failed to start 'id -gn' to resolve the shared group.");
+
+            string output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+                throw new InvalidOperationException("Failed to resolve the current user's primary group for sidecar tests.");
+
+            return output;
         }
     }
 

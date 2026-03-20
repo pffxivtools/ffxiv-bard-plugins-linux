@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
+using XivIpc.Internal;
 using XivIpc.Messaging;
 
 namespace TinyIpc.Internal;
@@ -39,14 +40,24 @@ internal static class UnixMessageBusBackendFactory
 
     private static IShimTinyMessageBus CreateAuto(ChannelInfo channelInfo)
     {
-        Exception? sidecarFailure;
+        bool brokerRequired = IsBrokerRequiredForAuto();
+        Exception? sidecarFailure = null;
         try
         {
             return CreateSidecar(channelInfo);
         }
-        catch (Exception ex) when (ShouldFallbackFromSidecar(ex))
+        catch (Exception ex)
         {
             sidecarFailure = ex;
+            LogAutoSidecarFailure(channelInfo, ex, brokerRequired);
+
+            if (brokerRequired)
+            {
+                return new DisabledShimMessageBus(
+                    channelInfo.Name,
+                    "Brokered startup was required for this process and sidecar initialization failed.",
+                    ex);
+            }
         }
 
         try
@@ -55,8 +66,18 @@ internal static class UnixMessageBusBackendFactory
         }
         catch (Exception directEx)
         {
-            throw new InvalidOperationException(
-                "TinyIpc auto backend selection failed. Sidecar startup failed, and direct shared-memory startup also failed.",
+            TinyIpcLogger.Warning(
+                nameof(UnixMessageBusBackendFactory),
+                "AutoDirectFailed",
+                "Direct/in-memory backend initialization failed during auto backend selection; using safe no-op behavior.",
+                directEx,
+                ("channel", channelInfo.Name),
+                ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR")),
+                ("configuredBackend", Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND") ?? AutoBackend));
+
+            return new DisabledShimMessageBus(
+                channelInfo.Name,
+                "Auto backend could not initialize either sidecar or direct/in-memory backend.",
                 new AggregateException(
                     "TinyIpc backend startup failures.",
                     sidecarFailure ?? new InvalidOperationException("Unknown sidecar startup failure."),
@@ -76,13 +97,35 @@ internal static class UnixMessageBusBackendFactory
 
         return ex is FileNotFoundException
             or DirectoryNotFoundException
-            or TimeoutException
             or IOException
-            or UnauthorizedAccessException
-            or InvalidOperationException
             or PlatformNotSupportedException
             or SocketException
-            or Win32Exception;
+            or Win32Exception
+            or SidecarStartupException;
+    }
+
+    private static bool IsBrokerRequiredForAuto()
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP")))
+            return false;
+
+        return UnixSidecarProcessManager.TryResolveNativeHostPath(out _);
+    }
+
+    private static void LogAutoSidecarFailure(ChannelInfo channelInfo, Exception ex, bool brokerRequired)
+    {
+        TinyIpcLogger.Warning(
+            nameof(UnixMessageBusBackendFactory),
+            brokerRequired ? "AutoBrokerRequiredFailed" : "AutoFallbackToDirect",
+            brokerRequired
+                ? "Sidecar startup failed during auto backend selection; brokered mode was required so TinyIpc will use a safe no-op bus."
+                : "Sidecar startup failed during auto backend selection; falling back to direct/in-memory backend.",
+            ex,
+            ("channel", channelInfo.Name),
+            ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR")),
+            ("configuredBackend", Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND") ?? AutoBackend),
+            ("brokerRequired", brokerRequired),
+            ("nativeHostCandidates", string.Join(";", UnixSidecarProcessManager.GetNativeHostCandidatePathsForDiagnostics())));
     }
 
     private static Exception Unwrap(Exception ex)

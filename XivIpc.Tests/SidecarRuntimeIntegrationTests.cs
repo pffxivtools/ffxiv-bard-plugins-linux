@@ -13,13 +13,14 @@ namespace XivIpc.Tests;
 [Collection("TinyIpc Serial")]
 public sealed class SidecarRuntimeIntegrationTests
 {
-    [Fact]
-    public async Task Wine_Client_StartsBrokerAndReceivesFromNative_WhenEnabled()
+    [Theory]
+    [InlineData(false)]
+    public async Task Wine_Client_StartsBrokerAndReceivesFromNative_WhenEnabled(bool productionDiscovery)
     {
         if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_WINE_TESTS"))
             return;
 
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(productionDiscovery);
         string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
         string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
         string runnerPath = RuntimeHarness.ResolveScriptPath("run-wine-test-host.sh");
@@ -33,6 +34,7 @@ public sealed class SidecarRuntimeIntegrationTests
             scope.CreateEnvironment(nativeHostPath));
 
         await subscriber.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
 
         using var publisher = scope.CreateBus();
         await Task.Delay(750);
@@ -45,13 +47,14 @@ public sealed class SidecarRuntimeIntegrationTests
         Assert.Equal(0, await subscriber.WaitForExitAsync(TimeSpan.FromSeconds(10)));
     }
 
-    [Fact]
-    public async Task Proton_Client_StartsBrokerAndReceivesFromNative_WhenEnabled()
+    [Theory]
+    [InlineData(false)]
+    public async Task Proton_Client_StartsBrokerAndReceivesFromNative_WhenEnabled(bool productionDiscovery)
     {
         if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_PROTON_TESTS"))
             return;
 
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(productionDiscovery);
         string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
         string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
         string runnerPath = RuntimeHarness.ResolveScriptPath("run-proton-test-host.sh");
@@ -65,6 +68,7 @@ public sealed class SidecarRuntimeIntegrationTests
             scope.CreateEnvironment(nativeHostPath));
 
         await subscriber.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
 
         using var publisher = scope.CreateBus();
         await Task.Delay(750);
@@ -77,13 +81,14 @@ public sealed class SidecarRuntimeIntegrationTests
         Assert.Equal(0, await subscriber.WaitForExitAsync(TimeSpan.FromSeconds(10)));
     }
 
-    [Fact]
-    public async Task Wine_Client_KilledWithoutDispose_CanReconnectToLiveBroker_WhenEnabled()
+    [Theory]
+    [InlineData(false)]
+    public async Task Wine_Client_KilledWithoutDispose_CanReconnectToLiveBroker_WhenEnabled(bool productionDiscovery)
     {
         if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_WINE_TESTS"))
             return;
 
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(productionDiscovery);
         string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
         string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
         string runnerPath = RuntimeHarness.ResolveScriptPath("run-wine-test-host.sh");
@@ -101,6 +106,7 @@ public sealed class SidecarRuntimeIntegrationTests
             scope.CreateEnvironment(nativeHostPath));
 
         await holder.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
         holder.Kill();
         Assert.NotEqual(0, await holder.WaitForExitAsync(TimeSpan.FromSeconds(10)));
 
@@ -123,13 +129,41 @@ public sealed class SidecarRuntimeIntegrationTests
         Assert.Equal(0, await subscriber.WaitForExitAsync(TimeSpan.FromSeconds(10)));
     }
 
-    [Fact]
-    public async Task Proton_Client_KilledWithoutDispose_CanReconnectToLiveBroker_WhenEnabled()
+    [Theory]
+    [InlineData(false)]
+    public async Task Wine_Client_Dispose_RemovesSession_AndBrokerShutsDown_WhenEnabled(bool productionDiscovery)
+    {
+        if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_WINE_TESTS"))
+            return;
+
+        using TestEnvironmentScope scope = new(productionDiscovery);
+        string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
+        string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
+        string runnerPath = RuntimeHarness.ResolveScriptPath("run-wine-test-host.sh");
+
+        using HostedProcess client = RuntimeHarness.StartProcess(
+            runnerPath,
+            hostPath,
+            "connect-dispose-and-wait",
+            scope.ChannelName,
+            "3000",
+            scope.CreateEnvironment(nativeHostPath));
+
+        await client.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
+        await client.WaitForStdoutLineAsync("DISPOSED", TimeSpan.FromSeconds(30));
+        await scope.WaitForBrokerShutdownAsync();
+        Assert.Equal(0, await client.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    public async Task Proton_Client_KilledWithoutDispose_CanReconnectToLiveBroker_WhenEnabled(bool productionDiscovery)
     {
         if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_PROTON_TESTS"))
             return;
 
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(productionDiscovery);
         string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
         string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
         string runnerPath = RuntimeHarness.ResolveScriptPath("run-proton-test-host.sh");
@@ -147,6 +181,7 @@ public sealed class SidecarRuntimeIntegrationTests
             scope.CreateEnvironment(nativeHostPath));
 
         await holder.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
         holder.Kill();
         Assert.NotEqual(0, await holder.WaitForExitAsync(TimeSpan.FromSeconds(10)));
 
@@ -167,6 +202,33 @@ public sealed class SidecarRuntimeIntegrationTests
         string messageLine = await subscriber.WaitForStdoutPrefixAsync("MESSAGE:", TimeSpan.FromSeconds(15));
         Assert.Equal(Convert.ToBase64String(payload), messageLine["MESSAGE:".Length..]);
         Assert.Equal(0, await subscriber.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    public async Task Proton_Client_Dispose_RemovesSession_AndBrokerShutsDown_WhenEnabled(bool productionDiscovery)
+    {
+        if (!RuntimeHarness.ShouldRun("TINYIPC_ENABLE_PROTON_TESTS"))
+            return;
+
+        using TestEnvironmentScope scope = new(productionDiscovery);
+        string hostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_TEST_HOST_PATH");
+        string nativeHostPath = RuntimeHarness.ResolveRequiredArtifactPath("TINYIPC_RUNTIME_NATIVE_HOST_PATH");
+        string runnerPath = RuntimeHarness.ResolveScriptPath("run-proton-test-host.sh");
+
+        using HostedProcess client = RuntimeHarness.StartProcess(
+            runnerPath,
+            hostPath,
+            "connect-dispose-and-wait",
+            scope.ChannelName,
+            "3000",
+            scope.CreateEnvironment(nativeHostPath));
+
+        await client.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(30));
+        scope.AssertProductionSidecarStarted();
+        await client.WaitForStdoutLineAsync("DISPOSED", TimeSpan.FromSeconds(30));
+        await scope.WaitForBrokerShutdownAsync();
+        Assert.Equal(0, await client.WaitForExitAsync(TimeSpan.FromSeconds(10)));
     }
 
     private static async Task PublishBytesAsync(TinyMessageBus bus, byte[] bytes)
@@ -228,9 +290,11 @@ public sealed class SidecarRuntimeIntegrationTests
     private sealed class TestEnvironmentScope : IDisposable
     {
         private readonly Dictionary<string, string?> _previousEnvironment = new(StringComparer.Ordinal);
+        private readonly bool _productionDiscovery;
 
-        public TestEnvironmentScope()
+        public TestEnvironmentScope(bool productionDiscovery)
         {
+            _productionDiscovery = productionDiscovery;
             ChannelName = $"xivipc-runtime-{Guid.NewGuid():N}";
             SharedDirectory = Path.Combine(Path.GetTempPath(), "xivipc-runtime-tests", Guid.NewGuid().ToString("N"));
             SocketPath = Path.Combine(SharedDirectory, "tinyipc-sidecar.sock");
@@ -243,11 +307,32 @@ public sealed class SidecarRuntimeIntegrationTests
             Capture("TINYIPC_NATIVE_HOST_PATH");
             Capture("TINYIPC_UNIX_SHELL");
             Capture("TINYIPC_TEST_MAX_PAYLOAD_BYTES");
+            Capture("TINYIPC_LOG_DIR");
+            Capture("TINYIPC_LOG_LEVEL");
+            Capture("TINYIPC_ENABLE_LOGGING");
+            Capture("TINYIPC_FILE_NOTIFIER");
 
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+            ProductionPathTestEnvironment.ResetLogger();
+
+            if (_productionDiscovery)
+            {
+                ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
+                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
+                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+            }
+            else
+            {
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+            }
             Environment.SetEnvironmentVariable("TINYIPC_TEST_MAX_PAYLOAD_BYTES", "4096");
 
             if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL")))
@@ -261,8 +346,45 @@ public sealed class SidecarRuntimeIntegrationTests
         public TinyMessageBus CreateBus(int maxPayloadBytes = 4096)
             => new(new TinyMemoryMappedFile(ChannelName, maxPayloadBytes), disposeFile: true);
 
+        public void AssertProductionSidecarStarted()
+        {
+            if (!_productionDiscovery)
+                return;
+
+            Assert.True(File.Exists(SocketPath), $"Expected broker socket '{SocketPath}' to exist.");
+            Assert.True(File.Exists(Path.Combine(SharedDirectory, "tinyipc-sidecar.state.json")), "Expected broker state file to exist.");
+
+            string clientLog = ProductionPathTestEnvironment.ReadLatestClientLogOrEmpty(SharedDirectory);
+            string nativeLog = ProductionPathTestEnvironment.ReadLatestUnixProcessLogOrEmpty(SharedDirectory);
+            ProductionPathTestEnvironment.AssertStartedSidecar(clientLog);
+            ProductionPathTestEnvironment.AssertHealthyNativeBrokerLog(nativeLog);
+            ProductionPathTestEnvironment.AssertLaunchContract(
+                clientLog,
+                nativeLog,
+                SharedDirectory,
+                SocketPath,
+                Path.Combine(SharedDirectory, "tinyipc-native-host", "XivIpc.NativeHost"));
+        }
+
         public Dictionary<string, string> CreateEnvironment(string nativeHostPath)
         {
+            if (_productionDiscovery)
+            {
+                ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
+
+                return new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["TINYIPC_SHARED_DIR"] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory),
+                    ["TINYIPC_SHARED_GROUP"] = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? ResolveCurrentSharedGroup(),
+                    ["TINYIPC_TEST_MAX_PAYLOAD_BYTES"] = "4096",
+                    ["TINYIPC_UNIX_SHELL"] = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL") ?? "/bin/sh",
+                    ["TINYIPC_LOG_DIR"] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory),
+                    ["TINYIPC_LOG_LEVEL"] = "info",
+                    ["TINYIPC_ENABLE_LOGGING"] = "1",
+                    ["TINYIPC_FILE_NOTIFIER"] = "auto"
+                };
+            }
+
             return new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["TINYIPC_MESSAGE_BUS_BACKEND"] = "sidecar",
@@ -301,10 +423,26 @@ public sealed class SidecarRuntimeIntegrationTests
             throw new TimeoutException($"Timed out waiting for live broker socket '{SocketPath}'.", last);
         }
 
+        public async Task WaitForBrokerShutdownAsync()
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (!File.Exists(SocketPath))
+                    return;
+
+                await Task.Delay(50).ConfigureAwait(false);
+            }
+
+            Assert.False(File.Exists(SocketPath), $"Expected broker socket '{SocketPath}' to be removed.");
+        }
+
         public void Dispose()
         {
             foreach ((string key, string? value) in _previousEnvironment)
                 Environment.SetEnvironmentVariable(key, value);
+
+            ProductionPathTestEnvironment.ResetLogger();
 
             try
             {

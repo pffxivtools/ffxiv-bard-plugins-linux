@@ -21,6 +21,7 @@ static async Task<int> ProgramMainAsync(string[] args)
         return command switch
         {
             "connect" => await ConnectAsync(channel, maxPayloadBytes).ConfigureAwait(false),
+            "connect-dispose-and-wait" => await ConnectDisposeAndWaitAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "hold" => await HoldAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "publish" => await PublishAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "subscribe-once" => await SubscribeOnceAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
@@ -51,6 +52,21 @@ static async Task<int> HoldAsync(string channel, int maxPayloadBytes, string[] a
     Console.Out.WriteLine("CONNECTED");
     await Console.Out.FlushAsync().ConfigureAwait(false);
     await Task.Delay(TimeSpan.FromSeconds(holdSeconds)).ConfigureAwait(false);
+    return 0;
+}
+
+static async Task<int> ConnectDisposeAndWaitAsync(string channel, int maxPayloadBytes, string[] args)
+{
+    if (args.Length < 3 || !int.TryParse(args[2], out int waitMs) || waitMs < 0)
+        return Fail("connect-dispose-and-wait requires a non-negative wait time in milliseconds.");
+
+    var bus = CreateBus(channel, maxPayloadBytes);
+    Console.Out.WriteLine("CONNECTED");
+    await Console.Out.FlushAsync().ConfigureAwait(false);
+    bus.Dispose();
+    Console.Out.WriteLine("DISPOSED");
+    await Console.Out.FlushAsync().ConfigureAwait(false);
+    await Task.Delay(waitMs).ConfigureAwait(false);
     return 0;
 }
 

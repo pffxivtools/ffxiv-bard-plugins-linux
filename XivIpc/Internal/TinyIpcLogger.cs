@@ -227,7 +227,7 @@ namespace XivIpc.Internal
         {
             string? configured = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
             if (!string.IsNullOrWhiteSpace(configured))
-                return configured;
+                return UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(configured);
 
             return Path.Combine(Path.GetTempPath(), "TinyIpc");
         }

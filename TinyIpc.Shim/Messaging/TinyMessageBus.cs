@@ -83,6 +83,18 @@ public sealed class TinyMessageBus : ITinyMessageBus
     {
         TinyIpcLogger.EnsureInitialized(RuntimeEnvironmentDetector.Detect());
         ArgumentNullException.ThrowIfNull(memoryMappedFile);
+        TinyIpcProcessStamp stamp = TinyIpcProcessStamp.Create(typeof(TinyMessageBus));
+        TinyIpcLogger.Info(
+            nameof(TinyMessageBus),
+            "ClientProcessStamp",
+            "Resolved TinyIpc client process stamp.",
+            ("assemblyPath", stamp.AssemblyPath),
+            ("assemblyName", stamp.AssemblyName),
+            ("informationalVersion", stamp.InformationalVersion),
+            ("fileVersion", stamp.FileVersion),
+            ("sha256", stamp.Sha256),
+            ("processPath", stamp.ProcessPath),
+            ("processSha256", stamp.ProcessSha256));
 
         if (memoryMappedFile is not TinyMemoryMappedFile shimFile)
             throw new ArgumentException("TinyMessageBus requires the TinyIpc.Shim TinyMemoryMappedFile implementation.", nameof(memoryMappedFile));

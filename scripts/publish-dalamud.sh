@@ -197,11 +197,27 @@ publish_shim() {
 
 stage_native_host_payload() {
   local staging_dir="${TINYIPC_SHARED_DIR}/tinyipc-native-host"
+  local shared_group="${TINYIPC_SHARED_GROUP:-steam}"
+
   rm -rf "${staging_dir}"
-  mkdir -p "${staging_dir}"
+  mkdir -p "${TINYIPC_SHARED_DIR}" "${staging_dir}"
+
+  if getent group "${shared_group}" >/dev/null 2>&1; then
+    chgrp -- "${shared_group}" "${TINYIPC_SHARED_DIR}" "${staging_dir}"
+    chmod 2770 -- "${TINYIPC_SHARED_DIR}" "${staging_dir}"
+  fi
 
   while IFS= read -r -d '' artifact; do
-    cp -f "${artifact}" "${staging_dir}/"
+    local dest="${staging_dir}/$(basename "${artifact}")"
+    install -m 660 -- "${artifact}" "${dest}"
+
+    if [[ -x "${artifact}" ]]; then
+      chmod 770 -- "${dest}"
+    fi
+
+    if getent group "${shared_group}" >/dev/null 2>&1; then
+      chgrp -- "${shared_group}" "${dest}"
+    fi
   done < <(find "${DIST_DIR}" -maxdepth 1 -type f -print0)
 
   log "Staged native host payload: ${staging_dir}"

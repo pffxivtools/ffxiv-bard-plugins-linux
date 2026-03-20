@@ -53,7 +53,9 @@ namespace XivIpc.Messaging
                     ResolveHeartbeatIntervalMs(),
                     ResolveHeartbeatTimeoutMs()));
 
-                SidecarAttachRing attach = SidecarProtocol.ReadAttachRing(_socket);
+                SidecarFrame attachFrame = SidecarProtocol.ReadFrame(_socket);
+                LogAttachFrameReceived(attachFrame);
+                SidecarAttachRing attach = DecodeAttachFrame(attachFrame);
                 _ring = AttachRingWithRetry(attach);
                 _sessionId = attach.SessionId;
                 _nextSequence = attach.StartSequence;
@@ -96,8 +98,9 @@ namespace XivIpc.Messaging
 
             _disposed = true;
 
-            try { _cts.Cancel(); } catch { }
             try { TryWriteDisposeAsync(); } catch { }
+            try { _cts.Cancel(); } catch { }
+            try { _socket.Shutdown(SocketShutdown.Both); } catch { }
             try { _socket.Dispose(); } catch { }
             try { _pendingSignal.Release(); } catch { }
             try { Task.WaitAll(new[] { _eventLoopTask, _dispatchLoopTask, _heartbeatTask }, TimeSpan.FromSeconds(2)); } catch { }
@@ -276,6 +279,39 @@ namespace XivIpc.Messaging
             throw new InvalidOperationException($"Failed to connect to broker socket '{socketPath}'.", last);
         }
 
+        private SidecarAttachRing DecodeAttachFrame(SidecarFrame frame)
+        {
+            try
+            {
+                return SidecarProtocol.DecodeAttachRing(frame);
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "AttachRingDecodeFailed",
+                    "Failed to decode broker ATTACH_RING frame.",
+                    ex,
+                    ("channel", _channelName),
+                    ("frameType", frame.Type),
+                    ("payloadLength", frame.Payload.Length),
+                    ("payloadPreview", BuildPayloadPreview(frame.Payload.Span)));
+                throw;
+            }
+        }
+
+        private void LogAttachFrameReceived(SidecarFrame frame)
+        {
+            TinyIpcLogger.Info(
+                nameof(UnixSidecarTinyMessageBus),
+                "AttachRingFrameReceived",
+                "Received broker attach frame.",
+                ("channel", _channelName),
+                ("frameType", frame.Type),
+                ("payloadLength", frame.Payload.Length),
+                ("payloadPreview", BuildPayloadPreview(frame.Payload.Span)));
+        }
+
         private static BrokeredChannelRing AttachRingWithRetry(SidecarAttachRing attach)
         {
             Exception? last = null;
@@ -306,6 +342,12 @@ namespace XivIpc.Messaging
         {
             string? raw = Environment.GetEnvironmentVariable(variableName);
             return int.TryParse(raw, out int value) && value > 0 ? value : fallback;
+        }
+
+        private static string BuildPayloadPreview(ReadOnlySpan<byte> payload)
+        {
+            int count = Math.Min(payload.Length, 32);
+            return count == 0 ? string.Empty : Convert.ToHexString(payload[..count]);
         }
 
         private void SafeDisposeCore()

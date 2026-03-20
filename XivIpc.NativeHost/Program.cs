@@ -4,6 +4,29 @@ using XivIpc.Internal;
 using XivIpc.Messaging;
 
 TinyIpcLogger.EnsureInitialized(RuntimeEnvironmentDetector.Detect());
+TinyIpcProcessStamp brokerStamp = TinyIpcProcessStamp.Create(typeof(BrokerStateSnapshot));
+TinyIpcLogger.Info(
+    "NativeHost",
+    "BrokerProcessStamp",
+    "Resolved TinyIpc native broker process stamp.",
+    ("assemblyPath", brokerStamp.AssemblyPath),
+    ("assemblyName", brokerStamp.AssemblyName),
+    ("informationalVersion", brokerStamp.InformationalVersion),
+    ("fileVersion", brokerStamp.FileVersion),
+    ("sha256", brokerStamp.Sha256),
+    ("processPath", brokerStamp.ProcessPath),
+    ("processSha256", brokerStamp.ProcessSha256));
+TinyIpcLogger.Info(
+    "NativeHost",
+    "BrokerStartupObservedEnvironment",
+    "Observed native broker startup environment before path normalization.",
+    ("launchId", Environment.GetEnvironmentVariable("TINYIPC_LAUNCH_ID") ?? string.Empty),
+    ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR") ?? string.Empty),
+    ("brokerDir", Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR") ?? string.Empty),
+    ("logDir", Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR") ?? string.Empty),
+    ("sharedGroup", Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? string.Empty),
+    ("brokerSocketPath", Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH") ?? string.Empty),
+    ("backend", Environment.GetEnvironmentVariable("TINYIPC_BUS_BACKEND") ?? string.Empty));
 UnixSharedStorageHelpers.EnsureBrokerAccessConfigured();
 
 string socketPath = ResolveSocketPath();
@@ -14,16 +37,17 @@ if (!string.IsNullOrWhiteSpace(socketDirectory))
     UnixSharedStorageHelpers.ApplyBrokerPermissions(socketDirectory, isDirectory: true);
 }
 
-if (File.Exists(socketPath))
-{
-    try { File.Delete(socketPath); } catch { }
-}
-
 using var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-listener.Bind(new UnixDomainSocketEndPoint(socketPath));
+if (!TryBindListener(listener, socketPath))
+    return;
+
 listener.Listen(128);
 
 UnixSharedStorageHelpers.ApplyBrokerPermissions(socketPath, isDirectory: false);
+
+BrokerStateSnapshot brokerState = BrokerStateSnapshot.CreateNew(socketPath);
+string brokerStatePath = BrokerStateSnapshot.ResolvePath(socketPath);
+BrokerStateSnapshot.Write(brokerStatePath, brokerState);
 
 Console.Out.WriteLine($"SOCKET:{socketPath}");
 Console.Out.WriteLine("READY");
@@ -33,6 +57,7 @@ var channels = new ConcurrentDictionary<string, BrokerChannel>(StringComparer.Or
 var sessions = new ConcurrentDictionary<long, BrokerSession>();
 long nextSessionId = 0;
 long lastEmptyTicks = DateTimeOffset.UtcNow.UtcTicks;
+var stateGate = new object();
 
 using var shutdownCts = new CancellationTokenSource();
 Task monitorTask = Task.Run(() => MonitorSessionsAsync(shutdownCts.Token));
@@ -99,12 +124,15 @@ finally
 
     try
     {
-        if (File.Exists(socketPath))
+        BrokerStateSnapshot? activeState = BrokerStateSnapshot.TryRead(brokerStatePath);
+        if (activeState is not null && string.Equals(activeState.InstanceId, brokerState.InstanceId, StringComparison.Ordinal) && File.Exists(socketPath))
             File.Delete(socketPath);
     }
     catch
     {
     }
+
+    BrokerStateSnapshot.DeleteIfOwned(brokerStatePath, brokerState.InstanceId);
 }
 
 async Task<BrokerSession> RegisterSessionAsync(Socket socket)
@@ -123,12 +151,26 @@ async Task<BrokerSession> RegisterSessionAsync(Socket socket)
 
     BrokerChannel channel = channels.GetOrAdd(
         hello.Channel,
-        static (channelName, state) => new BrokerChannel(channelName, state.SlotCount, state.SlotPayloadBytes, state.BrokerDirectory),
-        new ChannelSeed(ResolveSlotCount(), hello.MaxBytes, socketDirectory ?? throw new InvalidOperationException("Broker socket directory was not resolved.")));
+        static (channelName, state) => new BrokerChannel(channelName, state.SlotCount, state.SlotPayloadBytes, state.BrokerDirectory, state.InstanceId),
+        new ChannelSeed(ResolveSlotCount(), hello.MaxBytes, socketDirectory ?? throw new InvalidOperationException("Broker socket directory was not resolved."), brokerState.InstanceId));
 
     channel.Attach(session, hello.MaxBytes);
     sessions[sessionId] = session;
     Interlocked.Exchange(ref lastEmptyTicks, 0);
+    PersistBrokerState();
+
+    TinyIpcLogger.Info(
+        "NativeHost",
+        "AttachRingSending",
+        "Sending broker ATTACH_RING frame to client.",
+        ("channel", channel.ChannelName),
+        ("ringPath", channel.Ring.FilePath),
+        ("slotCount", channel.Ring.SlotCount),
+        ("slotPayloadBytes", channel.Ring.SlotPayloadBytes),
+        ("ringLength", channel.Ring.Length),
+        ("startSequence", channel.Ring.CaptureHead()),
+        ("sessionId", sessionId),
+        ("protocolVersion", 3));
 
     SidecarProtocol.WriteAttachRing(
         socket,
@@ -212,6 +254,7 @@ void RemoveSession(BrokerSession session)
         Interlocked.Exchange(ref lastEmptyTicks, DateTimeOffset.UtcNow.UtcTicks);
 
     session.Dispose();
+    PersistBrokerState();
 }
 
 async Task MonitorSessionsAsync(CancellationToken cancellationToken)
@@ -311,7 +354,7 @@ static TimeSpan ResolveIdleShutdownDelay()
     string? raw = Environment.GetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
     return int.TryParse(raw, out int value) && value >= 250
         ? TimeSpan.FromMilliseconds(value)
-        : TimeSpan.FromSeconds(2);
+        : TimeSpan.FromSeconds(120);
 }
 
 static string ResolveSocketPath()
@@ -345,16 +388,73 @@ static string ConvertWindowsPathToUnix(string path)
     return normalized;
 }
 
+static bool TryBindListener(Socket listener, string socketPath)
+{
+    try
+    {
+        listener.Bind(new UnixDomainSocketEndPoint(socketPath));
+        return true;
+    }
+    catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+    {
+        if (CanConnectToSocket(socketPath))
+            return false;
+
+        try
+        {
+            if (File.Exists(socketPath))
+                File.Delete(socketPath);
+        }
+        catch
+        {
+        }
+
+        listener.Bind(new UnixDomainSocketEndPoint(socketPath));
+        return true;
+    }
+}
+
+static bool CanConnectToSocket(string socketPath)
+{
+    try
+    {
+        using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        socket.ReceiveTimeout = 250;
+        socket.SendTimeout = 250;
+        socket.Connect(new UnixDomainSocketEndPoint(socketPath));
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+void PersistBrokerState()
+{
+    lock (stateGate)
+    {
+        brokerState = brokerState with
+        {
+            SessionCount = sessions.Count,
+            ChannelCount = channels.Count,
+            LastUpdatedUtcTicks = DateTimeOffset.UtcNow.UtcTicks
+        };
+
+        BrokerStateSnapshot.Write(brokerStatePath, brokerState);
+    }
+}
+
 sealed class BrokerChannel : IDisposable
 {
     private readonly object _gate = new();
     private readonly Dictionary<long, BrokerSession> _sessions = new();
     private readonly string _ringPath;
 
-    public BrokerChannel(string channelName, int slotCount, int slotPayloadBytes, string brokerDirectory)
+    public BrokerChannel(string channelName, int slotCount, int slotPayloadBytes, string brokerDirectory, string instanceId)
     {
         ChannelName = channelName;
-        _ringPath = UnixSharedStorageHelpers.BuildSharedFilePath(brokerDirectory, channelName, "broker-ring");
+        _ringPath = UnixSharedStorageHelpers.BuildSharedFilePath(brokerDirectory, $"{channelName}_{instanceId}", "broker-ring");
         Ring = BrokeredChannelRing.Create(_ringPath, slotCount, slotPayloadBytes);
     }
 
@@ -465,4 +565,4 @@ sealed class BrokerSession : IDisposable
     }
 }
 
-readonly record struct ChannelSeed(int SlotCount, int SlotPayloadBytes, string BrokerDirectory);
+readonly record struct ChannelSeed(int SlotCount, int SlotPayloadBytes, string BrokerDirectory, string InstanceId);

@@ -11,13 +11,19 @@ namespace XivIpc.Tests;
 [Collection("TinyIpc Serial")]
 public sealed class SidecarMultiUserTests
 {
-    [Fact]
-    public async Task SecondaryUnixUser_CanConnect_ReadRing_AndReceivePublish_WhenEnabled()
+    public static IEnumerable<object[]> Modes()
+    {
+        yield return new object[] { "sidecar" };
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task SecondaryUnixUser_CanConnect_ReadRing_AndReceivePublish_WhenEnabled(string mode)
     {
         if (!RuntimeHarness.ShouldRun())
             return;
 
-        using TestEnvironmentScope scope = new();
+        using TestEnvironmentScope scope = new(mode);
         using var publisher = scope.CreateBus();
         await scope.WaitForLiveSocketAsync();
 
@@ -30,10 +36,11 @@ public sealed class SidecarMultiUserTests
         await subscriber.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(15));
         string ringLine = await subscriber.WaitForStdoutPrefixAsync("RING:", TimeSpan.FromSeconds(15));
         string ringPath = ringLine["RING:".Length..];
-
+        string statePath = UnixSidecarProcessManager.ResolveBrokerStatePathForDiagnostics();
         Assert.Equal($"{scope.SharedGroup} 2770", GetStat(scope.SharedDirectory, "%G %a"));
         Assert.Equal($"{scope.SharedGroup} 660", GetStat(scope.SocketPath, "%G %a"));
         Assert.Equal($"{scope.SharedGroup} 660", GetStat(ringPath, "%G %a"));
+        Assert.Equal($"{scope.SharedGroup} 660", GetStat(statePath, "%G %a"));
 
         byte[] payload = Encoding.UTF8.GetBytes("multi-user-sidecar");
         await publisher.PublishAsync(payload);
@@ -73,7 +80,7 @@ public sealed class SidecarMultiUserTests
     {
         private readonly Dictionary<string, string?> _previousEnvironment = new(StringComparer.Ordinal);
 
-        public TestEnvironmentScope()
+        public TestEnvironmentScope(string mode)
         {
             SecondaryUser = Environment.GetEnvironmentVariable("TINYIPC_MULTIUSER_SECONDARY_USER")
                 ?? throw new InvalidOperationException("TINYIPC_MULTIUSER_SECONDARY_USER must be set for multi-user tests.");
@@ -91,11 +98,35 @@ public sealed class SidecarMultiUserTests
             Capture("TINYIPC_SHARED_GROUP");
             Capture("TINYIPC_NATIVE_HOST_PATH");
             Capture("TINYIPC_UNIX_SHELL");
+            Capture("TINYIPC_LOG_DIR");
+            Capture("TINYIPC_LOG_LEVEL");
+            Capture("TINYIPC_ENABLE_LOGGING");
+            Capture("TINYIPC_FILE_NOTIFIER");
+            Capture("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
 
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+            ProductionPathTestEnvironment.ResetLogger();
+
+            if (ProductionPathTestEnvironment.IsProductionPath(mode))
+            {
+                ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
+                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
+                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
+                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", "2000");
+            }
+            else
+            {
+                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
+                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
+                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", "2000");
+            }
 
             if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL")))
                 Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", "/bin/sh");
@@ -162,6 +193,8 @@ public sealed class SidecarMultiUserTests
         {
             foreach ((string key, string? value) in _previousEnvironment)
                 Environment.SetEnvironmentVariable(key, value);
+
+            ProductionPathTestEnvironment.ResetLogger();
 
             try
             {

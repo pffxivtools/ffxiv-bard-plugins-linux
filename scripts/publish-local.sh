@@ -110,7 +110,7 @@ ensure_shared_root_permissions() {
 
   if getent group "${shared_group}" >/dev/null 2>&1; then
     chgrp -- "${shared_group}" "${shared_root}"
-    chmod 2775 -- "${shared_root}"
+    chmod 2770 -- "${shared_root}"
   else
     chmod 1777 -- "${shared_root}"
   fi
@@ -123,19 +123,19 @@ stage_native_host_payload() {
   ensure_shared_root_permissions
 
   rm -rf -- "${staging_dir}"
-  install -d -m 2775 -- "${staging_dir}"
+  install -d -m 2770 -- "${staging_dir}"
 
   if getent group "${shared_group}" >/dev/null 2>&1; then
     chgrp -- "${shared_group}" "${staging_dir}"
-    chmod 2775 -- "${staging_dir}"
+    chmod 2770 -- "${staging_dir}"
   fi
 
   while IFS= read -r -d '' artifact; do
     local dest="${staging_dir}/$(basename "${artifact}")"
-    install -m 664 -- "${artifact}" "${dest}"
+    install -m 660 -- "${artifact}" "${dest}"
 
     if [[ -x "${artifact}" ]]; then
-      chmod 775 -- "${dest}"
+      chmod 770 -- "${dest}"
     fi
 
     if getent group "${shared_group}" >/dev/null 2>&1; then

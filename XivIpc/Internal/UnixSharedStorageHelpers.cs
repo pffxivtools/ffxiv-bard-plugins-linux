@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -212,14 +213,122 @@ namespace XivIpc.Internal
             if (gid < 0)
                 throw new InvalidOperationException($"Brokered TinyIpc shared group '{groupName}' could not be resolved.");
 
-            int chownResult = chown(unixPath, -1, gid);
-            if (chownResult != 0)
-                throw new IOException($"Failed to apply broker group ownership to '{unixPath}'. errno={System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}.");
+            string desiredModeText = isDirectory ? "2770" : "660";
+            int desiredMode = int.Parse(desiredModeText);
+            uint desiredModeBits = Convert.ToUInt32(desiredModeText, 8);
+            UnixPathMetadata? current = TryGetUnixPathMetadata(unixPath);
+            if (current is { GroupId: var currentGid, Mode: var currentMode } &&
+                currentGid == gid &&
+                currentMode == desiredMode)
+            {
+                TinyIpcLogger.Debug(
+                    nameof(UnixSharedStorageHelpers),
+                    "BrokerPermissionsAlreadyApplied",
+                    "Broker path already has the expected group ownership and mode.",
+                    ("path", path),
+                    ("unixPath", unixPath),
+                    ("gid", gid),
+                    ("mode", desiredMode.ToString("0000")));
+                return;
+            }
 
-            uint mode = Convert.ToUInt32(isDirectory ? "2770" : "660", 8);
-            int chmodResult = chmod(unixPath, mode);
-            if (chmodResult != 0)
-                throw new IOException($"Failed to apply broker permissions to '{unixPath}'. errno={System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}.");
+            if (current?.GroupId != gid)
+            {
+                TinyIpcLogger.Info(
+                    nameof(UnixSharedStorageHelpers),
+                    "BrokerGroupOwnershipRepairAttempt",
+                    "Attempting broker group ownership repair.",
+                    ("path", path),
+                    ("unixPath", unixPath),
+                    ("currentGid", current?.GroupId.ToString() ?? "unknown"),
+                    ("desiredGid", gid),
+                    ("currentMode", current?.Mode.ToString("0000") ?? "unknown"),
+                    ("desiredMode", desiredMode.ToString("0000")));
+                int chownResult = chown(unixPath, -1, gid);
+                if (chownResult != 0)
+                {
+                    int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+                    UnixPathMetadata? afterFailure = TryGetUnixPathMetadata(unixPath);
+                    if (afterFailure?.GroupId != gid)
+                    {
+                        throw new IOException(
+                            $"Failed to apply broker group ownership to '{unixPath}'. errno={errno}. currentGid={afterFailure?.GroupId.ToString() ?? "unknown"} desiredGid={gid}.");
+                    }
+
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSharedStorageHelpers),
+                        "BrokerGroupOwnershipApplyFailedButVerified",
+                        "chown failed, but the broker path already reports the expected group ownership.",
+                        null,
+                        ("path", path),
+                        ("unixPath", unixPath),
+                        ("errno", errno),
+                        ("currentGid", current?.GroupId.ToString() ?? "unknown"),
+                        ("verifiedGid", afterFailure?.GroupId.ToString() ?? "unknown"),
+                        ("gid", gid));
+                }
+                else
+                {
+                    UnixPathMetadata? afterRepair = TryGetUnixPathMetadata(unixPath);
+                    TinyIpcLogger.Info(
+                        nameof(UnixSharedStorageHelpers),
+                        "BrokerGroupOwnershipRepairApplied",
+                        "Applied broker group ownership repair.",
+                        ("path", path),
+                        ("unixPath", unixPath),
+                        ("previousGid", current?.GroupId.ToString() ?? "unknown"),
+                        ("verifiedGid", afterRepair?.GroupId.ToString() ?? "unknown"),
+                        ("desiredGid", gid));
+                }
+            }
+
+            if (current?.Mode != desiredMode)
+            {
+                TinyIpcLogger.Info(
+                    nameof(UnixSharedStorageHelpers),
+                    "BrokerPermissionRepairAttempt",
+                    "Attempting broker permission repair.",
+                    ("path", path),
+                    ("unixPath", unixPath),
+                    ("currentMode", current?.Mode.ToString("0000") ?? "unknown"),
+                    ("desiredMode", desiredMode.ToString("0000")));
+                int chmodResult = chmod(unixPath, desiredModeBits);
+                if (chmodResult != 0)
+                {
+                    int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+                    UnixPathMetadata? afterFailure = TryGetUnixPathMetadata(unixPath);
+                    if (afterFailure?.Mode != desiredMode)
+                    {
+                        throw new IOException(
+                            $"Failed to apply broker permissions to '{unixPath}'. errno={errno}. currentMode={afterFailure?.Mode.ToString("0000") ?? "unknown"} desiredMode={desiredMode:0000}.");
+                    }
+
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSharedStorageHelpers),
+                        "BrokerPermissionApplyFailedButVerified",
+                        "chmod failed, but the broker path already reports the expected mode.",
+                        null,
+                        ("path", path),
+                        ("unixPath", unixPath),
+                        ("errno", errno),
+                        ("currentMode", current?.Mode.ToString("0000") ?? "unknown"),
+                        ("verifiedMode", afterFailure?.Mode.ToString("0000") ?? "unknown"),
+                        ("mode", desiredMode.ToString("0000")));
+                }
+                else
+                {
+                    UnixPathMetadata? afterRepair = TryGetUnixPathMetadata(unixPath);
+                    TinyIpcLogger.Info(
+                        nameof(UnixSharedStorageHelpers),
+                        "BrokerPermissionRepairApplied",
+                        "Applied broker permission repair.",
+                        ("path", path),
+                        ("unixPath", unixPath),
+                        ("previousMode", current?.Mode.ToString("0000") ?? "unknown"),
+                        ("verifiedMode", afterRepair?.Mode.ToString("0000") ?? "unknown"),
+                        ("desiredMode", desiredMode.ToString("0000")));
+                }
+            }
         }
 
         internal static IDisposable AcquireProcessLock(string path)
@@ -413,11 +522,56 @@ namespace XivIpc.Internal
             return normalized;
         }
 
+        private static UnixPathMetadata? TryGetUnixPathMetadata(string unixPath)
+        {
+            try
+            {
+                using var process = Process.Start(new ProcessStartInfo("stat")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    ArgumentList =
+                    {
+                        "-c",
+                        "%g:%a",
+                        unixPath
+                    }
+                });
+
+                if (process is null)
+                    return null;
+
+                string output = process.StandardOutput.ReadToEnd().Trim();
+                process.WaitForExit();
+                if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+                    return null;
+
+                string[] parts = output.Split(':', 2);
+                if (parts.Length != 2)
+                    return null;
+
+                if (!int.TryParse(parts[0], out int gid))
+                    return null;
+
+                if (!int.TryParse(parts[1], out int mode))
+                    return null;
+
+                return new UnixPathMetadata(gid, mode);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
         private static extern int chmod(string path, uint mode);
 
         [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
         private static extern int chown(string path, int owner, int group);
+
+        private readonly record struct UnixPathMetadata(int GroupId, int Mode);
 
         private sealed class NoOpLockHandle : IDisposable
         {

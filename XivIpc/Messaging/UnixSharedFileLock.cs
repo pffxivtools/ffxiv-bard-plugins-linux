@@ -11,8 +11,9 @@ namespace XivIpc.Messaging
 
         private readonly string _path;
         private readonly object _processGate;
+        private readonly bool _strictBrokerPermissions;
 
-        public UnixSharedFileLock(string name, string kind)
+        public UnixSharedFileLock(string name, string kind, bool strictBrokerPermissions = false)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Lock must be named.", nameof(name));
@@ -21,10 +22,14 @@ namespace XivIpc.Messaging
                 throw new ArgumentException("Lock kind must be provided.", nameof(kind));
 
             _path = ResolveNativeLockPath(name, kind);
+            _strictBrokerPermissions = strictBrokerPermissions;
 
             string? directory = Path.GetDirectoryName(_path);
             if (!string.IsNullOrWhiteSpace(directory))
+            {
                 Directory.CreateDirectory(directory);
+                TryApplyPermissions(directory, isDirectory: true, strictBrokerPermissions);
+            }
 
             _processGate = UnixSharedStorageHelpers.GetProcessGate(_path);
 
@@ -44,10 +49,10 @@ namespace XivIpc.Messaging
                 using FileStream stream = new FileStream(
                     _path,
                     FileMode.OpenOrCreate,
-                    FileAccess.ReadWrite,
-                    FileShare.ReadWrite | FileShare.Delete);
+                FileAccess.ReadWrite,
+                FileShare.ReadWrite | FileShare.Delete);
 
-                TryApplyPermissions(_path);
+                TryApplyPermissions(_path, isDirectory: false, _strictBrokerPermissions);
                 LockStream(stream);
 
                 try
@@ -84,11 +89,14 @@ namespace XivIpc.Messaging
             return nativePath;
         }
 
-        private static void TryApplyPermissions(string path)
+        private static void TryApplyPermissions(string path, bool isDirectory, bool strictBrokerPermissions)
         {
             try
             {
-                UnixSharedStorageHelpers.ApplyPermissions(path, isDirectory: false);
+                if (strictBrokerPermissions)
+                    UnixSharedStorageHelpers.ApplyBrokerPermissions(path, isDirectory);
+                else
+                    UnixSharedStorageHelpers.ApplyPermissions(path, isDirectory);
             }
             catch (Exception ex)
             {
