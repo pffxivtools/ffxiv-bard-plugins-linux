@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: publish-semver-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
