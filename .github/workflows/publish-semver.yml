@@ -84,7 +84,7 @@ jobs:
             gh release upload "${tag}" "${assets[@]}" --clobber
             gh release edit "${tag}" --title "${title}" --notes-file "${notes_file}"
           else
-            gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}"
+            gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}" --latest
           fi
 
       - name: Commit pluginmaster.json to default branch
