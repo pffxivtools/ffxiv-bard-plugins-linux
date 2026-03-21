@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Runtime.Loader;
 using XivIpc.Internal;
 using XivIpc.Messaging;
 
@@ -20,13 +22,13 @@ TinyIpcLogger.Info(
     "NativeHost",
     "BrokerStartupObservedEnvironment",
     "Observed native broker startup environment before path normalization.",
-    ("launchId", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LaunchId) ?? string.Empty),
-    ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory) ?? string.Empty),
-    ("brokerDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory) ?? string.Empty),
-    ("logDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory) ?? string.Empty),
-    ("sharedGroup", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup) ?? string.Empty),
-    ("brokerSocketPath", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath) ?? string.Empty),
-    ("backend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BusBackend) ?? string.Empty));
+    ("launchId", Environment.GetEnvironmentVariable("TINYIPC_LAUNCH_ID") ?? string.Empty),
+    ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR") ?? string.Empty),
+    ("brokerDir", Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR") ?? string.Empty),
+    ("logDir", Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR") ?? string.Empty),
+    ("sharedGroup", Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? string.Empty),
+    ("brokerSocketPath", Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH") ?? string.Empty),
+    ("backend", Environment.GetEnvironmentVariable("TINYIPC_BUS_BACKEND") ?? string.Empty));
 UnixSharedStorageHelpers.EnsureBrokerAccessConfigured();
 
 string socketPath = ResolveSocketPath();
@@ -60,7 +62,100 @@ long lastEmptyTicks = DateTimeOffset.UtcNow.UtcTicks;
 var stateGate = new object();
 
 using var shutdownCts = new CancellationTokenSource();
+int shutdownRequested = 0;
 Task monitorTask = Task.Run(() => MonitorSessionsAsync(shutdownCts.Token));
+
+void RequestShutdown(string reason, Exception? exception = null)
+{
+    if (Interlocked.Exchange(ref shutdownRequested, 1) != 0)
+        return;
+
+    TinyIpcLogger.Info(
+        "NativeHost",
+        "ShutdownRequested",
+        "Broker shutdown was requested.",
+        ("reason", reason),
+        ("socketPath", socketPath));
+
+    if (exception is not null)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "ShutdownRequestException",
+            "Broker shutdown was triggered because an exception occurred in a shutdown pathway.",
+            exception,
+            ("reason", reason),
+            ("socketPath", socketPath));
+    }
+
+    try
+    {
+        shutdownCts.Cancel();
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "ShutdownCancellationFailed",
+            "Failed to cancel broker shutdown token.",
+            ex,
+            ("reason", reason),
+            ("socketPath", socketPath));
+    }
+
+    try
+    {
+        listener.Dispose();
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "ListenerDisposeFailedDuringShutdown",
+            "Failed to dispose the broker listener during shutdown.",
+            ex,
+            ("reason", reason),
+            ("socketPath", socketPath));
+    }
+}
+
+void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
+{
+    e.Cancel = true;
+    RequestShutdown("ConsoleCancelKeyPress");
+}
+
+void OnUnloading(AssemblyLoadContext context)
+{
+    RequestShutdown("AssemblyLoadContextUnloading");
+}
+
+void OnProcessExit(object? sender, EventArgs e)
+{
+    RequestShutdown("ProcessExit");
+}
+
+using PosixSignalRegistration? sigIntRegistration =
+    OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()
+        ? PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
+        {
+            context.Cancel = true;
+            RequestShutdown("SIGINT");
+        })
+        : null;
+
+using PosixSignalRegistration? sigTermRegistration =
+    OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()
+        ? PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+        {
+            context.Cancel = true;
+            RequestShutdown("SIGTERM");
+        })
+        : null;
+
+Console.CancelKeyPress += OnCancelKeyPress;
+AssemblyLoadContext.Default.Unloading += OnUnloading;
+AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
 
 try
 {
@@ -79,6 +174,16 @@ try
         {
             break;
         }
+        catch (Exception ex)
+        {
+            TinyIpcLogger.Error(
+                "NativeHost",
+                "AcceptFailed",
+                "Broker accept loop failed while waiting for a new client connection.",
+                ex,
+                ("socketPath", socketPath));
+            break;
+        }
 
         _ = Task.Run(async () =>
         {
@@ -88,6 +193,58 @@ try
             {
                 session = await RegisterSessionAsync(socket).ConfigureAwait(false);
                 await ProcessSessionAsync(session, shutdownCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (shutdownCts.IsCancellationRequested)
+            {
+                TinyIpcLogger.Debug(
+                    "NativeHost",
+                    "SessionCanceledDuringShutdown",
+                    "Broker session processing was canceled during shutdown.",
+                    ("hasSession", session is not null),
+                    ("sessionId", session?.SessionId ?? 0),
+                    ("channel", session?.Channel ?? string.Empty),
+                    ("ownerPid", session?.OwnerPid ?? 0));
+            }
+            catch (EndOfStreamException ex)
+            {
+                TinyIpcLogger.Warning(
+                    "NativeHost",
+                    "SessionDisconnectedDuringHandshakeOrRead",
+                    "Broker client disconnected before completing handshake or frame processing.",
+                    ex,
+                    ("hasSession", session is not null),
+                    ("sessionId", session?.SessionId ?? 0),
+                    ("channel", session?.Channel ?? string.Empty),
+                    ("ownerPid", session?.OwnerPid ?? 0),
+                    ("peerUid", session?.PeerCredentials.Uid ?? 0),
+                    ("peerGid", session?.PeerCredentials.Gid ?? 0));
+            }
+            catch (IOException ex)
+            {
+                TinyIpcLogger.Warning(
+                    "NativeHost",
+                    "SessionIoFailed",
+                    "Broker session ended because of an I/O failure.",
+                    ex,
+                    ("hasSession", session is not null),
+                    ("sessionId", session?.SessionId ?? 0),
+                    ("channel", session?.Channel ?? string.Empty),
+                    ("ownerPid", session?.OwnerPid ?? 0),
+                    ("peerUid", session?.PeerCredentials.Uid ?? 0),
+                    ("peerGid", session?.PeerCredentials.Gid ?? 0));
+            }
+            catch (ObjectDisposedException ex)
+            {
+                TinyIpcLogger.Debug(
+                    "NativeHost",
+                    "SessionSocketDisposed",
+                    "Broker session ended because the socket was disposed.",
+                    ("hasSession", session is not null),
+                    ("sessionId", session?.SessionId ?? 0),
+                    ("channel", session?.Channel ?? string.Empty),
+                    ("ownerPid", session?.OwnerPid ?? 0),
+                    ("exceptionType", ex.GetType().FullName ?? string.Empty),
+                    ("exceptionMessage", ex.Message));
             }
             catch (Exception ex)
             {
@@ -102,6 +259,7 @@ try
                     ("ownerPid", session?.OwnerPid ?? 0),
                     ("peerUid", session?.PeerCredentials.Uid ?? 0),
                     ("peerGid", session?.PeerCredentials.Gid ?? 0));
+
                 try
                 {
                     if (session is not null)
@@ -109,8 +267,14 @@ try
                     else
                         SidecarProtocol.WriteError(socket, ex.Message);
                 }
-                catch
+                catch (Exception writeEx)
                 {
+                    TinyIpcLogger.Debug(
+                        "NativeHost",
+                        "SessionErrorFrameWriteFailed",
+                        "Failed to write an error frame after a session processing failure.",
+                        ("exceptionType", writeEx.GetType().FullName ?? string.Empty),
+                        ("exceptionMessage", writeEx.Message));
                 }
             }
             finally
@@ -118,35 +282,144 @@ try
                 if (session is not null)
                     RemoveSession(session);
 
-                try { socket.Dispose(); } catch { }
+                try
+                {
+                    socket.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Debug(
+                        "NativeHost",
+                        "AcceptedSocketDisposeFailed",
+                        "Disposing an accepted client socket failed during session cleanup.",
+                        ("exceptionType", ex.GetType().FullName ?? string.Empty),
+                        ("exceptionMessage", ex.Message));
+                }
             }
         }, shutdownCts.Token);
     }
 }
 finally
 {
-    shutdownCts.Cancel();
+    Console.CancelKeyPress -= OnCancelKeyPress;
+    AssemblyLoadContext.Default.Unloading -= OnUnloading;
+    AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
 
-    try { listener.Dispose(); } catch { }
-    try { await monitorTask.ConfigureAwait(false); } catch { }
+    try
+    {
+        shutdownCts.Cancel();
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "FinalShutdownCancellationFailed",
+            "Failed to cancel broker shutdown token during final cleanup.",
+            ex,
+            ("socketPath", socketPath));
+    }
+
+    try
+    {
+        listener.Dispose();
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "FinalListenerDisposeFailed",
+            "Failed to dispose broker listener during final cleanup.",
+            ex,
+            ("socketPath", socketPath));
+    }
+
+    try
+    {
+        await monitorTask.ConfigureAwait(false);
+    }
+    catch (OperationCanceledException)
+    {
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "MonitorTaskJoinFailed",
+            "Failed while awaiting the broker monitor task during shutdown.",
+            ex,
+            ("socketPath", socketPath));
+    }
 
     foreach (BrokerSession session in sessions.Values)
-        session.Dispose();
+    {
+        try
+        {
+            session.Dispose();
+        }
+        catch (Exception ex)
+        {
+            TinyIpcLogger.Warning(
+                "NativeHost",
+                "SessionDisposeFailedDuringShutdown",
+                "Failed to dispose a broker session during final cleanup.",
+                ex,
+                ("sessionId", session.SessionId),
+                ("channel", session.Channel),
+                ("ownerPid", session.OwnerPid));
+        }
+    }
 
     foreach (BrokerChannel channel in channels.Values)
-        channel.Dispose();
+    {
+        try
+        {
+            channel.Dispose();
+        }
+        catch (Exception ex)
+        {
+            TinyIpcLogger.Warning(
+                "NativeHost",
+                "ChannelDisposeFailedDuringShutdown",
+                "Failed to dispose a broker channel during final cleanup.",
+                ex,
+                ("channel", channel.ChannelName));
+        }
+    }
 
     try
     {
         BrokerStateSnapshot? activeState = BrokerStateSnapshot.TryRead(brokerStatePath);
-        if (activeState is not null && string.Equals(activeState.InstanceId, brokerState.InstanceId, StringComparison.Ordinal) && File.Exists(socketPath))
+        if (activeState is not null &&
+            string.Equals(activeState.InstanceId, brokerState.InstanceId, StringComparison.Ordinal) &&
+            File.Exists(socketPath))
+        {
             File.Delete(socketPath);
+        }
     }
-    catch
+    catch (Exception ex)
     {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "SocketCleanupFailedDuringShutdown",
+            "Failed to remove the broker socket path during final cleanup.",
+            ex,
+            ("socketPath", socketPath));
     }
 
-    BrokerStateSnapshot.DeleteIfOwned(brokerStatePath, brokerState.InstanceId);
+    try
+    {
+        BrokerStateSnapshot.DeleteIfOwned(brokerStatePath, brokerState.InstanceId);
+    }
+    catch (Exception ex)
+    {
+        TinyIpcLogger.Warning(
+            "NativeHost",
+            "BrokerStateCleanupFailedDuringShutdown",
+            "Failed to clean up broker state snapshot during final cleanup.",
+            ex,
+            ("brokerStatePath", brokerStatePath),
+            ("instanceId", brokerState.InstanceId));
+    }
 }
 
 async Task<BrokerSession> RegisterSessionAsync(Socket socket)
@@ -380,8 +653,7 @@ async Task MonitorSessionsAsync(CancellationToken cancellationToken)
             TimeSpan emptyDuration = DateTimeOffset.UtcNow - new DateTimeOffset(emptySinceTicks, TimeSpan.Zero);
             if (emptyDuration >= ResolveIdleShutdownDelay())
             {
-                shutdownCts.Cancel();
-                listener.Dispose();
+                RequestShutdown("IdleTimeoutElapsed");
                 return;
             }
         }
@@ -394,7 +666,7 @@ async Task MonitorSessionsAsync(CancellationToken cancellationToken)
 
 bool AuthorizePeer(LinuxBrokerInterop.PeerCredentials credentials)
 {
-    string? groupName = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
+    string? groupName = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
     if (string.IsNullOrWhiteSpace(groupName))
         return false;
 
@@ -425,13 +697,13 @@ static uint? ResolveGroupId(string groupName)
 
 static long ResolveMinMessageAgeMs()
 {
-    string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
+    string? raw = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS");
     return long.TryParse(raw, out long value) && value >= 0 ? value : 1_000L;
 }
 
 static TimeSpan ResolveIdleShutdownDelay()
 {
-    string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerIdleShutdownMs);
+    string? raw = Environment.GetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
     return int.TryParse(raw, out int value) && value >= 250
         ? TimeSpan.FromMilliseconds(value)
         : TimeSpan.FromSeconds(120);
@@ -439,12 +711,12 @@ static TimeSpan ResolveIdleShutdownDelay()
 
 static string ResolveSocketPath()
 {
-    string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath);
+    string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH");
     if (!string.IsNullOrWhiteSpace(explicitPath))
         return ConvertWindowsPathToUnix(explicitPath);
 
-    string? sharedDirectory = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory)
-        ?? TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
+    string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR")
+        ?? Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
 
     if (!string.IsNullOrWhiteSpace(sharedDirectory))
         return Path.Combine(ConvertWindowsPathToUnix(sharedDirectory), "tinyipc-sidecar.sock");

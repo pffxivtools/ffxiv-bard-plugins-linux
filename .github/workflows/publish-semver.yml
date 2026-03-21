@@ -49,12 +49,14 @@ jobs:
         run: bash scripts/publish-release.sh
 
       - name: NuGet login (OIDC → temp API key)
+        if: github.event_name == 'push'
         uses: NuGet/login@v1
         id: login
         with:
-          user: contoso-bot # Recommended: use a secret like ${{ secrets.NUGET_USER }} for your nuget.org username (profile name), NOT your email address
+          user: ${{ secrets.NUGET_USER }}
 
       - name: Publish NuGet packages
+        if: github.event_name == 'push'
         shell: bash
         run: |
           shopt -s nullglob
@@ -65,7 +67,7 @@ jobs:
           fi
 
           dotnet nuget push "${packages[@]}" \
-            --api-key "${{steps.login.outputs.NUGET_API_KEY}}" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
 

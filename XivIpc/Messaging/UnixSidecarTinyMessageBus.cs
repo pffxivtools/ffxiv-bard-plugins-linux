@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Linq;
 using XivIpc.Internal;
 
 namespace XivIpc.Messaging
@@ -9,6 +10,7 @@ namespace XivIpc.Messaging
         private const int DefaultHeartbeatIntervalMs = 2000;
         private const int DefaultHeartbeatTimeoutMs = 60000;
         private const int MaxReconnectQueuedMessages = 64;
+
         private static readonly TimeSpan[] ReconnectBackoffSchedule =
         {
             TimeSpan.FromMilliseconds(100),
@@ -42,6 +44,8 @@ namespace XivIpc.Messaging
         private readonly Task _dispatchLoopTask;
         private readonly Task _sendLoopTask;
         private readonly Task _connectionLoopTask;
+        private readonly object _cleanupGate = new();
+        private readonly List<Task> _connectionCleanupTasks = new();
 
         private Socket? _socket;
         private BrokeredChannelJournal? _journal;
@@ -89,9 +93,20 @@ namespace XivIpc.Messaging
             AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
             AppDomain.CurrentDomain.DomainUnload += OnProcessExit;
 
-            _dispatchLoopTask = Task.Run(() => DispatchLoopAsync(_lifetimeCts.Token));
-            _sendLoopTask = Task.Run(() => SendLoopAsync(_lifetimeCts.Token));
-            _connectionLoopTask = Task.Run(() => ConnectionLoopAsync(_lifetimeCts.Token));
+            _dispatchLoopTask = ObserveTaskFault(
+                Task.Run(() => DispatchLoopAsync(_lifetimeCts.Token)),
+                "DispatchLoopFaulted",
+                "The broker-backed dispatch loop faulted unexpectedly.");
+
+            _sendLoopTask = ObserveTaskFault(
+                Task.Run(() => SendLoopAsync(_lifetimeCts.Token)),
+                "SendLoopFaulted",
+                "The broker-backed send loop faulted unexpectedly.");
+
+            _connectionLoopTask = ObserveTaskFault(
+                Task.Run(() => ConnectionLoopAsync(_lifetimeCts.Token)),
+                "ConnectionLoopFaulted",
+                "The broker-backed connection loop faulted unexpectedly.");
 
             RequestReconnect("InitialConnectScheduled", "Scheduled initial sidecar connection in the background.", null);
         }
@@ -131,14 +146,43 @@ namespace XivIpc.Messaging
             AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
             AppDomain.CurrentDomain.DomainUnload -= OnProcessExit;
 
-            try { _lifetimeCts.Cancel(); } catch { }
-            try { _reconnectSignal.Release(); } catch { }
-            try { _outboundSignal.Release(); } catch { }
-            try { _pendingSignal.Release(); } catch { }
+            SafeInvoke(
+                () => _lifetimeCts.Cancel(),
+                "LifetimeCancelFailed",
+                "Failed to cancel sidecar bus lifetime token during disposal.");
+
+            SafeInvoke(
+                () => _reconnectSignal.Release(),
+                "ReconnectSignalReleaseFailed",
+                "Failed to release reconnect signal during disposal.");
+
+            SafeInvoke(
+                () => _outboundSignal.Release(),
+                "OutboundSignalReleaseFailed",
+                "Failed to release outbound signal during disposal.");
+
+            SafeInvoke(
+                () => _pendingSignal.Release(),
+                "PendingSignalReleaseFailed",
+                "Failed to release pending signal during disposal.");
 
             TeardownConnection(sendDispose: true);
 
-            try { Task.WaitAll(new[] { _connectionLoopTask, _sendLoopTask, _dispatchLoopTask }, TimeSpan.FromSeconds(2)); } catch { }
+            try
+            {
+                Task.WaitAll(new[] { _connectionLoopTask, _sendLoopTask, _dispatchLoopTask }, TimeSpan.FromSeconds(2));
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "PrimaryBackgroundLoopJoinFailed",
+                    "Timed out or failed while waiting for primary broker-backed background loops to finish during disposal.",
+                    ex,
+                    ("channel", _channelName));
+            }
+
+            WaitForPendingConnectionCleanupTasks(TimeSpan.FromSeconds(5));
 
             TinyIpcLogger.Info(
                 nameof(UnixSidecarTinyMessageBus),
@@ -156,11 +200,30 @@ namespace XivIpc.Messaging
                 ("queuedPublishCount", Interlocked.Read(ref _queuedPublishCount)),
                 ("queuedPublishBytes", Interlocked.Read(ref _queuedPublishBytes)));
 
-            try { _pendingSignal.Dispose(); } catch { }
-            try { _outboundSignal.Dispose(); } catch { }
-            try { _reconnectSignal.Dispose(); } catch { }
-            try { _writeLock.Dispose(); } catch { }
-            try { _lifetimeCts.Dispose(); } catch { }
+            SafeInvoke(
+                () => _pendingSignal.Dispose(),
+                "PendingSignalDisposeFailed",
+                "Failed to dispose pending signal.");
+
+            SafeInvoke(
+                () => _outboundSignal.Dispose(),
+                "OutboundSignalDisposeFailed",
+                "Failed to dispose outbound signal.");
+
+            SafeInvoke(
+                () => _reconnectSignal.Dispose(),
+                "ReconnectSignalDisposeFailed",
+                "Failed to dispose reconnect signal.");
+
+            SafeInvoke(
+                () => _writeLock.Dispose(),
+                "WriteLockDisposeFailed",
+                "Failed to dispose write lock.");
+
+            SafeInvoke(
+                () => _lifetimeCts.Dispose(),
+                "LifetimeDisposeFailed",
+                "Failed to dispose lifetime cancellation source.");
         }
 
         public ValueTask DisposeAsync()
@@ -188,6 +251,16 @@ namespace XivIpc.Messaging
                 }
                 catch (OperationCanceledException)
                 {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Error(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ReconnectSignalWaitFailed",
+                        "Failed while waiting on the reconnect signal.",
+                        ex,
+                        ("channel", _channelName));
                     return;
                 }
 
@@ -280,6 +353,16 @@ namespace XivIpc.Messaging
                 BrokeredChannelJournal eventJournal = journal;
                 CancellationTokenSource eventConnectionCts = connectionCts;
 
+                Task eventLoopTask = ObserveTaskFault(
+                    Task.Run(() => EventLoopAsync(eventSocket, eventJournal, attach.SessionId, eventConnectionCts.Token)),
+                    "EventLoopFaulted",
+                    "The broker-backed event loop faulted unexpectedly.");
+
+                Task heartbeatTask = ObserveTaskFault(
+                    Task.Run(() => HeartbeatLoopAsync(eventSocket, eventConnectionCts.Token)),
+                    "HeartbeatLoopFaulted",
+                    "The broker-backed heartbeat loop faulted unexpectedly.");
+
                 lock (_stateGate)
                 {
                     if (_disposed)
@@ -295,8 +378,8 @@ namespace XivIpc.Messaging
                     _nextSequence = attach.StartSequence;
                     _connectionState = ConnectionState.Connected;
                     _connectedTcs.TrySetResult(true);
-                    _eventLoopTask = Task.Run(() => EventLoopAsync(eventSocket, eventJournal, attach.SessionId, eventConnectionCts.Token));
-                    _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(eventSocket, eventConnectionCts.Token));
+                    _eventLoopTask = eventLoopTask;
+                    _heartbeatTask = heartbeatTask;
                 }
 
                 TinyIpcLogger.Info(
@@ -318,10 +401,37 @@ namespace XivIpc.Messaging
             }
             finally
             {
-                try { connectionCts?.Dispose(); } catch { }
-                try { journal?.Dispose(); } catch { }
-                try { socket?.Dispose(); } catch { }
-                try { lease.Dispose(); } catch { }
+                if (connectionCts is not null)
+                {
+                    SafeInvoke(
+                        () => connectionCts.Dispose(),
+                        "ConnectionCtsDisposeFailed",
+                        "Failed to dispose connection cancellation source during connection setup cleanup.");
+                }
+
+                if (journal is not null)
+                {
+                    SafeInvoke(
+                        () => journal.Dispose(),
+                        "JournalDisposeFailedDuringConnect",
+                        "Failed to dispose unattached journal during connection setup cleanup.");
+                }
+
+                if (socket is not null)
+                {
+                    SafeInvoke(
+                        () => socket.Dispose(),
+                        "SocketDisposeFailedDuringConnect",
+                        "Failed to dispose unattached socket during connection setup cleanup.");
+                }
+
+                if (!lease.Equals(default(UnixSidecarProcessManager.Lease)))
+                {
+                    SafeInvoke(
+                        () => lease.Dispose(),
+                        "LeaseDisposeFailedDuringConnect",
+                        "Failed to dispose unattached sidecar lease during connection setup cleanup.");
+                }
             }
         }
 
@@ -337,10 +447,28 @@ namespace XivIpc.Messaging
                 {
                     return;
                 }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Error(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "OutboundSignalWaitFailed",
+                        "Failed while waiting on the outbound publish signal.",
+                        ex,
+                        ("channel", _channelName));
+                    return;
+                }
 
                 while (!cancellationToken.IsCancellationRequested && _outboundMessages.TryPeek(out byte[]? payload))
                 {
-                    await WaitUntilConnectedAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await WaitUntilConnectedAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
                     if (_disposed)
                         return;
 
@@ -348,7 +476,25 @@ namespace XivIpc.Messaging
                     if (socket is null)
                         break;
 
-                    await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        TinyIpcLogger.Error(
+                            nameof(UnixSidecarTinyMessageBus),
+                            "WriteLockAcquireFailedForPublish",
+                            "Failed to acquire the write lock before publishing to the sidecar.",
+                            ex,
+                            ("channel", _channelName));
+                        return;
+                    }
+
                     try
                     {
                         if (!ReferenceEquals(socket, GetCurrentSocket()))
@@ -372,7 +518,7 @@ namespace XivIpc.Messaging
                     }
                     finally
                     {
-                        _writeLock.Release();
+                        SafeReleaseWriteLock("WriteLockReleaseFailedAfterPublish");
                     }
                 }
             }
@@ -388,6 +534,16 @@ namespace XivIpc.Messaging
                 }
                 catch (OperationCanceledException)
                 {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Error(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "PendingSignalWaitFailed",
+                        "Failed while waiting on the pending receive signal.",
+                        ex,
+                        ("channel", _channelName));
                     return;
                 }
 
@@ -423,12 +579,18 @@ namespace XivIpc.Messaging
                             DrainAvailableMessages(journal, sessionId);
                             break;
                         case SidecarFrameType.Error:
-                            HandleConnectionLost(socket, "BrokerReturnedErrorFrame", new InvalidOperationException(System.Text.Encoding.UTF8.GetString(frame.Payload.Span)));
+                            HandleConnectionLost(
+                                socket,
+                                "BrokerReturnedErrorFrame",
+                                new InvalidOperationException(System.Text.Encoding.UTF8.GetString(frame.Payload.Span)));
                             return;
                         case SidecarFrameType.Ready:
                             break;
                         default:
-                            HandleConnectionLost(socket, "BrokerReturnedUnexpectedFrame", new InvalidOperationException($"Unexpected sidecar frame '{frame.Type}'."));
+                            HandleConnectionLost(
+                                socket,
+                                "BrokerReturnedUnexpectedFrame",
+                                new InvalidOperationException($"Unexpected sidecar frame '{frame.Type}'."));
                             return;
                     }
                 }
@@ -456,7 +618,25 @@ namespace XivIpc.Messaging
                     if (_disposed)
                         return;
 
-                    await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        TinyIpcLogger.Error(
+                            nameof(UnixSidecarTinyMessageBus),
+                            "WriteLockAcquireFailedForHeartbeat",
+                            "Failed to acquire the write lock before sending a heartbeat to the sidecar.",
+                            ex,
+                            ("channel", _channelName));
+                        return;
+                    }
+
                     try
                     {
                         if (!ReferenceEquals(socket, GetCurrentSocket()))
@@ -466,7 +646,7 @@ namespace XivIpc.Messaging
                     }
                     finally
                     {
-                        _writeLock.Release();
+                        SafeReleaseWriteLock("WriteLockReleaseFailedAfterHeartbeat");
                     }
                 }
             }
@@ -481,7 +661,23 @@ namespace XivIpc.Messaging
 
         private void DrainAvailableMessages(BrokeredChannelJournal journal, long sessionId)
         {
-            BrokeredJournalDrainResult result = journal.Drain(_clientInstanceId, ref _nextSequence);
+            BrokeredJournalDrainResult result;
+            try
+            {
+                result = journal.Drain(_clientInstanceId, ref _nextSequence);
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Error(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "JournalDrainFailed",
+                    "Failed to drain broker-backed messages from the journal.",
+                    ex,
+                    ("channel", _channelName),
+                    ("sessionId", sessionId));
+                throw;
+            }
+
             long lagBefore = Math.Max(0, result.LagBefore);
             Interlocked.Exchange(ref _lastObservedHead, result.HeadSequenceObserved);
             Interlocked.Exchange(ref _lastObservedTail, result.TailSequenceObserved);
@@ -524,7 +720,7 @@ namespace XivIpc.Messaging
             foreach (byte[] payload in result.Messages)
             {
                 _pendingMessages.Enqueue(payload);
-                _pendingSignal.Release();
+                SafeReleaseSemaphore(_pendingSignal, "PendingSignalReleaseFailedDuringDrain", "Failed to release pending signal after draining a broker-backed message.");
                 Interlocked.Increment(ref _drainedMessageCount);
             }
         }
@@ -572,7 +768,29 @@ namespace XivIpc.Messaging
                     waitTask = _connectedTcs.Task;
                 }
 
-                await waitTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await waitTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    TinyIpcLogger.Debug(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "WaitUntilConnectedCanceled",
+                        "Canceled while waiting for the broker-backed sidecar connection to become ready.",
+                        ("channel", _channelName));
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "WaitUntilConnectedFailed",
+                        "Waiting for the broker-backed sidecar connection failed unexpectedly.",
+                        ex,
+                        ("channel", _channelName));
+                    throw;
+                }
             }
         }
 
@@ -605,7 +823,7 @@ namespace XivIpc.Messaging
                     ("maxQueuedBytes", maxQueuedBytes));
             }
 
-            try { _outboundSignal.Release(); } catch { }
+            SafeReleaseSemaphore(_outboundSignal, "OutboundSignalReleaseFailedForQueuedPublish", "Failed to release outbound signal after queueing a publish.");
         }
 
         private void RequestReconnect(string eventName, string message, Exception? exception)
@@ -613,6 +831,7 @@ namespace XivIpc.Messaging
             if (_disposed)
                 return;
 
+            bool releaseSignal = false;
             lock (_stateGate)
             {
                 if (_disposed || _connectionState == ConnectionState.Disposed)
@@ -624,7 +843,37 @@ namespace XivIpc.Messaging
                 if (!_reconnectPending)
                 {
                     _reconnectPending = true;
+                    releaseSignal = true;
+                }
+            }
+
+            if (releaseSignal)
+            {
+                try
+                {
                     _reconnectSignal.Release();
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ReconnectSignalDisposed",
+                        "Reconnect was requested after the reconnect signal had already been disposed.",
+                        ex,
+                        ("channel", _channelName),
+                        ("eventName", eventName));
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Error(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ReconnectSignalReleaseFailed",
+                        "Failed to release the reconnect signal.",
+                        ex,
+                        ("channel", _channelName),
+                        ("eventName", eventName));
+                    return;
                 }
             }
 
@@ -656,6 +905,8 @@ namespace XivIpc.Messaging
             BrokeredChannelJournal? journal;
             UnixSidecarProcessManager.Lease? lease;
             CancellationTokenSource? connectionCts;
+            Task? eventLoopTask;
+            Task? heartbeatTask;
 
             lock (_stateGate)
             {
@@ -663,10 +914,15 @@ namespace XivIpc.Messaging
                 journal = _journal;
                 lease = _lease;
                 connectionCts = _connectionCts;
+                eventLoopTask = _eventLoopTask;
+                heartbeatTask = _heartbeatTask;
+
                 _socket = null;
                 _journal = null;
                 _lease = null;
                 _connectionCts = null;
+                _eventLoopTask = null;
+                _heartbeatTask = null;
 
                 if (!_disposed)
                 {
@@ -675,29 +931,313 @@ namespace XivIpc.Messaging
                 }
             }
 
-            try { connectionCts?.Cancel(); } catch { }
+            if (socket is null &&
+                journal is null &&
+                lease is null &&
+                connectionCts is null &&
+                eventLoopTask is null &&
+                heartbeatTask is null)
+            {
+                return;
+            }
 
-            if (sendDispose && socket is not null)
+            Action cancelConnection = () =>
             {
                 try
                 {
-                    _writeLock.Wait(CancellationToken.None);
-                    SidecarProtocol.WriteDispose(socket);
+                    connectionCts?.Cancel();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ConnectionCancelFailed",
+                        "Failed to cancel the active connection token during teardown.",
+                        ex,
+                        ("channel", _channelName));
                 }
-                finally
+            };
+
+            Action? sendDisposeFrame = null;
+            if (sendDispose && socket is not null)
+            {
+                sendDisposeFrame = () =>
                 {
-                    try { _writeLock.Release(); } catch { }
+                    bool writeLockHeld = false;
+                    try
+                    {
+                        _writeLock.Wait(CancellationToken.None);
+                        writeLockHeld = true;
+                        SidecarProtocol.WriteDispose(socket);
+                    }
+                    catch (Exception ex)
+                    {
+                        TinyIpcLogger.Warning(
+                            nameof(UnixSidecarTinyMessageBus),
+                            "DisposeFrameWriteFailed",
+                            "Failed to write sidecar DISPOSE during connection teardown.",
+                            ex,
+                            ("channel", _channelName));
+                    }
+                    finally
+                    {
+                        if (writeLockHeld)
+                            SafeReleaseWriteLock("WriteLockReleaseFailedAfterDisposeFrame");
+                    }
+                };
+            }
+
+            Action shutdownTransport = () =>
+            {
+                if (socket is null)
+                    return;
+
+                try
+                {
+                    socket.Shutdown(SocketShutdown.Both);
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Debug(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "SocketShutdownFailedDuringTeardown",
+                        "Socket shutdown during sidecar teardown failed.",
+                        ("channel", _channelName),
+                        ("exceptionType", ex.GetType().FullName),
+                        ("exceptionMessage", ex.Message));
+                }
+            };
+
+            Action disposeResources = () =>
+            {
+                if (socket is not null)
+                {
+                    SafeInvoke(
+                        () => socket.Dispose(),
+                        "SocketDisposeFailedDuringTeardown",
+                        "Failed to dispose socket during connection teardown.");
+                }
+
+                if (journal is not null)
+                {
+                    SafeInvoke(
+                        () => journal.Dispose(),
+                        "JournalDisposeFailedDuringTeardown",
+                        "Failed to dispose journal during connection teardown.");
+                }
+
+                if (lease.HasValue)
+                {
+                    UnixSidecarProcessManager.Lease leaseValue = lease.Value;
+                    SafeInvoke(
+                        () => leaseValue.Dispose(),
+                        "LeaseDisposeFailedDuringTeardown",
+                        "Failed to dispose sidecar lease during connection teardown.");
+                }
+
+                if (connectionCts is not null)
+                {
+                    SafeInvoke(
+                        () => connectionCts.Dispose(),
+                        "ConnectionCtsDisposeFailedDuringTeardown",
+                        "Failed to dispose connection cancellation source during connection teardown.");
+                }
+            };
+
+            Task cleanupTask = RunConnectionCleanupCoreAsync(
+                _channelName,
+                cancelConnection,
+                sendDisposeFrame,
+                shutdownTransport,
+                eventLoopTask,
+                heartbeatTask,
+                disposeResources,
+                TimeSpan.FromSeconds(5));
+
+            TrackCleanupTask(cleanupTask);
+        }
+
+        private void TrackCleanupTask(Task task)
+        {
+            lock (_cleanupGate)
+                _connectionCleanupTasks.Add(task);
+
+            _ = task.ContinueWith(
+                completed =>
+                {
+                    if (completed.IsFaulted && completed.Exception is not null)
+                    {
+                        TinyIpcLogger.Error(
+                            nameof(UnixSidecarTinyMessageBus),
+                            "ConnectionCleanupFaulted",
+                            "A connection cleanup task faulted unexpectedly.",
+                            completed.Exception.Flatten(),
+                            ("channel", _channelName));
+                    }
+
+                    lock (_cleanupGate)
+                        _connectionCleanupTasks.Remove(completed);
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        private void WaitForPendingConnectionCleanupTasks(TimeSpan timeout)
+        {
+            Task[] pending;
+            lock (_cleanupGate)
+                pending = _connectionCleanupTasks.Where(static t => !t.IsCompleted).ToArray();
+
+            if (pending.Length == 0)
+                return;
+
+            try
+            {
+                Task.WaitAll(pending, timeout);
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "ConnectionCleanupJoinFailed",
+                    "Timed out or failed while waiting for connection cleanup tasks to finish.",
+                    ex,
+                    ("channel", _channelName),
+                    ("pendingCount", pending.Length),
+                    ("timeoutMs", (int)timeout.TotalMilliseconds));
+            }
+        }
+
+        internal static Task RunConnectionCleanupForTestsAsync(
+            Action cancelConnection,
+            Action? sendDisposeFrame,
+            Action shutdownTransport,
+            Task? eventLoopTask,
+            Task? heartbeatTask,
+            Action disposeResources,
+            TimeSpan waitForConnectionTasks)
+            => RunConnectionCleanupCoreAsync(
+                channelName: "tests",
+                cancelConnection,
+                sendDisposeFrame,
+                shutdownTransport,
+                eventLoopTask,
+                heartbeatTask,
+                disposeResources,
+                waitForConnectionTasks);
+
+        private static async Task RunConnectionCleanupCoreAsync(
+            string channelName,
+            Action cancelConnection,
+            Action? sendDisposeFrame,
+            Action shutdownTransport,
+            Task? eventLoopTask,
+            Task? heartbeatTask,
+            Action disposeResources,
+            TimeSpan waitForConnectionTasks)
+        {
+            try
+            {
+                cancelConnection();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "ConnectionCleanupCancelFailed",
+                    "Connection cleanup failed while canceling the connection.",
+                    ex,
+                    ("channel", channelName));
+            }
+
+            try
+            {
+                sendDisposeFrame?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "ConnectionCleanupDisposeFrameFailed",
+                    "Connection cleanup failed while sending the dispose frame.",
+                    ex,
+                    ("channel", channelName));
+            }
+
+            try
+            {
+                shutdownTransport();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "ConnectionCleanupShutdownFailed",
+                    "Connection cleanup failed while shutting down the transport.",
+                    ex,
+                    ("channel", channelName));
+            }
+
+            Task[] dependentTasks = new[] { eventLoopTask, heartbeatTask }
+                .Where(static t => t is not null)
+                .Cast<Task>()
+                .ToArray();
+
+            if (dependentTasks.Length > 0)
+            {
+                try
+                {
+                    await Task.WhenAll(dependentTasks).WaitAsync(waitForConnectionTasks).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ConnectionCleanupWaitCanceled",
+                        "Connection cleanup wait for dependent tasks was canceled.",
+                        ex,
+                        ("channel", channelName),
+                        ("dependentTaskCount", dependentTasks.Length),
+                        ("timeoutMs", (int)waitForConnectionTasks.TotalMilliseconds));
+                }
+                catch (TimeoutException ex)
+                {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ConnectionCleanupWaitTimedOut",
+                        "Connection cleanup timed out while waiting for dependent tasks to finish.",
+                        ex,
+                        ("channel", channelName),
+                        ("dependentTaskCount", dependentTasks.Length),
+                        ("timeoutMs", (int)waitForConnectionTasks.TotalMilliseconds));
+                }
+                catch (Exception ex)
+                {
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "ConnectionCleanupWaitFailed",
+                        "Connection cleanup failed while waiting for dependent tasks to finish.",
+                        ex,
+                        ("channel", channelName),
+                        ("dependentTaskCount", dependentTasks.Length),
+                        ("timeoutMs", (int)waitForConnectionTasks.TotalMilliseconds));
                 }
             }
 
-            try { socket?.Shutdown(SocketShutdown.Both); } catch { }
-            try { socket?.Dispose(); } catch { }
-            try { journal?.Dispose(); } catch { }
-            try { lease?.Dispose(); } catch { }
-            try { connectionCts?.Dispose(); } catch { }
+            try
+            {
+                disposeResources();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "ConnectionCleanupDisposeResourcesFailed",
+                    "Connection cleanup failed while disposing connection resources.",
+                    ex,
+                    ("channel", channelName));
+            }
         }
 
         private Socket? GetCurrentSocket()
@@ -788,13 +1328,13 @@ namespace XivIpc.Messaging
 
         private static long ResolveMinMessageAgeMs()
         {
-            string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
+            string? raw = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS");
             return long.TryParse(raw, out long value) && value >= 0 ? value : 1_000L;
         }
 
         private static int ResolvePositiveInt32(string variableName, int fallback)
         {
-            string? raw = TinyIpcEnvironment.GetEnvironmentVariable(variableName);
+            string? raw = Environment.GetEnvironmentVariable(variableName);
             return int.TryParse(raw, out int value) && value > 0 ? value : fallback;
         }
 
@@ -810,8 +1350,14 @@ namespace XivIpc.Messaging
             {
                 Dispose();
             }
-            catch
+            catch (Exception ex)
             {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "DisposeFailedDuringProcessExit",
+                    "Broker-backed bus disposal failed during process exit or domain unload.",
+                    ex,
+                    ("channel", _channelName));
             }
         }
 
@@ -819,6 +1365,88 @@ namespace XivIpc.Messaging
         {
             if (_disposed)
                 throw new ObjectDisposedException(nameof(UnixSidecarTinyMessageBus));
+        }
+
+        private Task ObserveTaskFault(Task task, string eventName, string message)
+        {
+            _ = task.ContinueWith(
+                completed =>
+                {
+                    if (completed.IsFaulted && completed.Exception is not null)
+                    {
+                        TinyIpcLogger.Error(
+                            nameof(UnixSidecarTinyMessageBus),
+                            eventName,
+                            message,
+                            completed.Exception.Flatten(),
+                            ("channel", _channelName));
+                    }
+                    else if (completed.IsCanceled && !_disposed && !_lifetimeCts.IsCancellationRequested)
+                    {
+                        TinyIpcLogger.Warning(
+                            nameof(UnixSidecarTinyMessageBus),
+                            $"{eventName}Canceled",
+                            "A broker-backed background task was canceled unexpectedly.",
+                            null,
+                            ("channel", _channelName));
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
+            return task;
+        }
+
+        private void SafeReleaseSemaphore(SemaphoreSlim semaphore, string eventName, string message)
+        {
+            try
+            {
+                semaphore.Release();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    eventName,
+                    message,
+                    ex,
+                    ("channel", _channelName));
+            }
+        }
+
+        private void SafeReleaseWriteLock(string eventName)
+        {
+            try
+            {
+                _writeLock.Release();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    eventName,
+                    "Failed to release the sidecar write lock.",
+                    ex,
+                    ("channel", _channelName));
+            }
+        }
+
+        private void SafeInvoke(Action action, string eventName, string message)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    eventName,
+                    message,
+                    ex,
+                    ("channel", _channelName));
+            }
         }
     }
 }
