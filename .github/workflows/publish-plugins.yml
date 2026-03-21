@@ -76,7 +76,7 @@ jobs:
                 echo "Release ${tag} already exists; skipping upload"
               fi
             else
-              gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}"
+              gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}" --latest=false
             fi
           done
 

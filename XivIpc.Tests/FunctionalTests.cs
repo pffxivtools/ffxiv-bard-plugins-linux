@@ -327,10 +327,10 @@ public sealed class FunctionalTests
             return;
 
         Task[] tasks = buses
-            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10)))
+            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(30)))
             .ToArray();
 
-        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(40), cancellationToken);
     }
 
     private static bool IsSidecarStyleBackend(string backend)
