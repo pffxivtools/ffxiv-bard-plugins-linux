@@ -73,9 +73,9 @@
     "IsTestingExclusive": "False",
     "DownloadCount": 62310,
     "LastUpdate": "1766108205",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/BardToolbox-0.0.1.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/BardToolbox-0.0.1.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/BardToolbox-0.0.1.zip"
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/BardToolbox-2.2.4.3.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/BardToolbox-2.2.4.3.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/BardToolbox-2.2.4.3.zip"
   },
   {
     "Author": "Zune",
@@ -94,9 +94,9 @@
     "Changelog": "Weird features added",
     "DownloadCount": 0,
     "LastUpdate": "1756257632",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MasterOfPuppets-0.0.1.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MasterOfPuppets-0.0.1.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MasterOfPuppets-0.0.1.zip",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MasterOfPuppets-1.0.0.131.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MasterOfPuppets-1.0.0.131.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MasterOfPuppets-1.0.0.131.zip",
     "IsHide": false
   },
   {
@@ -129,8 +129,8 @@
     "IsTestingExclusive": "False",
     "DownloadCount": 221454,
     "LastUpdate": "1764618787",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MidiBard2-0.0.1.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MidiBard2-0.0.1.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.1/MidiBard2-0.0.1.zip"
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MidiBard2-3.2.3.0.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MidiBard2-3.2.3.0.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.2/MidiBard2-3.2.3.0.zip"
   }
 ]
