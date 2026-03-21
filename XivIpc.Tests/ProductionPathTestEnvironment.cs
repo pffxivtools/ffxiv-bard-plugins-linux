@@ -14,7 +14,7 @@ internal static class ProductionPathTestEnvironment
 
     internal static string ResolveSharedGroup()
     {
-        string? configured = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
         if (!string.IsNullOrWhiteSpace(configured))
             return configured;
 

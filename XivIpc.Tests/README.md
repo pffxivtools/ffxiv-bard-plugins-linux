@@ -14,6 +14,18 @@ This project verifies that the public shim and the internal transport behave cor
 - Multi-user and runtime integration tests validate group-based access plus cross-runtime communication with the Wine test host.
 - Log assertions and state-file assertions are used heavily so tests verify the launch contract as well as message delivery.
 
+## Optional Stress Coverage
+
+The broker journal stress coverage is opt-in so normal CI stays deterministic and bounded.
+
+Run it with:
+
+```bash
+TINYIPC_ENABLE_JOURNAL_STRESS_TESTS=1 \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
+  --filter "FullyQualifiedName~XivIpc.Tests.BrokeredChannelJournalStressTests"
+```
+
 ## Main Entry Points
 
 - `FunctionalTests.cs`

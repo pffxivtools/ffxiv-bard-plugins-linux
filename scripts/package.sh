@@ -2,8 +2,8 @@
 
 dotnet clean
 ~/.dotnet/tools/scrub --ask false
-rm -f TinyIpc.Shim.zip
-7z a TinyIpc.Shim.zip \
+rm -f XivIpc.zip
+7z a XivIpc.zip \
     TinyIpc.Shim XivIpc XivIpc.NativeHost \
-    TinyIpc.Shim.sln \
+    XivIpc.Tests XivIpc.WineTestHost TinyIpc.Shim.sln \
     .github -xr!.git

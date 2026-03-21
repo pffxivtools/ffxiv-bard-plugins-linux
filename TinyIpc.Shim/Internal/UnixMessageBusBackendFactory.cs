@@ -31,7 +31,7 @@ internal static class UnixMessageBusBackendFactory
 
     internal static string ResolveBackendName()
     {
-        string? configured = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
+        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend);
         if (string.IsNullOrWhiteSpace(configured))
             return AutoBackend;
 
@@ -60,8 +60,8 @@ internal static class UnixMessageBusBackendFactory
                 "Direct/in-memory backend initialization failed during auto backend selection; using safe no-op behavior.",
                 directEx,
                 ("channel", channelInfo.Name),
-                ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR")),
-                ("configuredBackend", Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND") ?? AutoBackend));
+                ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
+                ("configuredBackend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend) ?? AutoBackend));
 
             return new DisabledShimMessageBus(
                 channelInfo.Name,
@@ -94,7 +94,7 @@ internal static class UnixMessageBusBackendFactory
 
     private static bool IsBrokerRequiredForAuto()
     {
-        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP")))
+        if (string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup)))
             return false;
 
         return UnixSidecarProcessManager.TryResolveNativeHostPath(out _);
@@ -110,8 +110,8 @@ internal static class UnixMessageBusBackendFactory
                 : "Sidecar startup failed during auto backend selection; falling back to direct/in-memory backend.",
             ex,
             ("channel", channelInfo.Name),
-            ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR")),
-            ("configuredBackend", Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND") ?? AutoBackend),
+            ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
+            ("configuredBackend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend) ?? AutoBackend),
             ("brokerRequired", brokerRequired),
             ("nativeHostCandidates", string.Join(";", UnixSidecarProcessManager.GetNativeHostCandidatePathsForDiagnostics())));
     }

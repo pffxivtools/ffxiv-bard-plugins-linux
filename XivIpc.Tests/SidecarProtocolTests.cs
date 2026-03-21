@@ -4,14 +4,13 @@ using Xunit;
 
 namespace XivIpc.Tests;
 
-[Collection("TinyIpc Serial")]
 public sealed class SidecarProtocolTests
 {
     [Fact]
     public void DecodeAttachRing_WithOversizedRingPathLength_ThrowsInvalidData()
     {
         SidecarFrame frame = new(SidecarFrameType.AttachRing, BuildAttachRingPayload(
-            version: 3,
+            version: 4,
             ringPathLength: int.MaxValue,
             slotCount: 256,
             slotPayloadBytes: 1024,
@@ -45,7 +44,7 @@ public sealed class SidecarProtocolTests
     public void DecodeAttachRing_WithInvalidSlotCount_ThrowsInvalidData()
     {
         SidecarFrame frame = new(SidecarFrameType.AttachRing, BuildAttachRingPayload(
-            version: 3,
+            version: 4,
             ringPathLength: "/tmp/test.ring".Length,
             slotCount: 0,
             slotPayloadBytes: 1024,
@@ -63,7 +62,7 @@ public sealed class SidecarProtocolTests
     {
         const string ringPath = "/tmp/test.ring";
         SidecarFrame frame = new(SidecarFrameType.AttachRing, BuildAttachRingPayload(
-            version: 3,
+            version: 4,
             ringPathLength: ringPath.Length,
             slotCount: 256,
             slotPayloadBytes: 1024,
@@ -80,7 +79,7 @@ public sealed class SidecarProtocolTests
         Assert.Equal(7, attach.StartSequence);
         Assert.Equal(42, attach.SessionId);
         Assert.Equal(8192, attach.RingLength);
-        Assert.Equal(3, attach.ProtocolVersion);
+        Assert.Equal(4, attach.ProtocolVersion);
     }
 
     private static byte[] BuildAttachRingPayload(
@@ -94,7 +93,7 @@ public sealed class SidecarProtocolTests
         string ringPath)
     {
         byte[] ringPathBytes = System.Text.Encoding.UTF8.GetBytes(ringPath);
-        byte[] payload = new byte[4 + 4 + 4 + 4 + 8 + 8 + 4 + ringPathBytes.Length];
+        byte[] payload = new byte[4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + ringPathBytes.Length];
         int offset = 0;
         BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(offset, 4), version);
         offset += 4;
@@ -110,6 +109,8 @@ public sealed class SidecarProtocolTests
         offset += 8;
         BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(offset, 4), ringLength);
         offset += 4;
+        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(offset, 8), 0);
+        offset += 8;
         ringPathBytes.CopyTo(payload, offset);
         return payload;
     }

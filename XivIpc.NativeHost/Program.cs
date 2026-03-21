@@ -20,13 +20,13 @@ TinyIpcLogger.Info(
     "NativeHost",
     "BrokerStartupObservedEnvironment",
     "Observed native broker startup environment before path normalization.",
-    ("launchId", Environment.GetEnvironmentVariable("TINYIPC_LAUNCH_ID") ?? string.Empty),
-    ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR") ?? string.Empty),
-    ("brokerDir", Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR") ?? string.Empty),
-    ("logDir", Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR") ?? string.Empty),
-    ("sharedGroup", Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? string.Empty),
-    ("brokerSocketPath", Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH") ?? string.Empty),
-    ("backend", Environment.GetEnvironmentVariable("TINYIPC_BUS_BACKEND") ?? string.Empty));
+    ("launchId", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LaunchId) ?? string.Empty),
+    ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory) ?? string.Empty),
+    ("brokerDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory) ?? string.Empty),
+    ("logDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory) ?? string.Empty),
+    ("sharedGroup", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup) ?? string.Empty),
+    ("brokerSocketPath", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath) ?? string.Empty),
+    ("backend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BusBackend) ?? string.Empty));
 UnixSharedStorageHelpers.EnsureBrokerAccessConfigured();
 
 string socketPath = ResolveSocketPath();
@@ -99,11 +99,15 @@ try
                     ("hasSession", session is not null),
                     ("sessionId", session?.SessionId ?? 0),
                     ("channel", session?.Channel ?? string.Empty),
+                    ("ownerPid", session?.OwnerPid ?? 0),
                     ("peerUid", session?.PeerCredentials.Uid ?? 0),
                     ("peerGid", session?.PeerCredentials.Gid ?? 0));
                 try
                 {
-                    SidecarProtocol.WriteError(socket, ex.Message);
+                    if (session is not null)
+                        session.Write(static (s, message) => SidecarProtocol.WriteError(s, message), ex.Message);
+                    else
+                        SidecarProtocol.WriteError(socket, ex.Message);
                 }
                 catch
                 {
@@ -156,16 +160,17 @@ async Task<BrokerSession> RegisterSessionAsync(Socket socket)
         throw new UnauthorizedAccessException("Peer is not authorized for the TinyIpc broker.");
     }
 
-    RingSizing requestedSizing = RingSizingPolicy.Compute(hello.MaxBytes, ResolveSlotCount(), BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
+    JournalSizing requestedSizing = JournalSizingPolicy.Compute(hello.MaxBytes, BrokeredChannelJournal.HeaderBytes);
     long sessionId = Interlocked.Increment(ref nextSessionId);
-    var session = new BrokerSession(sessionId, hello.Channel, hello.HeartbeatTimeoutMs, socket, peerCredentials);
+    Guid clientInstanceId = hello.ClientInstanceId == Guid.Empty ? Guid.NewGuid() : hello.ClientInstanceId;
+    var session = new BrokerSession(sessionId, hello.Channel, hello.OwnerPid, hello.HeartbeatTimeoutMs, clientInstanceId, socket, peerCredentials);
 
     try
     {
         BrokerChannel channel = channels.GetOrAdd(
             hello.Channel,
-            static (channelName, state) => new BrokerChannel(channelName, state.RequestedBufferBytes, state.SlotCount, state.BrokerDirectory, state.InstanceId),
-            new ChannelSeed(hello.MaxBytes, ResolveSlotCount(), socketDirectory ?? throw new InvalidOperationException("Broker socket directory was not resolved."), brokerState.InstanceId));
+            static (channelName, state) => new BrokerChannel(channelName, state.RequestedBufferBytes, state.BrokerDirectory, state.InstanceId, state.MinAgeMs),
+            new ChannelSeed(hello.MaxBytes, socketDirectory ?? throw new InvalidOperationException("Broker socket directory was not resolved."), brokerState.InstanceId, ResolveMinMessageAgeMs()));
 
         channel.Attach(session, hello.MaxBytes);
         sessions[sessionId] = session;
@@ -174,31 +179,45 @@ async Task<BrokerSession> RegisterSessionAsync(Socket socket)
 
         TinyIpcLogger.Info(
             "NativeHost",
+            "SessionAttached",
+            "Registered a broker session for a sidecar client.",
+            ("sessionId", sessionId),
+            ("channel", hello.Channel),
+            ("ownerPid", hello.OwnerPid),
+            ("clientInstanceId", clientInstanceId),
+            ("peerUid", peerCredentials.Uid),
+            ("peerGid", peerCredentials.Gid),
+            ("channelSessionCount", channel.SessionCount));
+
+        TinyIpcLogger.Info(
+            "NativeHost",
             "AttachRingSending",
             "Sending broker ATTACH_RING frame to client.",
             ("channel", channel.ChannelName),
             ("requestedBufferBytes", hello.MaxBytes),
+            ("ownerPid", hello.OwnerPid),
             ("effectiveBudgetBytes", channel.Sizing.BudgetBytes),
             ("budgetWasCapped", channel.Sizing.WasCapped),
-            ("ringPath", channel.Ring.FilePath),
-            ("slotCount", channel.Ring.SlotCount),
-            ("slotPayloadBytes", channel.Ring.SlotPayloadBytes),
-            ("ringLength", channel.Ring.Length),
-            ("startSequence", channel.Ring.CaptureHead()),
+            ("ringPath", channel.Journal.FilePath),
+            ("capacityBytes", channel.Journal.CapacityBytes),
+            ("maxPayloadBytes", channel.Journal.MaxPayloadBytes),
+            ("ringLength", channel.Journal.Length),
+            ("startSequence", channel.Journal.CaptureHeadSequence()),
             ("sessionId", sessionId),
-            ("protocolVersion", 3));
+            ("protocolVersion", 4));
 
-        SidecarProtocol.WriteAttachRing(
-            socket,
+        session.Write(
+            static (s, attach) => SidecarProtocol.WriteAttachRing(s, attach),
             new SidecarAttachRing(
-                channel.Ring.FilePath,
-                channel.Ring.SlotCount,
-                channel.Ring.SlotPayloadBytes,
-                channel.Ring.CaptureHead(),
+                channel.Journal.FilePath,
+                channel.Journal.CapacityBytes,
+                channel.Journal.MaxPayloadBytes,
+                channel.Journal.CaptureHeadSequence(),
                 sessionId,
-                channel.Ring.Length));
+                channel.Journal.Length,
+                4));
 
-        SidecarProtocol.WriteReady(socket);
+        session.Write(static s => SidecarProtocol.WriteReady(s));
         await Task.CompletedTask.ConfigureAwait(false);
         return session;
     }
@@ -210,11 +229,11 @@ async Task<BrokerSession> RegisterSessionAsync(Socket socket)
             "Failed to register broker session during attach.",
             ex,
             ("channel", hello.Channel),
+            ("ownerPid", hello.OwnerPid),
             ("requestedBufferBytes", hello.MaxBytes),
-            ("slotCount", requestedSizing.SlotCount),
             ("effectiveBudgetBytes", requestedSizing.BudgetBytes),
             ("budgetWasCapped", requestedSizing.WasCapped),
-            ("derivedSlotPayloadBytes", requestedSizing.SlotPayloadBytes),
+            ("derivedMaxPayloadBytes", requestedSizing.MaxPayloadBytes),
             ("derivedImageSize", requestedSizing.ImageSize));
         throw;
     }
@@ -277,7 +296,7 @@ async Task ProcessSessionAsync(BrokerSession session, CancellationToken cancella
                 return;
 
             default:
-                SidecarProtocol.WriteError(session.Socket, $"Unexpected sidecar frame '{frame.Type}'.");
+                session.Write(static (s, message) => SidecarProtocol.WriteError(s, message), $"Unexpected sidecar frame '{frame.Type}'.");
                 session.MarkDead();
                 return;
         }
@@ -290,10 +309,12 @@ void RemoveSession(BrokerSession session)
 {
     session.MarkDead();
     sessions.TryRemove(session.SessionId, out _);
+    int channelSessionCount = 0;
 
     if (channels.TryGetValue(session.Channel, out BrokerChannel? channel))
     {
         channel.Detach(session.SessionId);
+        channelSessionCount = channel.SessionCount;
         if (channel.IsEmpty && channels.TryRemove(session.Channel, out BrokerChannel? removed))
             removed.Dispose();
     }
@@ -303,6 +324,17 @@ void RemoveSession(BrokerSession session)
 
     session.Dispose();
     PersistBrokerState();
+
+    TinyIpcLogger.Info(
+        "NativeHost",
+        "SessionDetached",
+        "Removed a broker session for a sidecar client.",
+        ("sessionId", session.SessionId),
+        ("channel", session.Channel),
+        ("ownerPid", session.OwnerPid),
+        ("peerUid", session.PeerCredentials.Uid),
+        ("peerGid", session.PeerCredentials.Gid),
+        ("channelSessionCount", channelSessionCount));
 }
 
 async Task MonitorSessionsAsync(CancellationToken cancellationToken)
@@ -362,7 +394,7 @@ async Task MonitorSessionsAsync(CancellationToken cancellationToken)
 
 bool AuthorizePeer(LinuxBrokerInterop.PeerCredentials credentials)
 {
-    string? groupName = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+    string? groupName = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
     if (string.IsNullOrWhiteSpace(groupName))
         return false;
 
@@ -391,15 +423,15 @@ static uint? ResolveGroupId(string groupName)
     return null;
 }
 
-static int ResolveSlotCount()
+static long ResolveMinMessageAgeMs()
 {
-    string? raw = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SLOT_COUNT");
-    return int.TryParse(raw, out int value) && value >= 8 ? value : 64;
+    string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
+    return long.TryParse(raw, out long value) && value >= 0 ? value : 1_000L;
 }
 
 static TimeSpan ResolveIdleShutdownDelay()
 {
-    string? raw = Environment.GetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
+    string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerIdleShutdownMs);
     return int.TryParse(raw, out int value) && value >= 250
         ? TimeSpan.FromMilliseconds(value)
         : TimeSpan.FromSeconds(120);
@@ -407,12 +439,12 @@ static TimeSpan ResolveIdleShutdownDelay()
 
 static string ResolveSocketPath()
 {
-    string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH");
+    string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath);
     if (!string.IsNullOrWhiteSpace(explicitPath))
         return ConvertWindowsPathToUnix(explicitPath);
 
-    string? sharedDirectory = Environment.GetEnvironmentVariable("TINYIPC_BROKER_DIR")
-        ?? Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+    string? sharedDirectory = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory)
+        ?? TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
 
     if (!string.IsNullOrWhiteSpace(sharedDirectory))
         return Path.Combine(ConvertWindowsPathToUnix(sharedDirectory), "tinyipc-sidecar.sock");
@@ -499,32 +531,31 @@ sealed class BrokerChannel : IDisposable
     private readonly Dictionary<long, BrokerSession> _sessions = new();
     private readonly string _ringPath;
     private long _publishCount;
-    private long _overwriteCount;
-    private long _peakRetainedDepth;
+    private long _peakRetainedBytes;
 
-    public BrokerChannel(string channelName, int requestedBufferBytes, int slotCount, string brokerDirectory, string instanceId)
+    public BrokerChannel(string channelName, int requestedBufferBytes, string brokerDirectory, string instanceId, long minAgeMs)
     {
         ChannelName = channelName;
-        _ringPath = UnixSharedStorageHelpers.BuildSharedFilePath(brokerDirectory, $"{channelName}_{instanceId}", "broker-ring");
-        Sizing = RingSizingPolicy.Compute(requestedBufferBytes, slotCount, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
-        Ring = BrokeredChannelRing.Create(_ringPath, Sizing.SlotCount, Sizing.SlotPayloadBytes);
+        _ringPath = UnixSharedStorageHelpers.BuildSharedFilePath(brokerDirectory, $"{channelName}_{instanceId}", "broker-journal");
+        Sizing = JournalSizingPolicy.Compute(requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
+        Journal = BrokeredChannelJournal.Create(_ringPath, Sizing.BudgetBytes, Sizing.MaxPayloadBytes, minAgeMs);
         TinyIpcLogger.Info(
             "NativeHost",
             "ChannelCreated",
-            "Created a broker channel ring with derived sizing.",
+            "Created a broker channel journal with derived sizing.",
             ("channel", ChannelName),
             ("requestedBufferBytes", Sizing.RequestedBufferBytes),
             ("effectiveBudgetBytes", Sizing.BudgetBytes),
             ("budgetWasCapped", Sizing.WasCapped),
-            ("slotCount", Ring.SlotCount),
-            ("slotPayloadBytes", Ring.SlotPayloadBytes),
-            ("ringLength", Ring.Length),
-            ("ringPath", Ring.FilePath));
+            ("maxPayloadBytes", Journal.MaxPayloadBytes),
+            ("journalLength", Journal.Length),
+            ("journalPath", Journal.FilePath),
+            ("minAgeMs", Journal.MinAgeMs));
     }
 
     public string ChannelName { get; }
-    public RingSizing Sizing { get; }
-    public BrokeredChannelRing Ring { get; }
+    public JournalSizing Sizing { get; }
+    public BrokeredChannelJournal Journal { get; }
     public bool IsEmpty
     {
         get
@@ -534,17 +565,26 @@ sealed class BrokerChannel : IDisposable
         }
     }
 
+    public int SessionCount
+    {
+        get
+        {
+            lock (_gate)
+                return _sessions.Count;
+        }
+    }
+
     public void Attach(BrokerSession session, int requestedMaxPayloadBytes)
     {
         lock (_gate)
         {
-            RingSizing requestedSizing = RingSizingPolicy.Compute(requestedMaxPayloadBytes, Ring.SlotCount, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
-            if (requestedSizing.SlotPayloadBytes > Ring.SlotPayloadBytes || requestedSizing.ImageSize > Ring.Length)
+            JournalSizing requestedSizing = JournalSizingPolicy.Compute(requestedMaxPayloadBytes, BrokeredChannelJournal.HeaderBytes);
+            if (requestedSizing.MaxPayloadBytes > Journal.MaxPayloadBytes || requestedSizing.ImageSize > Journal.Length)
             {
                 throw new InvalidOperationException(
-                    $"Existing brokered ring for channel '{ChannelName}' is smaller than requested. " +
-                    $"existingSlotCount={Ring.SlotCount}, existingSlotPayloadBytes={Ring.SlotPayloadBytes}, existingImageSize={Ring.Length}; " +
-                    $"requestedBufferBytes={requestedMaxPayloadBytes}, requestedSlotPayloadBytes={requestedSizing.SlotPayloadBytes}, requestedImageSize={requestedSizing.ImageSize}.");
+                    $"Existing brokered journal for channel '{ChannelName}' is smaller than requested. " +
+                    $"existingCapacityBytes={Journal.CapacityBytes}, existingMaxPayloadBytes={Journal.MaxPayloadBytes}, existingImageSize={Journal.Length}; " +
+                    $"requestedBufferBytes={requestedMaxPayloadBytes}, requestedMaxPayloadBytes={requestedSizing.MaxPayloadBytes}, requestedImageSize={requestedSizing.ImageSize}.");
             }
 
             _sessions[session.SessionId] = session;
@@ -560,42 +600,58 @@ sealed class BrokerChannel : IDisposable
     public void Publish(BrokerSession sender, byte[] payload)
     {
         BrokerSession[] recipients;
-        BrokeredRingPublishResult publishResult;
+        BrokeredJournalPublishResult publishResult;
 
         lock (_gate)
         {
-            publishResult = Ring.Publish(sender.SessionId, payload);
+            publishResult = Journal.Publish(sender.ClientInstanceId, payload);
             Interlocked.Increment(ref _publishCount);
-            UpdatePeakRetainedDepth(publishResult.RetainedDepth);
-            if (publishResult.OverwroteOldest)
-                Interlocked.Increment(ref _overwriteCount);
+            UpdatePeakRetainedBytes(publishResult.RetainedBytesAfter);
             recipients = _sessions.Values.Where(x => !x.IsDead).ToArray();
         }
 
-        if (publishResult.OverwroteOldest)
+        if (publishResult.PrunedExpired || publishResult.Compacted)
         {
-            TinyIpcLogger.Warning(
+            TinyIpcLogger.Info(
                 "NativeHost",
-                "RingOverwriteOccurred",
-                "A broker channel overwrote its oldest retained message to admit a new publish.",
-                null,
+                "JournalPrunedOrCompacted",
+                "Broker journal pruned expired records or compacted retained bytes to admit a new publish.",
                 ("channel", ChannelName),
                 ("senderSessionId", sender.SessionId),
+                ("senderInstanceId", sender.ClientInstanceId),
+                ("senderOwnerPid", sender.OwnerPid),
                 ("payloadLength", payload.Length),
-                ("slotCount", Ring.SlotCount),
-                ("slotPayloadBytes", Ring.SlotPayloadBytes),
-                ("headBefore", publishResult.HeadBefore),
-                ("tailBefore", publishResult.TailBefore),
-                ("headAfter", publishResult.HeadAfter),
-                ("tailAfter", publishResult.TailAfter),
-                ("retainedDepth", publishResult.RetainedDepth));
+                ("capacityBytes", Journal.CapacityBytes),
+                ("maxPayloadBytes", Journal.MaxPayloadBytes),
+                ("headBefore", publishResult.HeadSequenceBefore),
+                ("tailBefore", publishResult.TailSequenceBefore),
+                ("headAfter", publishResult.HeadSequenceAfter),
+                ("tailAfter", publishResult.TailSequenceAfter),
+                ("retainedBytesBefore", publishResult.RetainedBytesBefore),
+                ("retainedBytesAfter", publishResult.RetainedBytesAfter),
+                ("prunedExpired", publishResult.PrunedExpired),
+                ("compacted", publishResult.Compacted));
+        }
+
+        if (TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Debug))
+        {
+            TinyIpcLogger.Debug(
+                "NativeHost",
+                "PublishFanout",
+                "Fanned out a broker publish to the current live session set.",
+                ("channel", ChannelName),
+                ("senderSessionId", sender.SessionId),
+                ("senderInstanceId", sender.ClientInstanceId),
+                ("senderOwnerPid", sender.OwnerPid),
+                ("recipientCount", recipients.Length),
+                ("recipientSessionIds", string.Join(",", recipients.Select(static x => x.SessionId))));
         }
 
         foreach (BrokerSession recipient in recipients)
         {
             try
             {
-                SidecarProtocol.WriteNotify(recipient.Socket);
+                recipient.Write(static s => SidecarProtocol.WriteNotify(s));
             }
             catch (Exception ex)
             {
@@ -606,7 +662,9 @@ sealed class BrokerChannel : IDisposable
                     ex,
                     ("channel", ChannelName),
                     ("recipientSessionId", recipient.SessionId),
-                    ("senderSessionId", sender.SessionId));
+                    ("recipientOwnerPid", recipient.OwnerPid),
+                    ("senderSessionId", sender.SessionId),
+                    ("senderOwnerPid", sender.OwnerPid));
                 recipient.MarkDead();
             }
         }
@@ -622,16 +680,14 @@ sealed class BrokerChannel : IDisposable
             ("requestedBufferBytes", Sizing.RequestedBufferBytes),
             ("effectiveBudgetBytes", Sizing.BudgetBytes),
             ("budgetWasCapped", Sizing.WasCapped),
-            ("slotCount", Ring.SlotCount),
-            ("slotPayloadBytes", Ring.SlotPayloadBytes),
-            ("ringLength", Ring.Length),
-            ("currentHead", Ring.CaptureHead()),
-            ("currentTail", Ring.CaptureTail()),
-            ("currentRetainedDepth", Ring.CaptureHead() - Ring.CaptureTail()),
+            ("maxPayloadBytes", Journal.MaxPayloadBytes),
+            ("journalLength", Journal.Length),
+            ("currentHead", Journal.CaptureHeadSequence()),
+            ("currentTail", Journal.CaptureTailSequence()),
+            ("currentRetainedBytes", Journal.CaptureHeadOffset() - Journal.CaptureTailOffset()),
             ("publishCount", Interlocked.Read(ref _publishCount)),
-            ("overwriteCount", Interlocked.Read(ref _overwriteCount)),
-            ("peakRetainedDepth", Interlocked.Read(ref _peakRetainedDepth)));
-        Ring.Dispose();
+            ("peakRetainedBytes", Interlocked.Read(ref _peakRetainedBytes)));
+        Journal.Dispose();
         try
         {
             string runtimePath = UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(_ringPath);
@@ -643,24 +699,24 @@ sealed class BrokerChannel : IDisposable
         }
     }
 
-    private void UpdatePeakRetainedDepth(int retainedDepth)
+    private void UpdatePeakRetainedBytes(int retainedBytes)
     {
-        long current = Volatile.Read(ref _peakRetainedDepth);
-        while (retainedDepth > current)
+        long current = Volatile.Read(ref _peakRetainedBytes);
+        while (retainedBytes > current)
         {
-            long observed = Interlocked.CompareExchange(ref _peakRetainedDepth, retainedDepth, current);
+            long observed = Interlocked.CompareExchange(ref _peakRetainedBytes, retainedBytes, current);
             if (observed == current)
             {
-                if (retainedDepth >= Math.Max(1, Ring.SlotCount * 3 / 4))
+                if (retainedBytes >= Math.Max(1, Journal.CapacityBytes * 3 / 4))
                 {
                     TinyIpcLogger.Info(
                         "NativeHost",
-                        "ChannelHighRetainedDepthObserved",
-                        "Observed a high retained message depth for a broker channel.",
+                        "ChannelHighRetainedBytesObserved",
+                        "Observed a high retained byte depth for a broker channel.",
                         ("channel", ChannelName),
-                        ("retainedDepth", retainedDepth),
-                        ("slotCount", Ring.SlotCount),
-                        ("slotPayloadBytes", Ring.SlotPayloadBytes),
+                        ("retainedBytes", retainedBytes),
+                        ("capacityBytes", Journal.CapacityBytes),
+                        ("maxPayloadBytes", Journal.MaxPayloadBytes),
                         ("publishCount", Interlocked.Read(ref _publishCount)));
                 }
 
@@ -676,11 +732,13 @@ sealed class BrokerSession : IDisposable
 {
     private int _dead;
 
-    public BrokerSession(long sessionId, string channel, int heartbeatTimeoutMs, Socket socket, LinuxBrokerInterop.PeerCredentials peerCredentials)
+    public BrokerSession(long sessionId, string channel, int ownerPid, int heartbeatTimeoutMs, Guid clientInstanceId, Socket socket, LinuxBrokerInterop.PeerCredentials peerCredentials)
     {
         SessionId = sessionId;
         Channel = channel;
+        OwnerPid = ownerPid;
         HeartbeatTimeoutMs = heartbeatTimeoutMs > 0 ? heartbeatTimeoutMs : 60000;
+        ClientInstanceId = clientInstanceId;
         Socket = socket;
         PeerCredentials = peerCredentials;
         LastHeartbeatTicks = DateTimeOffset.UtcNow.UtcTicks;
@@ -688,11 +746,40 @@ sealed class BrokerSession : IDisposable
 
     public long SessionId { get; }
     public string Channel { get; }
+    public int OwnerPid { get; }
     public int HeartbeatTimeoutMs { get; }
+    public Guid ClientInstanceId { get; }
     public Socket Socket { get; }
+    public object WriteGate { get; } = new();
     public LinuxBrokerInterop.PeerCredentials PeerCredentials { get; }
     public long LastHeartbeatTicks;
     public bool IsDead => Volatile.Read(ref _dead) != 0;
+
+    public void Write(Action<Socket> writeAction)
+    {
+        ArgumentNullException.ThrowIfNull(writeAction);
+
+        lock (WriteGate)
+        {
+            if (IsDead)
+                return;
+
+            writeAction(Socket);
+        }
+    }
+
+    public void Write<TState>(Action<Socket, TState> writeAction, TState state)
+    {
+        ArgumentNullException.ThrowIfNull(writeAction);
+
+        lock (WriteGate)
+        {
+            if (IsDead)
+                return;
+
+            writeAction(Socket, state);
+        }
+    }
 
     public void TouchHeartbeat()
     {
@@ -710,4 +797,4 @@ sealed class BrokerSession : IDisposable
     }
 }
 
-readonly record struct ChannelSeed(int RequestedBufferBytes, int SlotCount, string BrokerDirectory, string InstanceId);
+readonly record struct ChannelSeed(int RequestedBufferBytes, string BrokerDirectory, string InstanceId, long MinAgeMs);

@@ -8,7 +8,6 @@ namespace XivIpc.Messaging
     {
         private const int DefaultHeartbeatIntervalMs = 2000;
         private const int DefaultHeartbeatTimeoutMs = 60000;
-        private const int DefaultSlotCount = 64;
         private const int MaxReconnectQueuedMessages = 64;
         private static readonly TimeSpan[] ReconnectBackoffSchedule =
         {
@@ -30,7 +29,7 @@ namespace XivIpc.Messaging
 
         private readonly string _channelName;
         private readonly int _requestedBufferBytes;
-        private readonly RingSizing _expectedSizing;
+        private readonly Guid _clientInstanceId;
         private readonly UnixSidecarProcessManager.RuntimeSettings _runtimeSettings;
         private readonly object _stateGate = new();
         private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -45,7 +44,7 @@ namespace XivIpc.Messaging
         private readonly Task _connectionLoopTask;
 
         private Socket? _socket;
-        private BrokeredChannelRing? _ring;
+        private BrokeredChannelJournal? _journal;
         private UnixSidecarProcessManager.Lease? _lease;
         private CancellationTokenSource? _connectionCts;
         private Task? _eventLoopTask;
@@ -56,8 +55,8 @@ namespace XivIpc.Messaging
         private bool _disposed;
         private long _sessionId;
         private long _nextSequence;
-        private int _effectiveSlotPayloadBytes;
-        private RingSizing _effectiveSizing;
+        private int _effectiveMaxPayloadBytes;
+        private JournalSizing _effectiveSizing;
         private long _drainedMessageCount;
         private long _retainedTailCatchupCount;
         private long _maxLagSeen;
@@ -81,10 +80,10 @@ namespace XivIpc.Messaging
 
             _channelName = channelName;
             _requestedBufferBytes = maxPayloadBytes;
-            _expectedSizing = RingSizingPolicy.Compute(_requestedBufferBytes, DefaultSlotCount, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
+            _clientInstanceId = Guid.NewGuid();
             _runtimeSettings = UnixSidecarProcessManager.CaptureSettings();
-            _effectiveSizing = _expectedSizing;
-            _effectiveSlotPayloadBytes = _expectedSizing.SlotPayloadBytes;
+            _effectiveSizing = JournalSizingPolicy.Compute(_requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
+            _effectiveMaxPayloadBytes = _effectiveSizing.MaxPayloadBytes;
             _connectionState = ConnectionState.Connecting;
 
             AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
@@ -104,14 +103,13 @@ namespace XivIpc.Messaging
             ArgumentNullException.ThrowIfNull(message);
             ThrowIfDisposed();
 
-            int allowedBytes = Volatile.Read(ref _effectiveSlotPayloadBytes);
+            int allowedBytes = Volatile.Read(ref _effectiveMaxPayloadBytes);
             if (message.Length > allowedBytes)
             {
                 throw new InvalidOperationException(
                     $"Message length {message.Length} exceeds the configured per-message capacity of {allowedBytes} bytes. " +
                     $"requestedBufferBytes={_requestedBufferBytes}, " +
-                    $"effectiveBudgetBytes={_effectiveSizing.BudgetBytes}, " +
-                    $"slotCount={_effectiveSizing.SlotCount}.");
+                    $"effectiveBudgetBytes={_effectiveSizing.BudgetBytes}.");
             }
 
             EnqueueOutbound(message);
@@ -149,8 +147,7 @@ namespace XivIpc.Messaging
                 ("channel", _channelName),
                 ("requestedBufferBytes", _requestedBufferBytes),
                 ("effectiveBudgetBytes", _effectiveSizing.BudgetBytes),
-                ("slotCount", _effectiveSizing.SlotCount),
-                ("slotPayloadBytes", _effectiveSlotPayloadBytes),
+                ("maxPayloadBytes", _effectiveMaxPayloadBytes),
                 ("drainedMessageCount", Interlocked.Read(ref _drainedMessageCount)),
                 ("retainedTailCatchupCount", Interlocked.Read(ref _retainedTailCatchupCount)),
                 ("maxLagSeen", Interlocked.Read(ref _maxLagSeen)),
@@ -249,7 +246,7 @@ namespace XivIpc.Messaging
 
             UnixSidecarProcessManager.Lease lease = default;
             Socket? socket = null;
-            BrokeredChannelRing? ring = null;
+            BrokeredChannelJournal? journal = null;
             CancellationTokenSource? connectionCts = null;
 
             try
@@ -262,13 +259,14 @@ namespace XivIpc.Messaging
                     _requestedBufferBytes,
                     RuntimeEnvironmentDetector.GetCurrentProcessId(),
                     ResolveHeartbeatIntervalMs(),
-                    ResolveHeartbeatTimeoutMs()));
+                    ResolveHeartbeatTimeoutMs(),
+                    _clientInstanceId));
 
                 SidecarFrame attachFrame = SidecarProtocol.ReadFrame(socket);
                 LogAttachFrameReceived(attachFrame);
                 SidecarAttachRing attach = DecodeAttachFrame(attachFrame);
-                ring = BrokeredChannelRing.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes);
-                RingSizing sizing = RingSizingPolicy.Compute(_requestedBufferBytes, attach.SlotCount, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
+                journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, ResolveMinMessageAgeMs());
+                JournalSizing sizing = JournalSizingPolicy.Compute(_requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
 
                 SidecarFrame readyFrame = SidecarProtocol.ReadFrame(socket);
                 if (readyFrame.Type == SidecarFrameType.Error)
@@ -279,7 +277,7 @@ namespace XivIpc.Messaging
 
                 connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 Socket eventSocket = socket;
-                BrokeredChannelRing eventRing = ring;
+                BrokeredChannelJournal eventJournal = journal;
                 CancellationTokenSource eventConnectionCts = connectionCts;
 
                 lock (_stateGate)
@@ -289,15 +287,15 @@ namespace XivIpc.Messaging
 
                     _lease = lease;
                     _socket = socket;
-                    _ring = ring;
+                    _journal = journal;
                     _connectionCts = connectionCts;
                     _effectiveSizing = sizing;
-                    _effectiveSlotPayloadBytes = attach.SlotPayloadBytes;
+                    _effectiveMaxPayloadBytes = attach.SlotPayloadBytes;
                     _sessionId = attach.SessionId;
                     _nextSequence = attach.StartSequence;
                     _connectionState = ConnectionState.Connected;
                     _connectedTcs.TrySetResult(true);
-                    _eventLoopTask = Task.Run(() => EventLoopAsync(eventSocket, eventRing, attach.SessionId, eventConnectionCts.Token));
+                    _eventLoopTask = Task.Run(() => EventLoopAsync(eventSocket, eventJournal, attach.SessionId, eventConnectionCts.Token));
                     _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(eventSocket, eventConnectionCts.Token));
                 }
 
@@ -306,22 +304,22 @@ namespace XivIpc.Messaging
                     "ReconnectSucceeded",
                     "Connected or reconnected to the sidecar broker.",
                     ("channel", _channelName),
+                    ("sessionId", attach.SessionId),
                     ("requestedBufferBytes", _requestedBufferBytes),
                     ("effectiveBudgetBytes", sizing.BudgetBytes),
-                    ("slotCount", sizing.SlotCount),
-                    ("slotPayloadBytes", sizing.SlotPayloadBytes),
+                    ("maxPayloadBytes", attach.SlotPayloadBytes),
                     ("socketPath", lease.SocketPath));
 
                 lease = default;
                 socket = null;
-                ring = null;
+                journal = null;
                 connectionCts = null;
                 await Task.CompletedTask.ConfigureAwait(false);
             }
             finally
             {
                 try { connectionCts?.Dispose(); } catch { }
-                try { ring?.Dispose(); } catch { }
+                try { journal?.Dispose(); } catch { }
                 try { socket?.Dispose(); } catch { }
                 try { lease.Dispose(); } catch { }
             }
@@ -412,7 +410,7 @@ namespace XivIpc.Messaging
             }
         }
 
-        private async Task EventLoopAsync(Socket socket, BrokeredChannelRing ring, long sessionId, CancellationToken cancellationToken)
+        private async Task EventLoopAsync(Socket socket, BrokeredChannelJournal journal, long sessionId, CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested && !_disposed)
             {
@@ -422,7 +420,7 @@ namespace XivIpc.Messaging
                     switch (frame.Type)
                     {
                         case SidecarFrameType.Notify:
-                            DrainAvailableMessages(ring, sessionId);
+                            DrainAvailableMessages(journal, sessionId);
                             break;
                         case SidecarFrameType.Error:
                             HandleConnectionLost(socket, "BrokerReturnedErrorFrame", new InvalidOperationException(System.Text.Encoding.UTF8.GetString(frame.Payload.Span)));
@@ -481,13 +479,30 @@ namespace XivIpc.Messaging
             }
         }
 
-        private void DrainAvailableMessages(BrokeredChannelRing ring, long sessionId)
+        private void DrainAvailableMessages(BrokeredChannelJournal journal, long sessionId)
         {
-            BrokeredRingDrainResult result = ring.Drain(sessionId, ref _nextSequence);
+            BrokeredJournalDrainResult result = journal.Drain(_clientInstanceId, ref _nextSequence);
             long lagBefore = Math.Max(0, result.LagBefore);
-            Interlocked.Exchange(ref _lastObservedHead, result.HeadObserved);
-            Interlocked.Exchange(ref _lastObservedTail, result.TailObserved);
+            Interlocked.Exchange(ref _lastObservedHead, result.HeadSequenceObserved);
+            Interlocked.Exchange(ref _lastObservedTail, result.TailSequenceObserved);
             UpdateMaxLag(lagBefore);
+
+            if (TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Debug))
+            {
+                TinyIpcLogger.Debug(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "NotifyDrainedMessages",
+                    "Drained available broker-backed messages for the current sidecar session.",
+                    ("channel", _channelName),
+                    ("sessionId", sessionId),
+                    ("drainedCount", result.Messages.Count),
+                    ("headObserved", result.HeadSequenceObserved),
+                    ("tailObserved", result.TailSequenceObserved),
+                    ("nextSequenceBefore", result.NextSequenceBefore),
+                    ("nextSequenceAfter", result.NextSequenceAfter),
+                    ("lagBefore", lagBefore),
+                    ("caughtUpToTail", result.CaughtUpToTail));
+            }
 
             if (result.CaughtUpToTail)
             {
@@ -495,15 +510,15 @@ namespace XivIpc.Messaging
                 TinyIpcLogger.Warning(
                     nameof(UnixSidecarTinyMessageBus),
                     "SubscriberCaughtUpToRetainedTail",
-                    "A broker-backed subscriber fell behind the retained tail and was advanced.",
+                    "A broker-backed subscriber fell behind the retained journal tail and was advanced.",
                     null,
                     ("channel", _channelName),
-                    ("headObserved", result.HeadObserved),
-                    ("tailObserved", result.TailObserved),
+                    ("headObserved", result.HeadSequenceObserved),
+                    ("tailObserved", result.TailSequenceObserved),
                     ("nextSequenceBefore", result.NextSequenceBefore),
                     ("nextSequenceAfter", result.NextSequenceAfter),
                     ("lagBefore", lagBefore),
-                    ("retainedDepth", result.RetainedDepth));
+                    ("retainedBytes", result.RetainedBytes));
             }
 
             foreach (byte[] payload in result.Messages)
@@ -522,7 +537,7 @@ namespace XivIpc.Messaging
                 long observed = Interlocked.CompareExchange(ref _maxLagSeen, lag, current);
                 if (observed == current)
                 {
-                    if (lag >= Math.Max(1, _effectiveSizing.SlotCount * 3L / 4L))
+                    if (lag >= Math.Max(1, _effectiveSizing.BudgetBytes * 3L / 4L))
                     {
                         TinyIpcLogger.Info(
                             nameof(UnixSidecarTinyMessageBus),
@@ -530,8 +545,8 @@ namespace XivIpc.Messaging
                             "Observed a high broker-backed subscriber lag.",
                             ("channel", _channelName),
                             ("lag", lag),
-                            ("slotCount", _effectiveSizing.SlotCount),
-                            ("effectiveBudgetBytes", _effectiveSizing.BudgetBytes));
+                            ("effectiveBudgetBytes", _effectiveSizing.BudgetBytes),
+                            ("maxPayloadBytes", _effectiveMaxPayloadBytes));
                     }
 
                     return;
@@ -638,18 +653,18 @@ namespace XivIpc.Messaging
         private void TeardownConnection(bool sendDispose)
         {
             Socket? socket;
-            BrokeredChannelRing? ring;
+            BrokeredChannelJournal? journal;
             UnixSidecarProcessManager.Lease? lease;
             CancellationTokenSource? connectionCts;
 
             lock (_stateGate)
             {
                 socket = _socket;
-                ring = _ring;
+                journal = _journal;
                 lease = _lease;
                 connectionCts = _connectionCts;
                 _socket = null;
-                _ring = null;
+                _journal = null;
                 _lease = null;
                 _connectionCts = null;
 
@@ -680,7 +695,7 @@ namespace XivIpc.Messaging
 
             try { socket?.Shutdown(SocketShutdown.Both); } catch { }
             try { socket?.Dispose(); } catch { }
-            try { ring?.Dispose(); } catch { }
+            try { journal?.Dispose(); } catch { }
             try { lease?.Dispose(); } catch { }
             try { connectionCts?.Dispose(); } catch { }
         }
@@ -771,9 +786,15 @@ namespace XivIpc.Messaging
         private static int ResolveHeartbeatTimeoutMs()
             => ResolvePositiveInt32("TINYIPC_SIDECAR_HEARTBEAT_TIMEOUT_MS", DefaultHeartbeatTimeoutMs);
 
+        private static long ResolveMinMessageAgeMs()
+        {
+            string? raw = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
+            return long.TryParse(raw, out long value) && value >= 0 ? value : 1_000L;
+        }
+
         private static int ResolvePositiveInt32(string variableName, int fallback)
         {
-            string? raw = Environment.GetEnvironmentVariable(variableName);
+            string? raw = TinyIpcEnvironment.GetEnvironmentVariable(variableName);
             return int.TryParse(raw, out int value) && value > 0 ? value : fallback;
         }
 

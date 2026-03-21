@@ -1,6 +1,7 @@
 using System.Net.Sockets;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
+using XivIpc.Internal;
 using XivIpc.Messaging;
 using Xunit;
 
@@ -101,8 +102,8 @@ public sealed class ProductionPathLifecycleTests
         => Inner.LargeRequestedBuffer_IsBudgetedWithoutOverflow(ProductionPathTestEnvironment.BackendName);
 
     [Fact]
-    public Task RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail()
-        => Inner.RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail(ProductionPathTestEnvironment.BackendName);
+    public Task JournalPruning_IsLogged_AndDrainCatchesUpToRetainedTail()
+        => Inner.JournalPruning_IsLogged_AndDrainCatchesUpToRetainedTail(ProductionPathTestEnvironment.BackendName);
 
     [Fact]
     public Task RawUdsClient_CanPublishToTinyMessageBusSubscriber()
@@ -144,7 +145,7 @@ public sealed class ProductionPathLifecycleTests
 
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly Dictionary<string, string?> _previousEnvironment = new(StringComparer.Ordinal);
+        private readonly IDisposable _overrides;
 
         public TestEnvironmentScope(string? sharedGroup = null)
         {
@@ -155,25 +156,16 @@ public sealed class ProductionPathLifecycleTests
             Directory.CreateDirectory(SharedDirectory);
             ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
 
-            Capture("TINYIPC_MESSAGE_BUS_BACKEND");
-            Capture("TINYIPC_NATIVE_HOST_PATH");
-            Capture("TINYIPC_SHARED_DIR");
-            Capture("TINYIPC_SHARED_GROUP");
-            Capture("TINYIPC_LOG_DIR");
-            Capture("TINYIPC_LOG_LEVEL");
-            Capture("TINYIPC_ENABLE_LOGGING");
-            Capture("TINYIPC_FILE_NOTIFIER");
-
             ProductionPathTestEnvironment.ResetLogger();
-
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", sharedGroup ?? ProductionPathTestEnvironment.ResolveSharedGroup());
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+            _overrides = TinyIpcEnvironment.Override(
+                (TinyIpcEnvironment.MessageBusBackend, null),
+                (TinyIpcEnvironment.NativeHostPath, null),
+                (TinyIpcEnvironment.SharedDirectory, ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory)),
+                (TinyIpcEnvironment.SharedGroup, sharedGroup ?? ProductionPathTestEnvironment.ResolveSharedGroup()),
+                (TinyIpcEnvironment.LogDirectory, ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory)),
+                (TinyIpcEnvironment.LogLevel, "info"),
+                (TinyIpcEnvironment.EnableLogging, "1"),
+                (TinyIpcEnvironment.FileNotifier, "auto"));
         }
 
         public string ChannelName { get; }
@@ -227,9 +219,7 @@ public sealed class ProductionPathLifecycleTests
 
         public void Dispose()
         {
-            foreach ((string key, string? value) in _previousEnvironment)
-                Environment.SetEnvironmentVariable(key, value);
-
+            _overrides.Dispose();
             ProductionPathTestEnvironment.ResetLogger();
 
             try
@@ -242,7 +232,5 @@ public sealed class ProductionPathLifecycleTests
             }
         }
 
-        private void Capture(string variableName)
-            => _previousEnvironment[variableName] = Environment.GetEnvironmentVariable(variableName);
     }
 }

@@ -283,7 +283,7 @@ namespace XivIpc.IO
 
         private static bool ShouldDeferInitializationToSidecar()
         {
-            string? backend = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
+            string? backend = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend);
             if (string.IsNullOrWhiteSpace(backend))
                 backend = "auto";
 

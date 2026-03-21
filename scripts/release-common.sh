@@ -232,7 +232,7 @@ publish_native_host() {
   rm -rf "${host_dist_dir}"
   mkdir -p "${host_dist_dir}"
 
-  dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained true \
+  dotnet publish -c Release -f net9.0 -r linux-x64 --self-contained true \
     -p:PublishSingleFile=true \
     XivIpc.NativeHost \
     -o "${host_dist_dir}"

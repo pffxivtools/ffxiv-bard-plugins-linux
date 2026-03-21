@@ -3,7 +3,6 @@ using Xunit;
 
 namespace XivIpc.Tests;
 
-[Collection("TinyIpc Serial")]
 public sealed class RingSizingPolicyTests
 {
     [Fact]

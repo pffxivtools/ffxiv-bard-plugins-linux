@@ -25,6 +25,7 @@ namespace XivIpc.Internal
     {
         private static readonly object Sync = new();
         private static readonly ITinyIpcLogSink DisabledSink = new NullTinyIpcLogSink();
+        private static readonly string EmergencyLogPath = Path.Combine(Path.GetTempPath(), "TinyIpc", "tinyipc-emergency.log");
         private static ITinyIpcLogSink _sink = DisabledSink;
         private static TinyIpcLogLevel _enabledThrough = TinyIpcLogLevel.Error;
         private static string _runtimeKind = "unknown";
@@ -48,34 +49,43 @@ namespace XivIpc.Internal
                 _runtimeKind = runtime.Kind.ToString();
                 _initialized = true;
 
-                if (!ReadOptionalBooleanEnvironment("TINYIPC_ENABLE_LOGGING").GetValueOrDefault())
+                if (ReadOptionalBooleanEnvironment(TinyIpcEnvironment.EnableLogging) == false)
                     return;
 
                 try
                 {
-                    string directory = ResolveLogDirectory();
-                    Directory.CreateDirectory(directory);
-                    try
-                    {
-                        UnixSharedStorageHelpers.ApplyPermissions(directory, isDirectory: true);
-                    }
-                    catch
-                    {
-                    }
-
-                    _enabledThrough = ParseLogLevel(Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL")) ?? TinyIpcLogLevel.Info;
-                    _sink = new FileTinyIpcLogSink(
-                        directory,
-                        ParsePositiveInt64(Environment.GetEnvironmentVariable("TINYIPC_LOG_MAX_BYTES")) ?? 5 * 1024 * 1024,
-                        ParsePositiveInt32(Environment.GetEnvironmentVariable("TINYIPC_LOG_FILE_COUNT")) ?? 3);
+                    _enabledThrough = ParseLogLevel(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogLevel)) ?? TinyIpcLogLevel.Info;
+                    _sink = CreateConfiguredSink();
                     _enabled = true;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    _sink = DisabledSink;
-                    _enabled = false;
-                    _failedClosed = true;
-                    return;
+                    TryWriteEmergencyLine(
+                        TinyIpcLogLevel.Error,
+                        "Logging",
+                        "InitializationFailed",
+                        "TinyIpc logging initialization failed; attempting emergency fallback.",
+                        ex);
+
+                    try
+                    {
+                        _sink = CreateEmergencyFallbackSink();
+                        _enabled = true;
+                        _failedClosed = false;
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        _sink = DisabledSink;
+                        _enabled = false;
+                        _failedClosed = true;
+                        TryWriteEmergencyLine(
+                            TinyIpcLogLevel.Error,
+                            "Logging",
+                            "FallbackInitializationFailed",
+                            "TinyIpc emergency logging fallback also failed.",
+                            fallbackEx);
+                        return;
+                    }
                 }
             }
 
@@ -84,9 +94,9 @@ namespace XivIpc.Internal
                 "Initialized",
                 "TinyIpc logging enabled.",
                 ("runtime", runtime.Kind),
-                ("sharedDir", Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR")),
-                ("backend", Environment.GetEnvironmentVariable("TINYIPC_BUS_BACKEND")),
-                ("notifier", Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER")));
+                ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
+                ("backend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BusBackend)),
+                ("notifier", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.FileNotifier)));
         }
 
         internal static void ResetForTests()
@@ -146,7 +156,7 @@ namespace XivIpc.Internal
 
         public static string? CreatePayloadPreview(byte[] payload)
         {
-            if (!ReadOptionalBooleanEnvironment("TINYIPC_LOG_PAYLOAD").GetValueOrDefault())
+            if (!ReadOptionalBooleanEnvironment(TinyIpcEnvironment.LogPayload).GetValueOrDefault())
                 return null;
 
             const int previewBytes = 32;
@@ -189,8 +199,9 @@ namespace XivIpc.Internal
 
                 _sink.WriteLine(sb.ToString());
             }
-            catch
+            catch (Exception ex)
             {
+                TryWriteEmergencyLine(level, component, eventName, message, ex, fields);
                 lock (Sync)
                 {
                     _sink.Dispose();
@@ -204,6 +215,14 @@ namespace XivIpc.Internal
         private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
             Exception? exception = e.ExceptionObject as Exception;
+            TryWriteEmergencyLine(
+                TinyIpcLogLevel.Error,
+                "GlobalException",
+                "UnhandledException",
+                "AppDomain.CurrentDomain.UnhandledException fired.",
+                exception,
+                ("isTerminating", e.IsTerminating),
+                ("exceptionObjectType", e.ExceptionObject?.GetType().FullName));
             Error(
                 "GlobalException",
                 "UnhandledException",
@@ -215,6 +234,13 @@ namespace XivIpc.Internal
 
         private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
         {
+            TryWriteEmergencyLine(
+                TinyIpcLogLevel.Error,
+                "GlobalException",
+                "UnobservedTaskException",
+                "TaskScheduler.UnobservedTaskException fired.",
+                e.Exception,
+                ("observed", e.Observed));
             Error(
                 "GlobalException",
                 "UnobservedTaskException",
@@ -225,11 +251,87 @@ namespace XivIpc.Internal
 
         private static string ResolveLogDirectory()
         {
-            string? configured = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
+            string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory);
             if (!string.IsNullOrWhiteSpace(configured))
                 return UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(configured);
 
             return Path.Combine(Path.GetTempPath(), "TinyIpc");
+        }
+
+        private static ITinyIpcLogSink CreateConfiguredSink()
+        {
+            string directory = ResolveLogDirectory();
+            return CreateFileSink(directory);
+        }
+
+        private static ITinyIpcLogSink CreateEmergencyFallbackSink()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "TinyIpc");
+            return CreateFileSink(directory);
+        }
+
+        private static ITinyIpcLogSink CreateFileSink(string directory)
+        {
+            Directory.CreateDirectory(directory);
+            try
+            {
+                UnixSharedStorageHelpers.ApplyPermissions(directory, isDirectory: true);
+            }
+            catch
+            {
+            }
+
+            return new FileTinyIpcLogSink(
+                directory,
+                ParsePositiveInt64(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogMaxBytes)) ?? 5 * 1024 * 1024,
+                ParsePositiveInt32(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogFileCount)) ?? 3);
+        }
+
+        private static void TryWriteEmergencyLine(
+            TinyIpcLogLevel level,
+            string component,
+            string eventName,
+            string message,
+            Exception? exception = null,
+            params (string Key, object? Value)[] fields)
+        {
+            try
+            {
+                string? directory = Path.GetDirectoryName(EmergencyLogPath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                    Directory.CreateDirectory(directory);
+
+                var sb = new StringBuilder(256);
+                sb.Append(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+                sb.Append(" level=").Append(level.ToString().ToUpperInvariant());
+                sb.Append(" pid=").Append(Environment.ProcessId);
+                sb.Append(" tid=").Append(Environment.CurrentManagedThreadId);
+                sb.Append(" runtime=").Append(_runtimeKind);
+                sb.Append(" component=").Append(Sanitize(component));
+                sb.Append(" event=").Append(Sanitize(eventName));
+                sb.Append(" message=\"").Append(Sanitize(message)).Append('"');
+
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    sb.Append(' ');
+                    sb.Append(Sanitize(fields[i].Key));
+                    sb.Append('=');
+                    sb.Append('"');
+                    sb.Append(Sanitize(FormatValue(fields[i].Value)));
+                    sb.Append('"');
+                }
+
+                if (exception != null)
+                {
+                    sb.Append(" exceptionType=\"").Append(Sanitize(exception.GetType().FullName ?? exception.GetType().Name)).Append('"');
+                    sb.Append(" exception=\"").Append(Sanitize(exception.ToString())).Append('"');
+                }
+
+                File.AppendAllText(EmergencyLogPath, sb.AppendLine().ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            }
+            catch
+            {
+            }
         }
 
         private static TinyIpcLogLevel? ParseLogLevel(string? value)
@@ -251,7 +353,7 @@ namespace XivIpc.Internal
 
         private static bool? ReadOptionalBooleanEnvironment(string name)
         {
-            string? value = Environment.GetEnvironmentVariable(name);
+            string? value = TinyIpcEnvironment.GetEnvironmentVariable(name);
             if (string.IsNullOrWhiteSpace(value))
                 return null;
 

@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net9.0</TargetFrameworks>
     <OutputType>Exe</OutputType>
     <RootNamespace>XivIpc.NativeHost</RootNamespace>
     <Description>Native Linux broker process for the XivIpc sidecar transport.</Description>

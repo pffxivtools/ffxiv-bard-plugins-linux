@@ -8,7 +8,7 @@ The test suite needs a Windows-process client that exercises the public shim fro
 
 ## How It Works
 
-- Commands such as `connect`, `hold`, `publish`, and `subscribe-once` create a `TinyMessageBus` over a named `TinyMemoryMappedFile`.
+- Commands such as `connect`, `hold`, `publish`, `subscribe-once`, and `subscribe-many` create a `TinyMessageBus` over a named `TinyMemoryMappedFile`.
 - The process reports simple line-oriented markers like `CONNECTED`, `DISPOSED`, `PUBLISHED`, and `MESSAGE:<base64>` so the native test harness can drive it and assert outcomes.
 - `TINYIPC_TEST_MAX_PAYLOAD_BYTES` controls the bus sizing used by the helper.
 - The host is intentionally minimal: it exists to prove the runtime contract, not to contain transport logic.

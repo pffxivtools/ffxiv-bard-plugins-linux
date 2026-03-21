@@ -19,7 +19,7 @@ The current production sidecar architecture is:
 
 ## Prerequisites
 
-- .NET SDK supporting `net9.0` and `net10.0`
+- .NET SDK supporting `net9.0`
 - Linux for sidecar, multi-user, Wine, and Proton validation
 - a valid shared group for brokered sidecar mode, typically `steam`
 
@@ -50,14 +50,14 @@ dotnet build XivIpc.Tests/XivIpc.Tests.csproj -v minimal
 Run the main native test matrix on Linux:
 
 ```bash
-dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net10.0 \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
   --filter "FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests|FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests"
 ```
 
 Run only lifecycle coverage:
 
 ```bash
-dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net10.0 \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
   --filter "FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests"
 ```
 
@@ -67,7 +67,7 @@ Run only multi-user coverage:
 TINYIPC_ENABLE_MULTIUSER_TESTS=1 \
 TINYIPC_MULTIUSER_SECONDARY_USER=bff14bard01 \
 TINYIPC_SHARED_GROUP=steam \
-dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net10.0 -v normal \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net9.0 -v normal \
   --filter "FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests"
 ```
 
@@ -112,7 +112,7 @@ Run Wine runtime integration:
 TINYIPC_ENABLE_WINE_TESTS=1 \
 TINYIPC_RUNTIME_TEST_HOST_PATH=/abs/path/XivIpc.WineTestHost.exe \
 TINYIPC_RUNTIME_NATIVE_HOST_PATH=/abs/path/XivIpc.NativeHost \
-dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net10.0 \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
   --filter "FullyQualifiedName~XivIpc.Tests.SidecarRuntimeIntegrationTests"
 ```
 
@@ -122,7 +122,7 @@ Run Proton runtime integration:
 TINYIPC_ENABLE_PROTON_TESTS=1 \
 TINYIPC_RUNTIME_TEST_HOST_PATH=/abs/path/XivIpc.WineTestHost.exe \
 TINYIPC_RUNTIME_NATIVE_HOST_PATH=/abs/path/XivIpc.NativeHost \
-dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net10.0 \
+dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
   --filter "FullyQualifiedName~XivIpc.Tests.SidecarRuntimeIntegrationTests"
 ```
 

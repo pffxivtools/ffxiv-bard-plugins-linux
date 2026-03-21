@@ -5,14 +5,108 @@ using System.Reflection;
 using System.Text;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
+using XivIpc.Internal;
 using XivIpc.Messaging;
 using Xunit;
 
 namespace XivIpc.Tests;
 
-[Collection("TinyIpc Serial")]
 public sealed class SidecarRuntimeIntegrationTests
 {
+    [Fact]
+    public async Task Managed_ClientProcesses_PublisherA_ReachesSubscribersBAndC_ExactlyOnce()
+    {
+        using TestEnvironmentScope scope = new(productionDiscovery: false);
+        string hostPath = RuntimeHarness.ResolveManagedHostPath();
+        string nativeHostPath = UnixSidecarProcessManager.ResolveNativeHostPath();
+        IReadOnlyDictionary<string, string> environment = scope.CreateEnvironment(nativeHostPath);
+
+        using HostedProcess subscriberA = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "subscribe-once",
+            scope.ChannelName,
+            "15000",
+            environment);
+        using HostedProcess subscriberB = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "subscribe-once",
+            scope.ChannelName,
+            "15000",
+            environment);
+
+        await subscriberA.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(15));
+        await subscriberB.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(15));
+        await scope.WaitForLiveSocketAsync();
+        await Task.Delay(750);
+
+        string expectedBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes("A1"));
+        using HostedProcess publisherA = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "publish",
+            scope.ChannelName,
+            expectedBase64,
+            environment);
+
+        await publisherA.WaitForStdoutLineAsync("PUBLISHED", TimeSpan.FromSeconds(15));
+        Assert.Equal(0, await publisherA.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(expectedBase64, (await subscriberA.WaitForStdoutPrefixAsync("MESSAGE:", TimeSpan.FromSeconds(15)))["MESSAGE:".Length..]);
+        Assert.Equal(expectedBase64, (await subscriberB.WaitForStdoutPrefixAsync("MESSAGE:", TimeSpan.FromSeconds(15)))["MESSAGE:".Length..]);
+        Assert.Equal(0, await subscriberA.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, await subscriberB.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public async Task Managed_ClientProcesses_PublishersBAndC_AreObservedBySubscriberA_AsSeparateEvents()
+    {
+        using TestEnvironmentScope scope = new(productionDiscovery: false);
+        string hostPath = RuntimeHarness.ResolveManagedHostPath();
+        string nativeHostPath = UnixSidecarProcessManager.ResolveNativeHostPath();
+        IReadOnlyDictionary<string, string> environment = scope.CreateEnvironment(nativeHostPath);
+
+        using HostedProcess subscriberA = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "subscribe-many",
+            scope.ChannelName,
+            "2",
+            environment,
+            "15000");
+
+        await subscriberA.WaitForStdoutLineAsync("CONNECTED", TimeSpan.FromSeconds(15));
+        await scope.WaitForLiveSocketAsync();
+        await Task.Delay(750);
+
+        string[] expectedBase64Payloads =
+        {
+            Convert.ToBase64String(Encoding.UTF8.GetBytes("B1")),
+            Convert.ToBase64String(Encoding.UTF8.GetBytes("C1"))
+        };
+
+        using HostedProcess publisherB = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "publish",
+            scope.ChannelName,
+            expectedBase64Payloads[0],
+            environment);
+        await publisherB.WaitForStdoutLineAsync("PUBLISHED", TimeSpan.FromSeconds(15));
+        Assert.Equal(0, await publisherB.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+
+        using HostedProcess publisherC = RuntimeHarness.StartManagedProcess(
+            hostPath,
+            "publish",
+            scope.ChannelName,
+            expectedBase64Payloads[1],
+            environment);
+        await publisherC.WaitForStdoutLineAsync("PUBLISHED", TimeSpan.FromSeconds(15));
+        Assert.Equal(0, await publisherC.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+
+        string[] actualA = (await subscriberA.WaitForStdoutPrefixesAsync("MESSAGE:", expectedBase64Payloads.Length, TimeSpan.FromSeconds(15)))
+            .Select(static line => line["MESSAGE:".Length..])
+            .ToArray();
+
+        Assert.Equal(expectedBase64Payloads, actualA);
+        Assert.Equal(0, await subscriberA.WaitForExitAsync(TimeSpan.FromSeconds(10)));
+    }
+
     [Theory]
     [InlineData(false)]
     public async Task Wine_Client_StartsBrokerAndReceivesFromNative_WhenEnabled(bool productionDiscovery)
@@ -289,7 +383,7 @@ public sealed class SidecarRuntimeIntegrationTests
 
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly Dictionary<string, string?> _previousEnvironment = new(StringComparer.Ordinal);
+        private readonly IDisposable _overrides;
         private readonly bool _productionDiscovery;
 
         public TestEnvironmentScope(bool productionDiscovery)
@@ -301,42 +395,34 @@ public sealed class SidecarRuntimeIntegrationTests
 
             Directory.CreateDirectory(SharedDirectory);
 
-            Capture("TINYIPC_MESSAGE_BUS_BACKEND");
-            Capture("TINYIPC_SHARED_DIR");
-            Capture("TINYIPC_SHARED_GROUP");
-            Capture("TINYIPC_NATIVE_HOST_PATH");
-            Capture("TINYIPC_UNIX_SHELL");
-            Capture("TINYIPC_TEST_MAX_PAYLOAD_BYTES");
-            Capture("TINYIPC_LOG_DIR");
-            Capture("TINYIPC_LOG_LEVEL");
-            Capture("TINYIPC_ENABLE_LOGGING");
-            Capture("TINYIPC_FILE_NOTIFIER");
-
             ProductionPathTestEnvironment.ResetLogger();
+            var overrides = new Dictionary<string, string?>(StringComparer.Ordinal);
 
             if (_productionDiscovery)
             {
                 ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
-                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+                overrides[TinyIpcEnvironment.MessageBusBackend] = null;
+                overrides[TinyIpcEnvironment.NativeHostPath] = null;
+                overrides[TinyIpcEnvironment.SharedDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory);
+                overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
+                overrides[TinyIpcEnvironment.LogDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory);
+                overrides[TinyIpcEnvironment.LogLevel] = "info";
+                overrides[TinyIpcEnvironment.EnableLogging] = "1";
+                overrides[TinyIpcEnvironment.FileNotifier] = "auto";
             }
             else
             {
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
-                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
+                overrides[TinyIpcEnvironment.MessageBusBackend] = "sidecar";
+                overrides[TinyIpcEnvironment.SharedDirectory] = SharedDirectory;
+                overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
+                overrides[TinyIpcEnvironment.NativeHostPath] = UnixSidecarProcessManager.ResolveNativeHostPath();
             }
-            Environment.SetEnvironmentVariable("TINYIPC_TEST_MAX_PAYLOAD_BYTES", "4096");
+            overrides["TINYIPC_TEST_MAX_PAYLOAD_BYTES"] = "4096";
 
-            if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL")))
-                Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", "/bin/sh");
+            if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell)))
+                overrides[TinyIpcEnvironment.UnixShell] = "/bin/sh";
+
+            _overrides = TinyIpcEnvironment.Override(overrides);
         }
 
         public string ChannelName { get; }
@@ -375,9 +461,9 @@ public sealed class SidecarRuntimeIntegrationTests
                 return new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["TINYIPC_SHARED_DIR"] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory),
-                    ["TINYIPC_SHARED_GROUP"] = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? ResolveCurrentSharedGroup(),
+                    ["TINYIPC_SHARED_GROUP"] = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup) ?? ResolveCurrentSharedGroup(),
                     ["TINYIPC_TEST_MAX_PAYLOAD_BYTES"] = "4096",
-                    ["TINYIPC_UNIX_SHELL"] = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL") ?? "/bin/sh",
+                    ["TINYIPC_UNIX_SHELL"] = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell) ?? "/bin/sh",
                     ["TINYIPC_LOG_DIR"] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory),
                     ["TINYIPC_LOG_LEVEL"] = "info",
                     ["TINYIPC_ENABLE_LOGGING"] = "1",
@@ -389,10 +475,10 @@ public sealed class SidecarRuntimeIntegrationTests
             {
                 ["TINYIPC_MESSAGE_BUS_BACKEND"] = "sidecar",
                 ["TINYIPC_SHARED_DIR"] = SharedDirectory,
-                ["TINYIPC_SHARED_GROUP"] = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? ResolveCurrentSharedGroup(),
+                ["TINYIPC_SHARED_GROUP"] = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup) ?? ResolveCurrentSharedGroup(),
                 ["TINYIPC_NATIVE_HOST_PATH"] = nativeHostPath,
                 ["TINYIPC_TEST_MAX_PAYLOAD_BYTES"] = "4096",
-                ["TINYIPC_UNIX_SHELL"] = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL") ?? "/bin/sh"
+                ["TINYIPC_UNIX_SHELL"] = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell) ?? "/bin/sh"
             };
         }
 
@@ -439,9 +525,7 @@ public sealed class SidecarRuntimeIntegrationTests
 
         public void Dispose()
         {
-            foreach ((string key, string? value) in _previousEnvironment)
-                Environment.SetEnvironmentVariable(key, value);
-
+            _overrides.Dispose();
             ProductionPathTestEnvironment.ResetLogger();
 
             try
@@ -453,9 +537,6 @@ public sealed class SidecarRuntimeIntegrationTests
             {
             }
         }
-
-        private void Capture(string variableName)
-            => _previousEnvironment[variableName] = Environment.GetEnvironmentVariable(variableName);
 
         private static string ResolveCurrentSharedGroup()
         {
@@ -520,11 +601,33 @@ public sealed class SidecarRuntimeIntegrationTests
                 $"Timed out waiting for stdout prefix '{prefix}'. stderr={string.Join(Environment.NewLine, _stderrLines.ToArray())}");
         }
 
+        public async Task<IReadOnlyList<string>> WaitForStdoutPrefixesAsync(string prefix, int expectedCount, TimeSpan timeout)
+        {
+            var lines = new List<string>(expectedCount);
+            DateTime deadline = DateTime.UtcNow + timeout;
+
+            while (lines.Count < expectedCount)
+            {
+                TimeSpan remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                    break;
+
+                lines.Add(await WaitForStdoutPrefixAsync(prefix, remaining).ConfigureAwait(false));
+            }
+
+            if (lines.Count != expectedCount)
+            {
+                throw new TimeoutException(
+                    $"Timed out waiting for {expectedCount} stdout lines with prefix '{prefix}'. observed={lines.Count} stderr={string.Join(Environment.NewLine, _stderrLines.ToArray())}");
+            }
+
+            return lines;
+        }
+
         public async Task<int> WaitForExitAsync(TimeSpan timeout)
         {
             using var cts = new CancellationTokenSource(timeout);
             await _process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-            await Task.WhenAll(_stdoutPump, _stderrPump).ConfigureAwait(false);
             return _process.ExitCode;
         }
 
@@ -628,6 +731,60 @@ public sealed class SidecarRuntimeIntegrationTests
                 psi.Environment[key] = value;
 
             Process process = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start '{runnerScriptPath}'.");
+            return new HostedProcess(process);
+        }
+
+        public static string ResolveManagedHostPath()
+        {
+            string baseDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string targetFramework = Path.GetFileName(baseDirectory);
+            string configuration = Directory.GetParent(baseDirectory)?.Name
+                ?? throw new InvalidOperationException("Could not resolve the current build configuration for runtime integration.");
+            string path = Path.GetFullPath(Path.Combine(
+                baseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "XivIpc.WineTestHost",
+                "bin",
+                configuration,
+                targetFramework,
+                "XivIpc.WineTestHost.dll"));
+
+            if (!File.Exists(path))
+                throw new FileNotFoundException("Managed runtime test host was not found.", path);
+
+            return path;
+        }
+
+        public static HostedProcess StartManagedProcess(
+            string managedHostPath,
+            string command,
+            string channel,
+            string firstArgument,
+            IReadOnlyDictionary<string, string> environment,
+            params string[] additionalArguments)
+        {
+            ProcessStartInfo psi = new("dotnet")
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            psi.ArgumentList.Add(managedHostPath);
+            psi.ArgumentList.Add(command);
+            psi.ArgumentList.Add(channel);
+            psi.ArgumentList.Add(firstArgument);
+
+            foreach (string argument in additionalArguments)
+                psi.ArgumentList.Add(argument);
+
+            foreach ((string key, string value) in environment)
+                psi.Environment[key] = value;
+
+            Process process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start the managed runtime test host.");
             return new HostedProcess(process);
         }
     }

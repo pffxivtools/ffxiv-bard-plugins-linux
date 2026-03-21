@@ -4,6 +4,7 @@ using System.Text;
 using System.Diagnostics;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
+using XivIpc.Internal;
 using Xunit;
 
 namespace XivIpc.Tests;
@@ -11,6 +12,8 @@ namespace XivIpc.Tests;
 [Collection("TinyIpc Serial")]
 public sealed class FunctionalTests
 {
+    private const string BarrierPrefix = "__tinyipc_test_barrier__:";
+
     public static IEnumerable<object[]> Backends()
     {
         yield return new object[] { "direct" };
@@ -31,18 +34,20 @@ public sealed class FunctionalTests
 
         Task reader = Task.Run(async () =>
         {
-            readerReady.TrySetResult();
-
             await foreach (var item in subscriber.SubscribeAsync(cts.Token))
             {
-                observed.Enqueue(GetString(item));
+                string message = GetString(item);
+                if (TryHandleBarrier(message, readerReady))
+                    continue;
+
+                observed.Enqueue(message);
                 if (observed.Count >= 25)
                     break;
             }
         }, cts.Token);
 
-        await readerReady.Task;
-        await WaitForSubscriptionToSettleAsync(backend, cts.Token);
+        await WaitForBusesReadyAsync(backend, new[] { publisher, subscriber }, cts.Token);
+        await AwaitSubscriptionsReadyAsync(publisher, new[] { readerReady }, cts.Token);
 
         for (int i = 0; i < 25; i++)
             await PublishStringAsync(publisher, $"msg-{i}");
@@ -70,18 +75,20 @@ public sealed class FunctionalTests
 
         Task reader = Task.Run(async () =>
         {
-            readerReady.TrySetResult();
-
             await foreach (var item in subscriber.SubscribeAsync(cts.Token))
             {
-                observed.Add(GetString(item));
+                string message = GetString(item);
+                if (TryHandleBarrier(message, readerReady))
+                    continue;
+
+                observed.Add(message);
                 if (observed.Count == 3)
                     break;
             }
         }, cts.Token);
 
-        await readerReady.Task;
-        await WaitForSubscriptionToSettleAsync(backend, cts.Token);
+        await WaitForBusesReadyAsync(backend, new[] { publisher, subscriber }, cts.Token);
+        await AwaitSubscriptionsReadyAsync(publisher, new[] { readerReady }, cts.Token);
 
         await PublishStringAsync(publisher, "a");
         await PublishStringAsync(publisher, "b");
@@ -125,6 +132,8 @@ public sealed class FunctionalTests
             })
             .ToArray();
 
+        await WaitForBusesReadyAsync(backend, publishers.Concat(subscribers), cts.Token);
+
         var allObserved = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
         var readySignals = new TaskCompletionSource[subscriberCount];
         var readerTasks = new Task[subscriberCount];
@@ -137,11 +146,12 @@ public sealed class FunctionalTests
 
             readerTasks[i] = Task.Run(async () =>
             {
-                readySignals[subscriberIndex].TrySetResult();
-
                 await foreach (var item in subscribers[subscriberIndex].SubscribeAsync(cts.Token))
                 {
                     string message = GetString(item);
+                    if (TryHandleBarrier(message, readySignals[subscriberIndex]))
+                        continue;
+
                     allObserved[subscriberIndex].TryAdd(message, 0);
 
                     if (allObserved[subscriberIndex].Count >= expectedTotal)
@@ -150,8 +160,7 @@ public sealed class FunctionalTests
             }, cts.Token);
         }
 
-        await Task.WhenAll(readySignals.Select(x => x.Task));
-        await WaitForSubscriptionToSettleAsync(backend, cts.Token);
+        await AwaitSubscriptionsReadyAsync(publishers[0], readySignals, cts.Token);
 
         var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -277,21 +286,56 @@ public sealed class FunctionalTests
     private static object? GetDefault(Type type)
         => type.IsValueType ? Activator.CreateInstance(type) : null;
 
-    private static async Task WaitForSubscriptionToSettleAsync(string backend, CancellationToken cancellationToken)
+    private static bool TryHandleBarrier(string message, TaskCompletionSource readySignal)
     {
-        if (ProductionPathTestEnvironment.IsProductionPath(backend))
-        {
-            await Task.Delay(1500, cancellationToken);
-        }
-        else if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
-        {
-            await Task.Delay(750, cancellationToken);
-        }
-        else
-        {
-            await Task.Delay(25, cancellationToken);
-        }
+        if (!message.StartsWith(BarrierPrefix, StringComparison.Ordinal))
+            return false;
+
+        readySignal.TrySetResult();
+        return true;
     }
+
+    private static async Task AwaitSubscriptionsReadyAsync(TinyMessageBus barrierPublisher, IEnumerable<TaskCompletionSource> readySignals, CancellationToken cancellationToken)
+    {
+        Task[] waitTasks = readySignals.Select(static signal => signal.Task).ToArray();
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (waitTasks.All(static task => task.IsCompleted))
+                return;
+
+            string barrier = BarrierPrefix + Guid.NewGuid().ToString("N");
+            await PublishStringAsync(barrierPublisher, barrier);
+
+            try
+            {
+                await Task.WhenAll(waitTasks).WaitAsync(TimeSpan.FromMilliseconds(200), cancellationToken);
+                return;
+            }
+            catch (TimeoutException)
+            {
+            }
+        }
+
+        throw new TimeoutException("Timed out waiting for subscribers to observe the live subscription barrier.");
+    }
+
+    private static async Task WaitForBusesReadyAsync(string backend, IEnumerable<TinyMessageBus> buses, CancellationToken cancellationToken)
+    {
+        if (!IsSidecarStyleBackend(backend))
+            return;
+
+        Task[] tasks = buses
+            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10)))
+            .ToArray();
+
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+    }
+
+    private static bool IsSidecarStyleBackend(string backend)
+        => string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase)
+            || ProductionPathTestEnvironment.IsProductionPath(backend);
 
     private static string GetString(object item)
     {
@@ -313,15 +357,7 @@ public sealed class FunctionalTests
 
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly string? _previousBackend;
-        private readonly string? _previousHostPath;
-        private readonly string? _previousUnixShell;
-        private readonly string? _previousSharedDir;
-        private readonly string? _previousSharedGroup;
-        private readonly string? _previousLogDir;
-        private readonly string? _previousLogLevel;
-        private readonly string? _previousLoggingEnabled;
-        private readonly string? _previousFileNotifier;
+        private readonly IDisposable _overrides;
         private readonly string _testSharedDir;
 
         public string Backend { get; }
@@ -332,64 +368,50 @@ public sealed class FunctionalTests
             Backend = backend;
             ChannelName = $"xivipc-tests-{backend}-{Guid.NewGuid():N}";
 
-            _previousBackend = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
-            _previousHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
-            _previousUnixShell = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL");
-            _previousSharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
-            _previousSharedGroup = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
-            _previousLogDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
-            _previousLogLevel = Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL");
-            _previousLoggingEnabled = Environment.GetEnvironmentVariable("TINYIPC_ENABLE_LOGGING");
-            _previousFileNotifier = Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER");
             _testSharedDir = Path.Combine(Path.GetTempPath(), "xivipc-tests", Guid.NewGuid().ToString("N"));
 
             ProductionPathTestEnvironment.ResetLogger();
+            var overrides = new Dictionary<string, string?>(StringComparer.Ordinal);
 
             if (ProductionPathTestEnvironment.IsProductionPath(backend))
             {
                 Directory.CreateDirectory(_testSharedDir);
                 ProductionPathTestEnvironment.PrepareStagedNativeHost(_testSharedDir);
 
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
-                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir));
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ProductionPathTestEnvironment.ResolveSharedGroup());
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir));
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+                overrides[TinyIpcEnvironment.MessageBusBackend] = null;
+                overrides[TinyIpcEnvironment.NativeHostPath] = null;
+                overrides[TinyIpcEnvironment.SharedDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir);
+                overrides[TinyIpcEnvironment.SharedGroup] = ProductionPathTestEnvironment.ResolveSharedGroup();
+                overrides[TinyIpcEnvironment.LogDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(_testSharedDir);
+                overrides[TinyIpcEnvironment.LogLevel] = "info";
+                overrides[TinyIpcEnvironment.EnableLogging] = "1";
+                overrides[TinyIpcEnvironment.FileNotifier] = "auto";
             }
             else
             {
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", backend);
+                overrides[TinyIpcEnvironment.MessageBusBackend] = backend;
             }
 
             if (string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase))
             {
                 Directory.CreateDirectory(_testSharedDir);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _testSharedDir);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", ResolveCurrentSharedGroup());
+                overrides[TinyIpcEnvironment.SharedDirectory] = _testSharedDir;
+                overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
 
                 string? hostPath = ResolveNativeHostPath();
                 if (!string.IsNullOrWhiteSpace(hostPath))
-                    Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", hostPath);
+                    overrides[TinyIpcEnvironment.NativeHostPath] = hostPath;
 
-                if (string.IsNullOrWhiteSpace(_previousUnixShell) && OperatingSystem.IsLinux())
-                    Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", "/bin/sh");
+                if (string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell)) && OperatingSystem.IsLinux())
+                    overrides[TinyIpcEnvironment.UnixShell] = "/bin/sh";
             }
+
+            _overrides = TinyIpcEnvironment.Override(overrides);
         }
 
         public void Dispose()
         {
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", _previousBackend);
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", _previousHostPath);
-            Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", _previousUnixShell);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _previousSharedDir);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", _previousSharedGroup);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", _previousLogDir);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", _previousLogLevel);
-            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", _previousLoggingEnabled);
-            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", _previousFileNotifier);
+            _overrides.Dispose();
             ProductionPathTestEnvironment.ResetLogger();
 
             try
@@ -404,7 +426,7 @@ public sealed class FunctionalTests
 
         private static string? ResolveNativeHostPath()
         {
-            string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
+            string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.NativeHostPath);
             if (!string.IsNullOrWhiteSpace(explicitPath) && File.Exists(explicitPath))
                 return explicitPath;
 

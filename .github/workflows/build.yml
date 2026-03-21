@@ -24,7 +24,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 9.0.x
 
       - name: Restore dependencies
         run: dotnet restore TinyIpc.Shim.sln
@@ -34,7 +34,7 @@ jobs:
 
       - name: Run native test subset
         run: >
-          dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net10.0 -v minimal
+          dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net9.0 -v minimal
           --filter "FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests"
 
       - name: Validate publish scripts

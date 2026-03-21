@@ -190,7 +190,7 @@ publish_shim() {
   log "Publishing TinyIpc shim"
   clean_dist
   dotnet publish -c Release -f "${PUBLISH_TFM}" TinyIpc.Shim -p:TinyIpcAbiFlavor="${abi_flavor}" -o "${DIST_DIR}"
-  dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained true -p:PublishSingleFile=true XivIpc.NativeHost -o "${DIST_DIR}"
+  dotnet publish -c Release -f net9.0 -r linux-x64 --self-contained true -p:PublishSingleFile=true XivIpc.NativeHost -o "${DIST_DIR}"
   validate_published_runtime
   stage_native_host_payload
 }

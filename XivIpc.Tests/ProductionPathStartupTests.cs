@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using System.Diagnostics;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
+using XivIpc.Internal;
 using Xunit;
 
 namespace XivIpc.Tests;
@@ -100,7 +101,7 @@ public sealed class ProductionPathStartupTests
 
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly Dictionary<string, string?> _previousEnvironment = new(StringComparer.Ordinal);
+        private readonly IDisposable _overrides;
 
         public TestEnvironmentScope(StagedHostMode stagedHostMode, bool setSharedGroup = true)
         {
@@ -118,25 +119,16 @@ public sealed class ProductionPathStartupTests
             else
                 StagedHostDirectory = Path.Combine(UnixSharedDirectory, "tinyipc-native-host");
 
-            Capture("TINYIPC_MESSAGE_BUS_BACKEND");
-            Capture("TINYIPC_NATIVE_HOST_PATH");
-            Capture("TINYIPC_SHARED_DIR");
-            Capture("TINYIPC_SHARED_GROUP");
-            Capture("TINYIPC_LOG_DIR");
-            Capture("TINYIPC_LOG_LEVEL");
-            Capture("TINYIPC_ENABLE_LOGGING");
-            Capture("TINYIPC_FILE_NOTIFIER");
-
             ProductionPathTestEnvironment.ResetLogger();
-
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", setSharedGroup ? ProductionPathTestEnvironment.ResolveSharedGroup() : null);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", SharedDirectory);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
+            _overrides = TinyIpcEnvironment.Override(
+                (TinyIpcEnvironment.MessageBusBackend, null),
+                (TinyIpcEnvironment.NativeHostPath, null),
+                (TinyIpcEnvironment.SharedDirectory, SharedDirectory),
+                (TinyIpcEnvironment.SharedGroup, setSharedGroup ? ProductionPathTestEnvironment.ResolveSharedGroup() : null),
+                (TinyIpcEnvironment.LogDirectory, SharedDirectory),
+                (TinyIpcEnvironment.LogLevel, "info"),
+                (TinyIpcEnvironment.EnableLogging, "1"),
+                (TinyIpcEnvironment.FileNotifier, "auto"));
         }
 
         public string ChannelName { get; }
@@ -253,7 +245,7 @@ public sealed class ProductionPathStartupTests
             psi.Environment["TINYIPC_ENABLE_LOGGING"] = "1";
             psi.Environment["TINYIPC_LOG_LEVEL"] = "info";
             psi.Environment["TINYIPC_FILE_NOTIFIER"] = "auto";
-            psi.Environment["TINYIPC_SHARED_GROUP"] = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? ProductionPathTestEnvironment.ResolveSharedGroup();
+            psi.Environment["TINYIPC_SHARED_GROUP"] = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup) ?? ProductionPathTestEnvironment.ResolveSharedGroup();
             psi.Environment["TINYIPC_BROKER_SOCKET_PATH"] = SocketPath;
             psi.Environment["TINYIPC_BUS_BACKEND"] = "sidecar-brokered";
             psi.Environment["TINYIPC_LAUNCH_ID"] = launchId;
@@ -262,9 +254,7 @@ public sealed class ProductionPathStartupTests
 
         public void Dispose()
         {
-            foreach ((string key, string? value) in _previousEnvironment)
-                Environment.SetEnvironmentVariable(key, value);
-
+            _overrides.Dispose();
             ProductionPathTestEnvironment.ResetLogger();
 
             try
@@ -277,8 +267,6 @@ public sealed class ProductionPathStartupTests
             }
         }
 
-        private void Capture(string variableName)
-            => _previousEnvironment[variableName] = Environment.GetEnvironmentVariable(variableName);
     }
 
     private enum StagedHostMode

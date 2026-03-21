@@ -969,7 +969,7 @@ namespace XivIpc.Messaging
 
         private static int ResolveSlotCount()
         {
-            string? configured = Environment.GetEnvironmentVariable("TINYIPC_SLOT_COUNT");
+            string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SlotCount);
             if (int.TryParse(configured, out int value) && value >= MinimumSlotCount)
                 return value;
 
@@ -978,7 +978,7 @@ namespace XivIpc.Messaging
 
         private static long ResolveMessageTtlMs()
         {
-            string? configured = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS");
+            string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
             if (long.TryParse(configured, out long value) && value >= 0)
                 return value;
 

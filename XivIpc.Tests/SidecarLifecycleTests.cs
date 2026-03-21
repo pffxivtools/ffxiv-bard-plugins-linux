@@ -31,6 +31,9 @@ public sealed class SidecarLifecycleTests
     [MemberData(nameof(Modes))]
     public async Task FirstClient_StartsBrokerAndCreatesSocket(string mode)
     {
+        LogTestEvent($"Test Start: FirstClient_StartsBrokerAndCreatesSocket(mode={mode})");
+        var testStart = Stopwatch.StartNew();
+
         using TestEnvironmentScope scope = new(mode);
 
         Assert.False(File.Exists(scope.SocketPath));
@@ -44,6 +47,9 @@ public sealed class SidecarLifecycleTests
         Assert.True(File.Exists(scope.SocketPath));
         Assert.True(File.Exists(scope.StatePath));
         Assert.NotEqual(0, UnixSidecarProcessManager.GetOwnedProcessIdForDiagnostics());
+
+        testStart.Stop();
+        LogTestEvent($"Test End: FirstClient_StartsBrokerAndCreatesSocket(mode={mode}) - Duration: {testStart.Elapsed:mm\\:ss\\.fff}");
     }
 
     [Theory]
@@ -622,18 +628,18 @@ public sealed class SidecarLifecycleTests
         using Socket socket = ConnectRawSocket(lease.SocketPath);
         SidecarAttachRing attach = AttachRawSession("large-buffer-channel", requestedBufferBytes, socket);
 
-        RingSizing expected = RingSizingPolicy.Compute(requestedBufferBytes, 64, BrokeredChannelRing.HeaderBytes, BrokeredChannelRing.SlotHeaderBytes);
-        Assert.Equal(expected.SlotPayloadBytes, attach.SlotPayloadBytes);
+        JournalSizing expected = JournalSizingPolicy.Compute(requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
+        Assert.Equal(expected.MaxPayloadBytes, attach.SlotPayloadBytes);
         Assert.Equal(expected.ImageSize, attach.RingLength);
         Assert.True(File.Exists(attach.RingPath));
     }
 
     [Theory]
     [MemberData(nameof(Modes))]
-    public async Task RingOverwrite_IsLogged_AndDrainCatchesUpToRetainedTail(string mode)
+    public async Task JournalPruning_IsLogged_AndDrainCatchesUpToRetainedTail(string mode)
     {
         using TestEnvironmentScope scope = new(mode);
-        const int requestedBufferBytes = 1 << 20;
+        const int requestedBufferBytes = 2_048;
 
         using TinyMessageBus publisher = scope.CreateBus("backlog-channel", requestedBufferBytes);
         await scope.WaitForLiveSocketAsync();
@@ -642,33 +648,39 @@ public sealed class SidecarLifecycleTests
         using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
         using Socket rawSocket = ConnectRawSocket(lease.SocketPath);
         SidecarAttachRing attach = AttachRawSession("backlog-channel", requestedBufferBytes, rawSocket);
-        int messageCount = attach.SlotCount + 32;
 
-        for (int index = 0; index < messageCount; index++)
+        for (int index = 0; index < 8; index++)
         {
-            byte[] payload = Encoding.UTF8.GetBytes($"backlog-{index:D3}");
+            byte[] payload = Encoding.UTF8.GetBytes($"early-{index:D3}-" + new string('a', 180));
             await PublishBytesAsync(publisher, payload);
         }
 
-        using BrokeredChannelRing ring = BrokeredChannelRing.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes);
+        await Task.Delay(1_100);
+
+        for (int index = 0; index < 12; index++)
+        {
+            byte[] payload = Encoding.UTF8.GetBytes($"late-{index:D3}-" + new string('b', 180));
+            await PublishBytesAsync(publisher, payload);
+        }
+
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
         while (DateTime.UtcNow < deadline)
         {
-            if (ring.CaptureHead() >= messageCount)
+            if (journal.CaptureHeadSequence() >= 20)
                 break;
 
             await Task.Delay(25);
         }
 
         long nextSequence = 0;
-        BrokeredRingDrainResult drain = ring.Drain(selfSessionId: long.MaxValue, ref nextSequence);
+        BrokeredJournalDrainResult drain = journal.Drain(Guid.Empty, ref nextSequence);
 
-        string[] expected = Enumerable.Range(messageCount - attach.SlotCount, attach.SlotCount)
-            .Select(index => $"backlog-{index:D3}")
-            .ToArray();
-        Assert.Equal(attach.SlotCount, drain.Messages.Count);
-        Assert.Equal(expected, drain.Messages.Select(static payload => Encoding.UTF8.GetString(payload)).ToArray());
-        Assert.True(drain.TailObserved >= messageCount - attach.SlotCount);
+        string[] actual = drain.Messages.Select(static payload => Encoding.UTF8.GetString(payload)).ToArray();
+        Assert.True(drain.CaughtUpToTail);
+        Assert.NotEmpty(actual);
+        Assert.Contains(actual, static entry => entry.StartsWith("late-", StringComparison.Ordinal));
+        Assert.True(drain.TailSequenceObserved > 0);
 
         rawSocket.Dispose();
         publisher.Dispose();
@@ -676,8 +688,164 @@ public sealed class SidecarLifecycleTests
 
         string log = scope.ReadAllLogsOrEmpty();
         Assert.Contains("event=ChannelCreated", log, StringComparison.Ordinal);
-        Assert.Contains("event=RingOverwriteOccurred", log, StringComparison.Ordinal);
+        Assert.Contains("event=JournalPrunedOrCompacted", log, StringComparison.Ordinal);
         Assert.Contains("event=ChannelLifetimeSummary", log, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task ConcurrentManagedPublishers_AdvanceJournalAndDeliverAllMessages(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+        const int requestedBufferBytes = 8_192;
+        const int publisherCount = 3;
+        const int subscriberCount = 2;
+        const int messagesPerPublisher = 20;
+        int expectedTotal = publisherCount * messagesPerPublisher;
+        string channelName = "journal-concurrent";
+
+        using var publishersScope = new LifecycleDisposableList<TinyMessageBus>();
+        using var subscribersScope = new LifecycleDisposableList<TinyMessageBus>();
+
+        TinyMessageBus[] publishers = Enumerable.Range(0, publisherCount)
+            .Select(_ =>
+            {
+                var bus = scope.CreateBus(channelName, requestedBufferBytes);
+                publishersScope.Add(bus);
+                return bus;
+            })
+            .ToArray();
+
+        TinyMessageBus[] subscribers = Enumerable.Range(0, subscriberCount)
+            .Select(_ =>
+            {
+                var bus = scope.CreateBus(channelName, requestedBufferBytes);
+                subscribersScope.Add(bus);
+                return bus;
+            })
+            .ToArray();
+
+        await scope.WaitForLiveSocketAsync();
+        await WaitForConnectedAsync(publishers.Concat(subscribers), TimeSpan.FromSeconds(10));
+
+        using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
+        using Socket rawSocket = ConnectRawSocket(lease.SocketPath);
+        SidecarAttachRing attach = AttachRawSession(channelName, requestedBufferBytes, rawSocket, Guid.NewGuid());
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        Task<string[]>[] receiveTasks = subscribers
+            .Select(subscriber => ReceiveMessagesAsync(subscriber, expectedTotal, new ConcurrentQueue<string>(), cts.Token))
+            .ToArray();
+
+        await WaitForSubscriptionToSettleAsync(cts.Token);
+
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task[] publishTasks = Enumerable.Range(0, publisherCount)
+            .Select(publisherIndex => Task.Run(async () =>
+            {
+                await startGate.Task;
+                for (int messageIndex = 0; messageIndex < messagesPerPublisher; messageIndex++)
+                {
+                    byte[] payload = Encoding.UTF8.GetBytes($"journal-pub-{publisherIndex:D2}-msg-{messageIndex:D3}");
+                    await PublishBytesAsync(publishers[publisherIndex], payload);
+                }
+            }, cts.Token))
+            .ToArray();
+
+        startGate.TrySetResult();
+        await Task.WhenAll(publishTasks);
+
+        string[] expected = Enumerable.Range(0, publisherCount)
+            .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
+                .Select(msg => $"journal-pub-{pub:D2}-msg-{msg:D3}"))
+            .OrderBy(static value => value, StringComparer.Ordinal)
+            .ToArray();
+
+        foreach (Task<string[]> receiveTask in receiveTasks)
+        {
+            string[] actual = (await receiveTask)
+                .OrderBy(static value => value, StringComparer.Ordinal)
+                .ToArray();
+
+            Assert.Equal(expected, actual);
+        }
+
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (journal.CaptureHeadSequence() >= expectedTotal)
+                break;
+
+            await Task.Delay(25, cts.Token);
+        }
+
+        Assert.Equal(expectedTotal, journal.CaptureHeadSequence());
+        Assert.Equal(0, journal.CaptureTailSequence());
+
+        long nextSequence = 0;
+        BrokeredJournalDrainResult drain = journal.Drain(Guid.Empty, ref nextSequence);
+        string[] drained = drain.Messages.Select(Encoding.UTF8.GetString).OrderBy(static value => value, StringComparer.Ordinal).ToArray();
+
+        Assert.Equal(expectedTotal, nextSequence);
+        Assert.Equal(expected, drained);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public async Task RawClientDrain_SkipsSelfPublishes_ButObservesPeerPublishes(string mode)
+    {
+        using TestEnvironmentScope scope = new(mode);
+        const int requestedBufferBytes = 4_096;
+        const string channelName = "raw-self-filter";
+        Guid rawClientId = Guid.NewGuid();
+
+        using var managedPublisher = scope.CreateBus(channelName, requestedBufferBytes);
+        using var managedSubscriber = scope.CreateBus(channelName, requestedBufferBytes);
+        await scope.WaitForLiveSocketAsync();
+        await WaitForConnectedAsync(new[] { managedPublisher, managedSubscriber }, TimeSpan.FromSeconds(10));
+
+        using Socket rawSocket = ConnectRawSocket(scope.SocketPath);
+        SidecarAttachRing attach = AttachRawSession(channelName, requestedBufferBytes, rawSocket, rawClientId);
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        Task<byte[]> receiveTask = ReceiveSingleMessageAsync(managedSubscriber, cts.Token);
+        await WaitForSubscriptionToSettleAsync(cts.Token);
+
+        byte[] selfPayload = Encoding.UTF8.GetBytes("raw-self-publish");
+        SidecarProtocol.WritePublish(rawSocket, selfPayload);
+        Assert.Equal(selfPayload, await receiveTask);
+
+        DateTime selfDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < selfDeadline)
+        {
+            if (journal.CaptureHeadSequence() >= 1)
+                break;
+
+            await Task.Delay(25, cts.Token);
+        }
+
+        long nextSequence = 0;
+        BrokeredJournalDrainResult selfDrain = journal.Drain(rawClientId, ref nextSequence);
+        Assert.Empty(selfDrain.Messages);
+        Assert.Equal(1, nextSequence);
+
+        byte[] peerPayload = Encoding.UTF8.GetBytes("managed-peer-publish");
+        await PublishBytesAsync(managedPublisher, peerPayload);
+
+        DateTime peerDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < peerDeadline)
+        {
+            if (journal.CaptureHeadSequence() >= 2)
+                break;
+
+            await Task.Delay(25, cts.Token);
+        }
+
+        BrokeredJournalDrainResult peerDrain = journal.Drain(rawClientId, ref nextSequence);
+        Assert.Equal(2, nextSequence);
+        Assert.Equal(new[] { "managed-peer-publish" }, peerDrain.Messages.Select(Encoding.UTF8.GetString).ToArray());
     }
 
     [Theory]
@@ -1012,13 +1180,17 @@ public sealed class SidecarLifecycleTests
     }
 
     private static SidecarAttachRing AttachRawSession(string channelName, int maxPayloadBytes, Socket socket)
+        => AttachRawSession(channelName, maxPayloadBytes, socket, Guid.Empty);
+
+    private static SidecarAttachRing AttachRawSession(string channelName, int maxPayloadBytes, Socket socket, Guid clientInstanceId)
     {
         SidecarProtocol.WriteHello(socket, new SidecarHello(
             channelName,
             maxPayloadBytes,
             Environment.ProcessId,
             HeartbeatIntervalMs: 100,
-            HeartbeatTimeoutMs: 5_000));
+            HeartbeatTimeoutMs: 5_000,
+            ClientInstanceId: clientInstanceId));
 
         SidecarAttachRing attach = SidecarProtocol.ReadAttachRing(socket);
         SidecarFrame ready = SidecarProtocol.ReadFrame(socket);
@@ -1089,69 +1261,72 @@ public sealed class SidecarLifecycleTests
     private static Task WaitForConnectedAsync(IEnumerable<TinyMessageBus> buses, TimeSpan timeout)
         => Task.WhenAll(buses.Select(bus => bus.WaitForConnectedForDiagnosticsAsync(timeout)));
 
+    private static void LogTestEvent(string message)
+    {
+        var timestamp = DateTimeOffset.Now.ToString("HH:mm:ss.fff");
+        Console.WriteLine($"[TEST:{timestamp}] {message}");
+    }
+
+    private async Task RunTimedTestAsync(string testName, Func<Task> testAction)
+    {
+        LogTestEvent($"Test Start: {testName}");
+        var testStart = Stopwatch.StartNew();
+        await testAction();
+        testStart.Stop();
+        LogTestEvent($"Test End: {testName} - Duration: {testStart.Elapsed:mm\\:ss\\.fff}");
+    }
+
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly string? _previousBackend;
-        private readonly string? _previousHostPath;
-        private readonly string? _previousUnixShell;
-        private readonly string? _previousSharedDir;
-        private readonly string? _previousSharedGroup;
-        private readonly string? _previousLogDir;
-        private readonly string? _previousLogLevel;
-        private readonly string? _previousLoggingEnabled;
-        private readonly string? _previousFileNotifier;
-        private readonly string? _previousBrokerIdleShutdownMs;
+        private readonly Dictionary<string, string?> _overrideValues = new(StringComparer.Ordinal);
+        private readonly IDisposable _overrides;
 
         public TestEnvironmentScope(string mode, int? brokerIdleShutdownMs = 2_000)
         {
+            LogTestEvent($"TestEnvironmentScope.Start: mode={mode}");
+            var scopeStart = Stopwatch.StartNew();
+
             ChannelName = $"xivipc-lifecycle-{Guid.NewGuid():N}";
             SharedDirectory = Path.Combine(Path.GetTempPath(), "xivipc-lifecycle-tests", Guid.NewGuid().ToString("N"));
             SocketPath = Path.Combine(SharedDirectory, "tinyipc-sidecar.sock");
             StatePath = Path.Combine(SharedDirectory, "tinyipc-sidecar.state.json");
             SharedGroup = ResolveCurrentSharedGroup();
 
-            _previousBackend = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND");
-            _previousHostPath = Environment.GetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH");
-            _previousUnixShell = Environment.GetEnvironmentVariable("TINYIPC_UNIX_SHELL");
-            _previousSharedDir = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
-            _previousSharedGroup = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
-            _previousLogDir = Environment.GetEnvironmentVariable("TINYIPC_LOG_DIR");
-            _previousLogLevel = Environment.GetEnvironmentVariable("TINYIPC_LOG_LEVEL");
-            _previousLoggingEnabled = Environment.GetEnvironmentVariable("TINYIPC_ENABLE_LOGGING");
-            _previousFileNotifier = Environment.GetEnvironmentVariable("TINYIPC_FILE_NOTIFIER");
-            _previousBrokerIdleShutdownMs = Environment.GetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS");
-
             Directory.CreateDirectory(SharedDirectory);
             ProductionPathTestEnvironment.ResetLogger();
-
             if (ProductionPathTestEnvironment.IsProductionPath(mode))
             {
                 ProductionPathTestEnvironment.PrepareStagedNativeHost(SharedDirectory);
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", null);
-                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", null);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory));
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
-                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", brokerIdleShutdownMs?.ToString());
+                _overrideValues[TinyIpcEnvironment.MessageBusBackend] = null;
+                _overrideValues[TinyIpcEnvironment.NativeHostPath] = null;
+                _overrideValues[TinyIpcEnvironment.SharedDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory);
+                _overrideValues[TinyIpcEnvironment.SharedGroup] = SharedGroup;
+                _overrideValues[TinyIpcEnvironment.LogDirectory] = ProductionPathTestEnvironment.ToWindowsStylePath(SharedDirectory);
+                _overrideValues[TinyIpcEnvironment.LogLevel] = "info";
+                _overrideValues[TinyIpcEnvironment.EnableLogging] = "1";
+                _overrideValues[TinyIpcEnvironment.FileNotifier] = "auto";
+                _overrideValues[TinyIpcEnvironment.BrokerIdleShutdownMs] = brokerIdleShutdownMs?.ToString();
             }
             else
             {
-                Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", "sidecar");
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", SharedDirectory);
-                Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", SharedGroup);
-                Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", UnixSidecarProcessManager.ResolveNativeHostPath());
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", SharedDirectory);
-                Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", "info");
-                Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", "1");
-                Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", "auto");
-                Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", brokerIdleShutdownMs?.ToString());
+                _overrideValues[TinyIpcEnvironment.MessageBusBackend] = "sidecar";
+                _overrideValues[TinyIpcEnvironment.SharedDirectory] = SharedDirectory;
+                _overrideValues[TinyIpcEnvironment.SharedGroup] = SharedGroup;
+                _overrideValues[TinyIpcEnvironment.NativeHostPath] = UnixSidecarProcessManager.ResolveNativeHostPath();
+                _overrideValues[TinyIpcEnvironment.LogDirectory] = SharedDirectory;
+                _overrideValues[TinyIpcEnvironment.LogLevel] = "info";
+                _overrideValues[TinyIpcEnvironment.EnableLogging] = "1";
+                _overrideValues[TinyIpcEnvironment.FileNotifier] = "auto";
+                _overrideValues[TinyIpcEnvironment.BrokerIdleShutdownMs] = brokerIdleShutdownMs?.ToString();
             }
 
-            if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(_previousUnixShell))
-                Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", "/bin/sh");
+            if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell)))
+                _overrideValues[TinyIpcEnvironment.UnixShell] = "/bin/sh";
+
+            _overrides = TinyIpcEnvironment.Override(_overrideValues);
+
+            scopeStart.Stop();
+            LogTestEvent($"TestEnvironmentScope.Start completed in {scopeStart.Elapsed:mm\\:ss\\.fff}");
         }
 
         public string ChannelName { get; }
@@ -1223,7 +1398,7 @@ public sealed class SidecarLifecycleTests
         }
 
         public void SetSharedGroup(string groupName)
-            => Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", groupName);
+            => _overrideValues[TinyIpcEnvironment.SharedGroup] = groupName;
 
         public async Task WaitForLiveSocketAsync()
         {
@@ -1334,16 +1509,10 @@ public sealed class SidecarLifecycleTests
 
         public void Dispose()
         {
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_BUS_BACKEND", _previousBackend);
-            Environment.SetEnvironmentVariable("TINYIPC_NATIVE_HOST_PATH", _previousHostPath);
-            Environment.SetEnvironmentVariable("TINYIPC_UNIX_SHELL", _previousUnixShell);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_DIR", _previousSharedDir);
-            Environment.SetEnvironmentVariable("TINYIPC_SHARED_GROUP", _previousSharedGroup);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_DIR", _previousLogDir);
-            Environment.SetEnvironmentVariable("TINYIPC_LOG_LEVEL", _previousLogLevel);
-            Environment.SetEnvironmentVariable("TINYIPC_ENABLE_LOGGING", _previousLoggingEnabled);
-            Environment.SetEnvironmentVariable("TINYIPC_FILE_NOTIFIER", _previousFileNotifier);
-            Environment.SetEnvironmentVariable("TINYIPC_BROKER_IDLE_SHUTDOWN_MS", _previousBrokerIdleShutdownMs);
+            LogTestEvent($"TestEnvironmentScope.Dispose: channel={ChannelName}");
+            var disposeStart = Stopwatch.StartNew();
+
+            _overrides.Dispose();
             ProductionPathTestEnvironment.ResetLogger();
 
             try
@@ -1354,6 +1523,9 @@ public sealed class SidecarLifecycleTests
             catch
             {
             }
+
+            disposeStart.Stop();
+            LogTestEvent($"TestEnvironmentScope.Dispose completed in {disposeStart.Elapsed:mm\\:ss\\.fff}");
         }
 
         private static string ResolveCurrentSharedGroup()
@@ -1372,6 +1544,19 @@ public sealed class SidecarLifecycleTests
                 throw new InvalidOperationException("Failed to resolve the current user's primary group for sidecar tests.");
 
             return output;
+        }
+    }
+
+    private sealed class LifecycleDisposableList<T> : IDisposable where T : IDisposable
+    {
+        private readonly List<T> _items = new();
+
+        public void Add(T item) => _items.Add(item);
+
+        public void Dispose()
+        {
+            foreach (T item in _items)
+                item.Dispose();
         }
     }
 }

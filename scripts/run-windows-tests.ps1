@@ -20,7 +20,7 @@ if (-not $SkipUpstream) {
     Write-Host "1. Upstream TinyIpc Windows tests"
     Push-Location $UpstreamRoot
     try {
-        dotnet test --project $UpstreamProject -f net10.0-windows -v minimal
+        dotnet test --project $UpstreamProject -f net9.0-windows -v minimal
     }
     finally {
         Pop-Location
@@ -28,4 +28,4 @@ if (-not $SkipUpstream) {
 }
 
 Write-Host "2. TinyIpc.Shim Windows smoke/regression tests"
-dotnet test $ShimProject -f net10.0-windows -v minimal
+dotnet test $ShimProject -f net9.0-windows -v minimal

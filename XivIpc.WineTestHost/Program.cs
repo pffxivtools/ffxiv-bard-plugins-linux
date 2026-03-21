@@ -24,6 +24,7 @@ static async Task<int> ProgramMainAsync(string[] args)
             "connect-dispose-and-wait" => await ConnectDisposeAndWaitAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "hold" => await HoldAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "publish" => await PublishAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
+            "subscribe-many" => await SubscribeManyAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             "subscribe-once" => await SubscribeOnceAsync(channel, maxPayloadBytes, args).ConfigureAwait(false),
             _ => Fail($"Unknown command '{command}'.")
         };
@@ -77,6 +78,7 @@ static async Task<int> PublishAsync(string channel, int maxPayloadBytes, string[
 
     byte[] payload = Convert.FromBase64String(args[2]);
     using var bus = CreateBus(channel, Math.Max(maxPayloadBytes, payload.Length));
+    await Task.Delay(750).ConfigureAwait(false);
     await bus.PublishAsync(payload).ConfigureAwait(false);
     Console.Out.WriteLine("PUBLISHED");
     await Console.Out.FlushAsync().ConfigureAwait(false);
@@ -103,6 +105,35 @@ static async Task<int> SubscribeOnceAsync(string channel, int maxPayloadBytes, s
     }
 
     return Fail("subscribe-once completed without receiving a message.");
+}
+
+static async Task<int> SubscribeManyAsync(string channel, int maxPayloadBytes, string[] args)
+{
+    if (args.Length < 3 || !int.TryParse(args[2], out int expectedCount) || expectedCount <= 0)
+        return Fail("subscribe-many requires a positive expected message count.");
+
+    int timeoutMs = 15_000;
+    if (args.Length >= 4 && (!int.TryParse(args[3], out timeoutMs) || timeoutMs <= 0))
+        return Fail("subscribe-many timeout must be a positive integer.");
+
+    using var bus = CreateBus(channel, maxPayloadBytes);
+    using var cts = new CancellationTokenSource(timeoutMs);
+    int observed = 0;
+
+    Console.Out.WriteLine("CONNECTED");
+    await Console.Out.FlushAsync().ConfigureAwait(false);
+
+    await foreach (var item in bus.SubscribeAsync(cts.Token).ConfigureAwait(false))
+    {
+        Console.Out.WriteLine("MESSAGE:" + Convert.ToBase64String(GetBytes(item)));
+        await Console.Out.FlushAsync().ConfigureAwait(false);
+        observed++;
+
+        if (observed >= expectedCount)
+            return 0;
+    }
+
+    return Fail($"subscribe-many completed after observing {observed} of {expectedCount} expected messages.");
 }
 
 static TinyMessageBus CreateBus(string channel, int maxPayloadBytes)

@@ -28,8 +28,9 @@ namespace XivIpc.Internal
         int OwnerPid,
         int HeartbeatIntervalMs,
         int HeartbeatTimeoutMs,
+        Guid ClientInstanceId = default,
         SidecarClientCapabilities Capabilities = SidecarClientCapabilities.BrokeredRing,
-        int ProtocolVersion = 2);
+        int ProtocolVersion = 3);
 
     internal readonly record struct SidecarAttachRing(
         string RingPath,
@@ -45,12 +46,12 @@ namespace XivIpc.Internal
     internal static class SidecarProtocol
     {
         private const int LengthPrefixBytes = 4;
-        private const int AttachRingFixedPayloadBytes = 4 + 4 + 4 + 4 + 8 + 8 + 4;
+        private const int AttachRingFixedPayloadBytes = 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8;
 
         public static void WriteHello(Socket socket, SidecarHello hello)
         {
             byte[] channelBytes = System.Text.Encoding.UTF8.GetBytes(hello.Channel ?? string.Empty);
-            int payloadLength = 4 + 4 + 4 + 4 + 4 + 4 + 4 + channelBytes.Length;
+            int payloadLength = 4 + 4 + 4 + 4 + 4 + 16 + 4 + 4 + channelBytes.Length;
             byte[] buffer = new byte[LengthPrefixBytes + 1 + payloadLength];
 
             BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(0, 4), 1 + payloadLength);
@@ -62,6 +63,7 @@ namespace XivIpc.Internal
             WriteInt32(buffer, ref offset, hello.MaxBytes);
             WriteInt32(buffer, ref offset, hello.HeartbeatIntervalMs);
             WriteInt32(buffer, ref offset, hello.HeartbeatTimeoutMs);
+            WriteGuid(buffer, ref offset, hello.ClientInstanceId);
             WriteInt32(buffer, ref offset, (int)hello.Capabilities);
             WriteInt32(buffer, ref offset, channelBytes.Length);
             channelBytes.CopyTo(buffer, offset);
@@ -85,6 +87,9 @@ namespace XivIpc.Internal
             int maxBytes = ReadInt32(span, ref offset);
             int heartbeatIntervalMs = ReadInt32(span, ref offset);
             int heartbeatTimeoutMs = ReadInt32(span, ref offset);
+            Guid clientInstanceId = version >= 3
+                ? ReadGuid(span, ref offset)
+                : Guid.Empty;
             SidecarClientCapabilities capabilities = (SidecarClientCapabilities)ReadInt32(span, ref offset);
             int channelLength = ReadInt32(span, ref offset);
 
@@ -92,13 +97,13 @@ namespace XivIpc.Internal
                 throw new InvalidDataException("HELLO channel payload is invalid.");
 
             string channel = System.Text.Encoding.UTF8.GetString(span.Slice(offset, channelLength));
-            return new SidecarHello(channel, maxBytes, ownerPid, heartbeatIntervalMs, heartbeatTimeoutMs, capabilities, version);
+            return new SidecarHello(channel, maxBytes, ownerPid, heartbeatIntervalMs, heartbeatTimeoutMs, clientInstanceId, capabilities, version);
         }
 
         public static void WriteAttachRing(Socket socket, SidecarAttachRing attach)
         {
             byte[] ringPathBytes = System.Text.Encoding.UTF8.GetBytes(attach.RingPath ?? string.Empty);
-            byte[] payload = new byte[4 + 4 + 4 + 4 + 8 + 8 + 4 + ringPathBytes.Length];
+            byte[] payload = new byte[AttachRingFixedPayloadBytes + ringPathBytes.Length];
             int offset = 0;
             WriteInt32(payload, ref offset, attach.ProtocolVersion);
             WriteInt32(payload, ref offset, ringPathBytes.Length);
@@ -107,6 +112,7 @@ namespace XivIpc.Internal
             WriteInt64(payload, ref offset, attach.StartSequence);
             WriteInt64(payload, ref offset, attach.SessionId);
             WriteInt32(payload, ref offset, attach.RingLength);
+            WriteInt64(payload, ref offset, attach.ProtocolVersion >= 4 ? attach.StartSequence : 0);
             ringPathBytes.CopyTo(payload, offset);
             SendAll(socket, BuildFrame(SidecarFrameType.AttachRing, payload));
         }
@@ -143,8 +149,10 @@ namespace XivIpc.Internal
             long startSequence = ReadInt64(span, ref offset);
             long sessionId = ReadInt64(span, ref offset);
             int ringLength = ReadInt32(span, ref offset);
+            if (version >= 4)
+                _ = ReadInt64(span, ref offset);
 
-            if (version != 3)
+            if (version is not (3 or 4))
                 throw new InvalidDataException($"ATTACH_RING protocol version '{version}' is unsupported.");
 
             if (ringPathLength < 0)
@@ -252,6 +260,12 @@ namespace XivIpc.Internal
             offset += 4;
         }
 
+        private static void WriteGuid(byte[] buffer, ref int offset, Guid value)
+        {
+            value.TryWriteBytes(buffer.AsSpan(offset, 16));
+            offset += 16;
+        }
+
         private static void WriteInt64(byte[] buffer, ref int offset, long value)
         {
             BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(offset, 8), value);
@@ -269,6 +283,13 @@ namespace XivIpc.Internal
         {
             long value = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(offset, 8));
             offset += 8;
+            return value;
+        }
+
+        private static Guid ReadGuid(ReadOnlySpan<byte> span, ref int offset)
+        {
+            Guid value = new(span.Slice(offset, 16));
+            offset += 16;
             return value;
         }
     }

@@ -1,11 +1,11 @@
 using System.Collections.Concurrent;
 using System.Text;
+using XivIpc.Internal;
 using XivIpc.Messaging;
 using Xunit;
 
 namespace XivIpc.Tests;
 
-[Collection("TinyIpc Serial")]
 public sealed class UnixInMemoryTinyMessageBusTests
 {
     [Fact]
@@ -408,8 +408,7 @@ public sealed class UnixInMemoryTinyMessageBusTests
 
     private sealed class SharedMemoryTestEnvironment : IDisposable
     {
-        private readonly string? _previousSlotCount;
-        private readonly string? _previousTtlMs;
+        private readonly IDisposable _overrides;
 
         public string ChannelName { get; }
 
@@ -417,17 +416,14 @@ public sealed class UnixInMemoryTinyMessageBusTests
         {
             ChannelName = channelName ?? $"xivipc-shm-tests-{Guid.NewGuid():N}";
 
-            _previousSlotCount = Environment.GetEnvironmentVariable("TINYIPC_SLOT_COUNT");
-            _previousTtlMs = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS");
-
-            Environment.SetEnvironmentVariable("TINYIPC_SLOT_COUNT", slotCount.ToString());
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS", ttlMs.ToString());
+            _overrides = TinyIpcEnvironment.Override(
+                (TinyIpcEnvironment.SlotCount, slotCount.ToString()),
+                (TinyIpcEnvironment.MessageTtlMs, ttlMs.ToString()));
         }
 
         public void Dispose()
         {
-            Environment.SetEnvironmentVariable("TINYIPC_SLOT_COUNT", _previousSlotCount);
-            Environment.SetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS", _previousTtlMs);
+            _overrides.Dispose();
         }
     }
 

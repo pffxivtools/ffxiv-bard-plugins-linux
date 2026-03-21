@@ -341,7 +341,7 @@ namespace XivIpc.Internal
 
         private static string ResolveSharedDirectory()
         {
-            string? explicitPath = Environment.GetEnvironmentVariable("TINYIPC_SHARED_DIR");
+            string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
             if (!string.IsNullOrWhiteSpace(explicitPath))
             {
                 string resolved = ResolvePathForCurrentRuntime(explicitPath);
@@ -396,7 +396,7 @@ namespace XivIpc.Internal
 
         private static string BuildSharedFileName(string name, string kind)
         {
-            string? prefix = Environment.GetEnvironmentVariable("TINYIPC_SHARED_PREFIX");
+            string? prefix = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedPrefix);
             if (string.IsNullOrWhiteSpace(prefix))
                 prefix = "tinyipc";
 
@@ -437,7 +437,7 @@ namespace XivIpc.Internal
 
         private static string? GetConfiguredGroup()
         {
-            string? group = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
+            string? group = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
             return string.IsNullOrWhiteSpace(group) ? null : group;
         }
 
