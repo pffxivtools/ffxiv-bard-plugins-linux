@@ -100,14 +100,19 @@ pack_semver_artifacts() {
     local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
     local extract_dir="${WORK_DIR}/${asset_slug}.extract"
     local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
-    local asset_name="${asset_slug}-${release_version}.zip"
-    local asset_path="${ASSETS_DIR}/${asset_name}"
     local release_url
 
     log "Fetching upstream manifest: ${pluginmaster_url}"
     download_file "${pluginmaster_url}" "${manifest_file}"
     extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${original_entry_file}"
     jq -e '.' "${original_entry_file}" >/dev/null 2>&1 || die "Could not find manifest entry for ${plugin_name}"
+
+    local upstream_version
+    upstream_version="$(get_upstream_version "${original_entry_file}")"
+    [[ -n "${upstream_version}" ]] || die "Could not determine upstream version for ${plugin_name}"
+
+    local asset_name="${asset_slug}-${upstream_version}.zip"
+    local asset_path="${ASSETS_DIR}/${asset_name}"
 
     local download_url
     download_url="$(get_download_link_install "${manifest_file}" "${plugin_name}")"
@@ -126,10 +131,6 @@ pack_semver_artifacts() {
     release_url="$(github_release_asset_url "${GITHUB_REPOSITORY}" "${semver_tag}" "${asset_name}")"
     build_republished_entry "${original_entry_file}" "${release_url}" "${republished_entry}"
     merge_plugin_entry "${PLUGINMASTER_OUTPUT}" "${republished_entry}"
-
-    local upstream_version
-    upstream_version="$(get_upstream_version "${original_entry_file}")"
-    [[ -n "${upstream_version}" ]] || die "Could not determine upstream version for ${plugin_name}"
 
     jq --arg pluginName "${plugin_name}" --arg upstreamVersion "${upstream_version}" \
       '. += [{"pluginName": $pluginName, "upstreamVersion": $upstreamVersion}]' \

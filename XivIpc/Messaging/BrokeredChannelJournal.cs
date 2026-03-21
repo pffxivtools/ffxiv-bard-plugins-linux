@@ -28,7 +28,7 @@ namespace XivIpc.Messaging
     internal sealed unsafe class BrokeredChannelJournal : IDisposable
     {
         private const uint JournalMagic = 0x5449424a; // "TIBJ"
-        private const uint RecordMagic = 0x54494252; // "TIBR"
+        private const uint RecordMagic = 0x54494252;  // "TIBR"
         private const int JournalVersion = 1;
 
         private const int HeaderMagicOffset = 0;
@@ -56,6 +56,7 @@ namespace XivIpc.Messaging
         private readonly MemoryMappedFile _mappedFile;
         private readonly MemoryMappedViewAccessor _view;
         private readonly SafeMemoryMappedViewHandle _viewHandle;
+        private bool _disposed;
 
         private BrokeredChannelJournal(
             string filePath,
@@ -104,7 +105,13 @@ namespace XivIpc.Messaging
             try
             {
                 UnixSharedStorageHelpers.ApplyBrokerPermissions(runtimePath, isDirectory: false);
-                MemoryMappedFile mappedFile = MemoryMappedFile.CreateFromFile(stream, null, length, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
+                MemoryMappedFile mappedFile = MemoryMappedFile.CreateFromFile(
+                    stream,
+                    null,
+                    length,
+                    MemoryMappedFileAccess.ReadWrite,
+                    HandleInheritability.None,
+                    leaveOpen: true);
                 MemoryMappedViewAccessor view = mappedFile.CreateViewAccessor(0, length, MemoryMappedFileAccess.ReadWrite);
                 byte* pointer = AcquirePointer(view.SafeMemoryMappedViewHandle);
                 var journal = new BrokeredChannelJournal(filePath, stream, mappedFile, view, view.SafeMemoryMappedViewHandle, pointer, capacityBytes, maxPayloadBytes, minAgeMs);
@@ -126,7 +133,13 @@ namespace XivIpc.Messaging
             FileStream stream = OpenFileStream(runtimePath, length, create: false);
             try
             {
-                MemoryMappedFile mappedFile = MemoryMappedFile.CreateFromFile(stream, null, length, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
+                MemoryMappedFile mappedFile = MemoryMappedFile.CreateFromFile(
+                    stream,
+                    null,
+                    length,
+                    MemoryMappedFileAccess.ReadWrite,
+                    HandleInheritability.None,
+                    leaveOpen: true);
                 MemoryMappedViewAccessor view = mappedFile.CreateViewAccessor(0, length, MemoryMappedFileAccess.ReadWrite);
                 byte* pointer = AcquirePointer(view.SafeMemoryMappedViewHandle);
                 var journal = new BrokeredChannelJournal(filePath, stream, mappedFile, view, view.SafeMemoryMappedViewHandle, pointer, capacityBytes, maxPayloadBytes, minAgeMs);
@@ -141,29 +154,56 @@ namespace XivIpc.Messaging
         }
 
         internal long CaptureHeadSequence()
-            => Volatile.Read(ref *(long*)((byte*)Pointer + HeaderHeadSequenceOffset));
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return ReadInt64((byte*)Pointer, HeaderHeadSequenceOffset);
+            }
+        }
 
         internal long CaptureTailSequence()
-            => Volatile.Read(ref *(long*)((byte*)Pointer + HeaderTailSequenceOffset));
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return ReadInt64((byte*)Pointer, HeaderTailSequenceOffset);
+            }
+        }
 
         internal int CaptureHeadOffset()
-            => Volatile.Read(ref *(int*)((byte*)Pointer + HeaderHeadOffsetOffset));
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return ReadInt32((byte*)Pointer, HeaderHeadOffsetOffset);
+            }
+        }
 
         internal int CaptureTailOffset()
-            => Volatile.Read(ref *(int*)((byte*)Pointer + HeaderTailOffsetOffset));
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return ReadInt32((byte*)Pointer, HeaderTailOffsetOffset);
+            }
+        }
 
         internal BrokeredJournalPublishResult Publish(Guid senderInstanceId, byte[] message)
         {
             ArgumentNullException.ThrowIfNull(message);
-            if (message.Length > MaxPayloadBytes)
-                throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {MaxPayloadBytes}.");
-
-            int requiredBytes = checked(RecordHeaderBytes + message.Length);
-            if (requiredBytes > CapacityBytes)
-                throw new InvalidOperationException($"Message length {message.Length} exceeds journal capacity {CapacityBytes}.");
 
             lock (_gate)
             {
+                ThrowIfDisposed();
+
+                if (message.Length > MaxPayloadBytes)
+                    throw new InvalidOperationException($"Message length {message.Length} exceeds configured max {MaxPayloadBytes}.");
+
+                int requiredBytes = checked(RecordHeaderBytes + message.Length);
+                if (requiredBytes > CapacityBytes)
+                    throw new InvalidOperationException($"Message length {message.Length} exceeds journal capacity {CapacityBytes}.");
+
                 Validate();
 
                 byte* image = (byte*)Pointer;
@@ -197,7 +237,13 @@ namespace XivIpc.Messaging
                 {
                     int retainedBytes = headOffset - tailOffset;
                     if (retainedBytes > 0)
-                        Buffer.MemoryCopy(image + HeaderBytes + tailOffset, image + HeaderBytes, CapacityBytes, retainedBytes);
+                    {
+                        Buffer.MemoryCopy(
+                            image + HeaderBytes + tailOffset,
+                            image + HeaderBytes,
+                            CapacityBytes,
+                            retainedBytes);
+                    }
 
                     ClearBytes(image + HeaderBytes + retainedBytes, CapacityBytes - retainedBytes);
                     headOffset = retainedBytes;
@@ -216,10 +262,17 @@ namespace XivIpc.Messaging
 
                 int writeOffset = HeaderBytes + headOffset;
                 ClearBytes(image + writeOffset, requiredBytes);
+
                 if (message.Length > 0)
                 {
                     fixed (byte* source = message)
-                        Buffer.MemoryCopy(source, image + writeOffset + RecordHeaderBytes, message.Length, message.Length);
+                    {
+                        Buffer.MemoryCopy(
+                            source,
+                            image + writeOffset + RecordHeaderBytes,
+                            message.Length,
+                            message.Length);
+                    }
                 }
 
                 WriteInt32(image, writeOffset + RecordTotalLengthOffset, requiredBytes);
@@ -250,78 +303,83 @@ namespace XivIpc.Messaging
 
         internal BrokeredJournalDrainResult Drain(Guid selfInstanceId, ref long nextSequence)
         {
-            Validate();
-
-            byte* image = (byte*)Pointer;
-            int tailOffset = Volatile.Read(ref *(int*)(image + HeaderTailOffsetOffset));
-            int headOffset = Volatile.Read(ref *(int*)(image + HeaderHeadOffsetOffset));
-            long tailSequence = Volatile.Read(ref *(long*)(image + HeaderTailSequenceOffset));
-            long headSequence = Volatile.Read(ref *(long*)(image + HeaderHeadSequenceOffset));
-            long nextSequenceBefore = nextSequence;
-            long lagBefore = headSequence - nextSequenceBefore;
-            bool caughtUpToTail = false;
-
-            if (nextSequence < tailSequence)
+            lock (_gate)
             {
-                nextSequence = tailSequence;
-                caughtUpToTail = true;
-            }
+                ThrowIfDisposed();
+                Validate();
 
-            int offset = tailOffset;
-            long sequence = tailSequence;
-            while (sequence < nextSequence && offset < headOffset)
-            {
-                int recordOffset = HeaderBytes + offset;
-                int recordLength = ReadInt32(image, recordOffset + RecordTotalLengthOffset);
-                if (recordLength < RecordHeaderBytes || offset + recordLength > headOffset)
-                    break;
+                byte* image = (byte*)Pointer;
+                int tailOffset = ReadInt32(image, HeaderTailOffsetOffset);
+                int headOffset = ReadInt32(image, HeaderHeadOffsetOffset);
+                long tailSequence = ReadInt64(image, HeaderTailSequenceOffset);
+                long headSequence = ReadInt64(image, HeaderHeadSequenceOffset);
+                long nextSequenceBefore = nextSequence;
+                long lagBefore = headSequence - nextSequenceBefore;
+                bool caughtUpToTail = false;
 
-                offset += recordLength;
-                sequence++;
-            }
-
-            var messages = new List<byte[]>();
-            while (sequence < headSequence && offset < headOffset)
-            {
-                int recordOffset = HeaderBytes + offset;
-                uint magic = Volatile.Read(ref *(uint*)(image + recordOffset + RecordMagicOffset));
-                int recordLength = ReadInt32(image, recordOffset + RecordTotalLengthOffset);
-                long recordSequence = ReadInt64(image, recordOffset + RecordSequenceOffset);
-                int payloadLength = ReadInt32(image, recordOffset + RecordPayloadLengthOffset);
-                Guid senderInstanceId = ReadGuid(image + recordOffset + RecordSenderGuidOffset);
-                if (magic != RecordMagic ||
-                    recordLength < RecordHeaderBytes ||
-                    offset + recordLength > headOffset ||
-                    recordSequence != sequence ||
-                    payloadLength < 0 ||
-                    payloadLength > MaxPayloadBytes ||
-                    RecordHeaderBytes + payloadLength > recordLength)
+                if (nextSequence < tailSequence)
                 {
-                    break;
+                    nextSequence = tailSequence;
+                    caughtUpToTail = true;
                 }
 
-                if (senderInstanceId != selfInstanceId)
+                int offset = tailOffset;
+                long sequence = tailSequence;
+                while (sequence < nextSequence && offset < headOffset)
                 {
-                    byte[] payload = new byte[payloadLength];
-                    if (payloadLength > 0)
-                        MarshalCopy(image + recordOffset + RecordHeaderBytes, payload);
-                    messages.Add(payload);
+                    int recordOffset = HeaderBytes + offset;
+                    int recordLength = ReadInt32(image, recordOffset + RecordTotalLengthOffset);
+                    if (recordLength < RecordHeaderBytes || offset + recordLength > headOffset)
+                        break;
+
+                    offset += recordLength;
+                    sequence++;
                 }
 
-                offset += recordLength;
-                sequence++;
-                nextSequence = sequence;
-            }
+                var messages = new List<byte[]>();
+                while (sequence < headSequence && offset < headOffset)
+                {
+                    int recordOffset = HeaderBytes + offset;
+                    uint magic = ReadUInt32(image, recordOffset + RecordMagicOffset);
+                    int recordLength = ReadInt32(image, recordOffset + RecordTotalLengthOffset);
+                    long recordSequence = ReadInt64(image, recordOffset + RecordSequenceOffset);
+                    int payloadLength = ReadInt32(image, recordOffset + RecordPayloadLengthOffset);
+                    Guid senderInstanceId = ReadGuid(image + recordOffset + RecordSenderGuidOffset);
 
-            return new BrokeredJournalDrainResult(
-                Messages: messages,
-                CaughtUpToTail: caughtUpToTail,
-                TailSequenceObserved: tailSequence,
-                HeadSequenceObserved: headSequence,
-                NextSequenceBefore: nextSequenceBefore,
-                NextSequenceAfter: nextSequence,
-                LagBefore: lagBefore,
-                RetainedBytes: headOffset - tailOffset);
+                    if (magic != RecordMagic ||
+                        recordLength < RecordHeaderBytes ||
+                        offset + recordLength > headOffset ||
+                        recordSequence != sequence ||
+                        payloadLength < 0 ||
+                        payloadLength > MaxPayloadBytes ||
+                        RecordHeaderBytes + payloadLength > recordLength)
+                    {
+                        break;
+                    }
+
+                    if (senderInstanceId != selfInstanceId)
+                    {
+                        byte[] payload = new byte[payloadLength];
+                        if (payloadLength > 0)
+                            MarshalCopy(image + recordOffset + RecordHeaderBytes, payload);
+                        messages.Add(payload);
+                    }
+
+                    offset += recordLength;
+                    sequence++;
+                    nextSequence = sequence;
+                }
+
+                return new BrokeredJournalDrainResult(
+                    Messages: messages,
+                    CaughtUpToTail: caughtUpToTail,
+                    TailSequenceObserved: tailSequence,
+                    HeadSequenceObserved: headSequence,
+                    NextSequenceBefore: nextSequenceBefore,
+                    NextSequenceAfter: nextSequence,
+                    LagBefore: lagBefore,
+                    RetainedBytes: headOffset - tailOffset);
+            }
         }
 
         private void Initialize()
@@ -350,8 +408,15 @@ namespace XivIpc.Messaging
             int tailOffset = ReadInt32(image, HeaderTailOffsetOffset);
             int headOffset = ReadInt32(image, HeaderHeadOffsetOffset);
             long minAgeMs = ReadInt64(image, HeaderMinAgeMsOffset);
-            if (magic != JournalMagic || version != JournalVersion || capacityBytes != CapacityBytes || maxPayloadBytes != MaxPayloadBytes || minAgeMs != MinAgeMs)
+
+            if (magic != JournalMagic ||
+                version != JournalVersion ||
+                capacityBytes != CapacityBytes ||
+                maxPayloadBytes != MaxPayloadBytes ||
+                minAgeMs != MinAgeMs)
+            {
                 throw new InvalidDataException("Broker journal header is invalid.");
+            }
 
             if (tailOffset < 0 || headOffset < tailOffset || headOffset > CapacityBytes)
                 throw new InvalidDataException("Broker journal offsets are invalid.");
@@ -359,10 +424,23 @@ namespace XivIpc.Messaging
 
         public void Dispose()
         {
-            _viewHandle.ReleasePointer();
-            _view.Dispose();
-            _mappedFile.Dispose();
-            _stream.Dispose();
+            lock (_gate)
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                _viewHandle.ReleasePointer();
+                _view.Dispose();
+                _mappedFile.Dispose();
+                _stream.Dispose();
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(BrokeredChannelJournal));
         }
 
         private static FileStream OpenFileStream(string path, int length, bool create)
@@ -373,7 +451,7 @@ namespace XivIpc.Messaging
             return stream;
         }
 
-        private static unsafe byte* AcquirePointer(SafeMemoryMappedViewHandle handle)
+        private static byte* AcquirePointer(SafeMemoryMappedViewHandle handle)
         {
             byte* pointer = null;
             handle.AcquirePointer(ref pointer);
