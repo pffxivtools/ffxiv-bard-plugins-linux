@@ -413,26 +413,15 @@ publish_native_host() {
 
 install_runtime_files() {
   local plugin_root="$1"
-  local shim_dist_dir="$2"
-  local tinyipc_source="${shim_dist_dir}/TinyIpc.dll"
-  local xivipc_source="${shim_dist_dir}/XivIpc.dll"
+  local dist_dir="$2"
 
-  [[ -f "${tinyipc_source}" ]] || die "Missing shim TinyIpc.dll"
-  [[ -f "${xivipc_source}" ]] || die "Missing shim XivIpc.dll"
+  [[ -d "${dist_dir}" ]] || die "Missing dist directory: ${dist_dir}"
 
-  local replaced=0
-  local target
+  mkdir -p "${plugin_root}"
 
-  while IFS= read -r -d '' target; do
-    cp -f "${tinyipc_source}" "${target}"
-    replaced=1
-  done < <(find "${plugin_root}" -type f -name 'TinyIpc.dll' -print0)
+  find "${plugin_root}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-  if [[ "${replaced}" -eq 0 ]]; then
-    cp -f "${tinyipc_source}" "${plugin_root}/TinyIpc.dll"
-  fi
-
-  cp -f "${xivipc_source}" "${plugin_root}/XivIpc.dll"
+  cp -a "${dist_dir}/." "${plugin_root}/"
 }
 
 create_plugin_zip() {
