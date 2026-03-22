@@ -8,6 +8,8 @@ cd "${REPO_ROOT}"
 # shellcheck source=./release-common.sh
 source "${SCRIPT_DIR}/release-common.sh"
 
+export PUBLISH_CONTEXT=local
+
 DIST_DIR="${REPO_ROOT}/dist"
 SHIM_DIST_DIR="${DIST_DIR}/shim"
 HOST_DIST_DIR="${DIST_DIR}/native-host"

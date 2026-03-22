@@ -52,19 +52,12 @@ jobs:
           repositories: |
             BardToolbox
 
-      - name: Checkout BardToolbox private repo
-        uses: actions/checkout@v4
-        with:
-          repository: pffxivtools/BardToolbox
-          token: ${{ steps.bardtoolbox_app_token.outputs.token }}
-          path: BardToolbox
-          fetch-depth: 1
 
       - name: Generate release assets and manifest
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PUBLISH_SCHEME: semver
-          BARDTOOLBOX_LOCAL_DIR: ${{ github.workspace }}/BardToolbox
+          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
         run: bash scripts/publish-release.sh
 
       - name: NuGet login (OIDC → temp API key)

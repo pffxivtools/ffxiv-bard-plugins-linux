@@ -8,6 +8,8 @@ cd "${REPO_ROOT}"
 # shellcheck source=./release-common.sh
 source "${SCRIPT_DIR}/release-common.sh"
 
+export PUBLISH_CONTEXT=release
+
 : "${PUBLISH_SCHEME:?PUBLISH_SCHEME must be set to semver or plugins}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 : "${TOOL_SELECTION:=all}"

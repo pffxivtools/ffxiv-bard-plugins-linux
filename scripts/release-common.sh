@@ -57,8 +57,14 @@ resolve_bardtoolbox_local_dir() {
   return 1
 }
 
-selected_targets() {
-  local selection="${TOOL_SELECTION:-all}"
+bardtoolbox_release_target() {
+  local repo="${BARDTOOLBOX_PRIVATE_REPO:-pffxivtools/BardToolbox}"
+  local ref="${BARDTOOLBOX_PRIVATE_REF:-main}"
+  local manifest_path="${BARDTOOLBOX_MANIFEST_PATH:-pluginmaster.json}"
+  printf '%s\n' "BardToolbox|BardToolbox|github-private-pluginmaster|${repo}:${manifest_path}@${ref}|url-download||4x"
+}
+
+bardtoolbox_local_target() {
   local bard_local_dir
   bard_local_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and publish/BardToolbox/"
 
@@ -67,18 +73,51 @@ selected_targets() {
   local bard_payload_source_kind="local-publish-dir"
   local bard_payload_source_value="${bard_local_dir}/${BARDTOOLBOX_PUBLISH_SUBDIR:-publish/BardToolbox}"
 
+  printf '%s\n' "BardToolbox|BardToolbox|${bard_manifest_source_kind}|${bard_manifest_source_value}|${bard_payload_source_kind}|${bard_payload_source_value}|4x"
+}
+
+selected_targets() {
+  local selection="${TOOL_SELECTION:-all}"
   local midi_manifest="${MIDIBARD2_PLUGINMASTER:-https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/pluginmaster.json}"
   local mop_manifest="${MASTEROFPUPPETS_PLUGINMASTER:-https://raw.githubusercontent.com/zunetrix/DalamudPlugins/refs/heads/main/pluginmaster.json}"
+  local bard_target
+  local source_mode="${BARDTOOLBOX_SOURCE_MODE:-}"
+
+  if [[ -z "${source_mode}" ]]; then
+    case "${PUBLISH_CONTEXT:-}" in
+      local) source_mode="local" ;;
+      release) source_mode="remote" ;;
+      *)
+        if [[ -n "${BARDTOOLBOX_LOCAL_DIR:-}" || -d "${REPO_ROOT}/../BardToolbox/publish/BardToolbox" || -d "${REPO_ROOT}/BardToolbox/publish/BardToolbox" ]]; then
+          source_mode="local"
+        else
+          source_mode="remote"
+        fi
+        ;;
+    esac
+  fi
+
+  case "${source_mode}" in
+    local)
+      bard_target="$(bardtoolbox_local_target)"
+      ;;
+    remote)
+      bard_target="$(bardtoolbox_release_target)"
+      ;;
+    *)
+      die "Unsupported BARDTOOLBOX_SOURCE_MODE: ${source_mode}"
+      ;;
+  esac
 
   case "${selection}" in
     all)
       printf '%s\n' \
-        "BardToolbox|BardToolbox|${bard_manifest_source_kind}|${bard_manifest_source_value}|${bard_payload_source_kind}|${bard_payload_source_value}|4x" \
+        "${bard_target}" \
         "MidiBard2|MidiBard 2|url-pluginmaster|${midi_manifest}|url-download||3x" \
         "MasterOfPuppets|MasterOfPuppets|url-pluginmaster|${mop_manifest}|url-download||3x"
       ;;
     BardToolbox)
-      printf '%s\n' "BardToolbox|BardToolbox|${bard_manifest_source_kind}|${bard_manifest_source_value}|${bard_payload_source_kind}|${bard_payload_source_value}|4x"
+      printf '%s\n' "${bard_target}"
       ;;
     MidiBard2)
       printf '%s\n' "MidiBard2|MidiBard 2|url-pluginmaster|${midi_manifest}|url-download||3x"
