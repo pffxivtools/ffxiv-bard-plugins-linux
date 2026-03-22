@@ -46,7 +46,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 9.0.x
 
       - name: Create GitHub App token for BardToolbox
         id: bardtoolbox_app_token
@@ -58,6 +58,14 @@ jobs:
           repositories: |
             BardToolbox
 
+      - name: Checkout BardToolbox private repo
+        uses: actions/checkout@v4
+        with:
+          repository: pffxivtools/BardToolbox
+          token: ${{ steps.bardtoolbox_app_token.outputs.token }}
+          path: BardToolbox
+          fetch-depth: 1
+
       - name: Validate shell scripts
         shell: bash
         run: |
@@ -68,7 +76,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PUBLISH_SCHEME: plugins
           TOOL_SELECTION: BardToolbox
-          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
+          BARDTOOLBOX_LOCAL_DIR: ${{ github.workspace }}/BardToolbox
         shell: bash
         run: |
           bash scripts/publish-release.sh
@@ -90,7 +98,7 @@ jobs:
           PUBLISH_SCHEME: semver
           RELEASE_VERSION: ${{ env.TEST_RELEASE_VERSION }}
           TOOL_SELECTION: BardToolbox
-          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
+          BARDTOOLBOX_LOCAL_DIR: ${{ github.workspace }}/BardToolbox
         shell: bash
         run: |
           bash scripts/publish-release.sh

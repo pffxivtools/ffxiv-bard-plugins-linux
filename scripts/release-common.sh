@@ -21,28 +21,70 @@ ensure_common_prereqs() {
   require_cmd curl
   require_cmd unzip
   require_cmd tar
+  require_cmd zip
+  require_cmd find
+  require_cmd python3
 }
-
-BARDTOOLBOX_OWNER_DEFAULT="pffxivtools"
-BARDTOOLBOX_REPO_DEFAULT="BardToolbox"
-BARDTOOLBOX_MANIFEST_PATH_DEFAULT="pluginmaster.json"
-BARDTOOLBOX_MANIFEST_REF_DEFAULT="main"
 
 ensure_pluginmaster_file() {
   local output_file="$1"
   mkdir -p "$(dirname "${output_file}")"
   [[ -f "${output_file}" ]] || printf '[]\n' > "${output_file}"
+  jq -e 'type == "array"' "${output_file}" >/dev/null 2>&1 || die "${output_file} must contain a JSON array"
+}
+
+resolve_bardtoolbox_local_dir() {
+  local candidates=()
+  [[ -n "${BARDTOOLBOX_LOCAL_DIR:-}" ]] && candidates+=("${BARDTOOLBOX_LOCAL_DIR}")
+  candidates+=(
+    "${REPO_ROOT}/BardToolbox"
+    "${REPO_ROOT}/../BardToolbox"
+    "${PWD}/BardToolbox"
+  )
+
+  local candidate
+  local manifest_path="${BARDTOOLBOX_MANIFEST_PATH:-pluginmaster.json}"
+  local publish_subdir="${BARDTOOLBOX_PUBLISH_SUBDIR:-publish/BardToolbox}"
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "${candidate}" ]] || continue
+    if [[ -f "${candidate}/${manifest_path}" && -d "${candidate}/${publish_subdir}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 selected_targets() {
   local selection="${TOOL_SELECTION:-all}"
+  local bard_local_dir
+  bard_local_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and publish/BardToolbox/"
+
+  local bard_manifest_source_kind="local-pluginmaster"
+  local bard_manifest_source_value="${bard_local_dir}/${BARDTOOLBOX_MANIFEST_PATH:-pluginmaster.json}"
+  local bard_payload_source_kind="local-publish-dir"
+  local bard_payload_source_value="${bard_local_dir}/${BARDTOOLBOX_PUBLISH_SUBDIR:-publish/BardToolbox}"
+
+  local midi_manifest="${MIDIBARD2_PLUGINMASTER:-https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/pluginmaster.json}"
+  local mop_manifest="${MASTEROFPUPPETS_PLUGINMASTER:-https://raw.githubusercontent.com/zunetrix/DalamudPlugins/refs/heads/main/pluginmaster.json}"
+
   case "${selection}" in
-    all|BardToolbox)
+    all)
       printf '%s\n' \
-        "BardToolbox|BardToolbox|github-private-pluginmaster|${BARDTOOLBOX_OWNER:-$BARDTOOLBOX_OWNER_DEFAULT}/${BARDTOOLBOX_REPO:-$BARDTOOLBOX_REPO_DEFAULT}:${BARDTOOLBOX_MANIFEST_PATH:-$BARDTOOLBOX_MANIFEST_PATH_DEFAULT}@${BARDTOOLBOX_MANIFEST_REF:-$BARDTOOLBOX_MANIFEST_REF_DEFAULT}|linux-x64|repo|${BARDTOOLBOX_OWNER:-$BARDTOOLBOX_OWNER_DEFAULT}/${BARDTOOLBOX_REPO:-$BARDTOOLBOX_REPO_DEFAULT}"
+        "BardToolbox|BardToolbox|${bard_manifest_source_kind}|${bard_manifest_source_value}|${bard_payload_source_kind}|${bard_payload_source_value}|4x" \
+        "MidiBard2|MidiBard 2|url-pluginmaster|${midi_manifest}|url-download||3x" \
+        "MasterOfPuppets|MasterOfPuppets|url-pluginmaster|${mop_manifest}|url-download||3x"
       ;;
-    MidiBard2|MasterOfPuppets)
-      die "${selection} is not yet configured in scripts/release-common.sh. BardToolbox is fully wired up for private repo publishing; add additional manifest sources before publishing ${selection}."
+    BardToolbox)
+      printf '%s\n' "BardToolbox|BardToolbox|${bard_manifest_source_kind}|${bard_manifest_source_value}|${bard_payload_source_kind}|${bard_payload_source_value}|4x"
+      ;;
+    MidiBard2)
+      printf '%s\n' "MidiBard2|MidiBard 2|url-pluginmaster|${midi_manifest}|url-download||3x"
+      ;;
+    MasterOfPuppets)
+      printf '%s\n' "MasterOfPuppets|MasterOfPuppets|url-pluginmaster|${mop_manifest}|url-download||3x"
       ;;
     *)
       die "Unsupported TOOL_SELECTION: ${selection}"
@@ -54,7 +96,7 @@ resolve_abi_flavor() {
   local plugin_name="$1"
   local default_abi_flavor="$2"
   local override_var="ABI_FLAVOR_${plugin_name//[^A-Za-z0-9]/_}"
-  local override="${!override_var:-}"
+  local override="${!override_var:-${TINYIPC_ABI_FLAVOR_OVERRIDE:-}}"
   if [[ -n "${override}" ]]; then
     printf '%s\n' "${override}"
   else
@@ -65,23 +107,64 @@ resolve_abi_flavor() {
 extract_zip_normalized() {
   local zip_path="$1"
   local extract_dir="$2"
+
   rm -rf "${extract_dir}"
   mkdir -p "${extract_dir}"
-  unzip -q -o "${zip_path}" -d "${extract_dir}"
+
+  python3 - "$zip_path" "$extract_dir" <<'PY'
+import os
+import shutil
+import sys
+import zipfile
+
+zip_path = sys.argv[1]
+out_dir = sys.argv[2]
+
+with zipfile.ZipFile(zip_path) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace('\\', '/').lstrip('/')
+        if not name:
+            continue
+        target = os.path.join(out_dir, name)
+        if info.is_dir() or name.endswith('/'):
+            os.makedirs(target, exist_ok=True)
+            continue
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with zf.open(info) as src, open(target, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+PY
 }
 
 resolve_extracted_root() {
   local extract_dir="$1"
-  local entries=()
+  local top_entries=()
   while IFS= read -r entry; do
-    entries+=("${entry}")
-  done < <(find "${extract_dir}" -mindepth 1 -maxdepth 1)
+    top_entries+=("$entry")
+  done < <(find "$extract_dir" -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)
 
-  if [[ "${#entries[@]}" -eq 1 && -d "${entries[0]}" ]]; then
-    printf '%s\n' "${entries[0]}"
+  if [[ "${#top_entries[@]}" -eq 1 && -d "${extract_dir}/${top_entries[0]}" ]]; then
+    printf '%s\n' "${extract_dir}/${top_entries[0]}"
   else
     printf '%s\n' "${extract_dir}"
   fi
+}
+
+prepare_plugin_tree_from_zip() {
+  local zip_path="$1"
+  local extract_dir="$2"
+  extract_zip_normalized "${zip_path}" "${extract_dir}"
+  resolve_extracted_root "${extract_dir}"
+}
+
+prepare_plugin_tree_from_dir() {
+  local source_dir="$1"
+  local stage_dir="$2"
+  rm -rf "${stage_dir}"
+  mkdir -p "${stage_dir}"
+  cp -a "${source_dir}/." "${stage_dir}/"
+  printf '%s\n' "${stage_dir}"
 }
 
 pack_nuget_project() {
@@ -90,9 +173,11 @@ pack_nuget_project() {
   local version="$3"
   local repository_url="$4"
 
+  mkdir -p "${output_dir}"
   log "Packing ${project_path} ${version}"
   dotnet pack "${project_path}" \
     -c Release \
+    -f net9.0 \
     -o "${output_dir}" \
     -p:ContinuousIntegrationBuild=true \
     -p:Version="${version}" \
@@ -104,10 +189,14 @@ pack_nuget_project() {
 publish_native_host() {
   local output_dir="$1"
   log "Publishing native host"
+  rm -rf "${output_dir}"
+  mkdir -p "${output_dir}"
   dotnet publish XivIpc.NativeHost/XivIpc.NativeHost.csproj \
     -c Release \
+    -f net9.0 \
     -r linux-x64 \
-    --self-contained false \
+    --self-contained true \
+    -p:PublishSingleFile=true \
     -o "${output_dir}"
 }
 
@@ -121,21 +210,20 @@ archive_native_host() {
 publish_shim_flavor() {
   local abi_flavor="$1"
   local output_dir="$2"
-  log "Publishing TinyIpc shim for ${abi_flavor}"
+  log "Publishing TinyIpc shim for ABI flavor ${abi_flavor}"
+  rm -rf "${output_dir}"
+  mkdir -p "${output_dir}"
   dotnet publish TinyIpc.Shim/TinyIpc.Shim.csproj \
     -c Release \
+    -f net9.0 \
     -o "${output_dir}" \
     -p:ContinuousIntegrationBuild=true \
     -p:PublishSingleFile=false \
     -p:PublishTrimmed=false \
-    -p:RuntimeIdentifier="${abi_flavor}"
+    -p:TinyIpcAbiFlavor="${abi_flavor}"
 
-  local native_host_dir="${output_dir}/XivIpc.NativeHost"
-  dotnet publish XivIpc.NativeHost/XivIpc.NativeHost.csproj \
-    -c Release \
-    -r "${abi_flavor}" \
-    --self-contained false \
-    -o "${native_host_dir}"
+  [[ -f "${output_dir}/TinyIpc.dll" ]] || die "Missing ${output_dir}/TinyIpc.dll"
+  [[ -f "${output_dir}/XivIpc.dll" ]] || die "Missing ${output_dir}/XivIpc.dll"
 }
 
 parse_github_repo_spec() {
@@ -158,6 +246,7 @@ fetch_github_file() {
   local url="https://api.github.com/repos/${owner_repo}/contents/${path}?ref=${ref}"
 
   mkdir -p "$(dirname "${output_file}")"
+
   if [[ -n "${token}" ]]; then
     curl -fsSL \
       -H "Authorization: Bearer ${token}" \
@@ -177,15 +266,21 @@ fetch_manifest_for_target() {
   local source_value="$2"
   local output_file="$3"
 
+  mkdir -p "$(dirname "${output_file}")"
   case "${source_kind}" in
+    local-pluginmaster)
+      [[ -f "${source_value}" ]] || die "Local pluginmaster not found: ${source_value}"
+      cp -f "${source_value}" "${output_file}"
+      ;;
     github-private-pluginmaster)
-      local parsed owner_repo manifest_path manifest_ref
+      local parsed owner_repo manifest_path manifest_ref token
       mapfile -t parsed < <(parse_github_repo_spec "${source_value}")
       owner_repo="${parsed[0]}"
       manifest_path="${parsed[1]}"
       manifest_ref="${parsed[2]}"
-      [[ -n "${BARDTOOLBOX_GH_TOKEN:-}" ]] || die "BARDTOOLBOX_GH_TOKEN must be set to fetch ${owner_repo}/${manifest_path}"
-      fetch_github_file "${owner_repo}" "${manifest_path}" "${manifest_ref}" "${output_file}" "${BARDTOOLBOX_GH_TOKEN}"
+      token="${BARDTOOLBOX_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+      [[ -n "${token}" ]] || die "BARDTOOLBOX_GH_TOKEN (or GH_TOKEN/GITHUB_TOKEN) must be set to fetch ${owner_repo}/${manifest_path}"
+      fetch_github_file "${owner_repo}" "${manifest_path}" "${manifest_ref}" "${output_file}" "${token}"
       ;;
     url-pluginmaster)
       curl -fsSL "${source_value}" -o "${output_file}"
@@ -201,7 +296,7 @@ extract_plugin_entry() {
   local plugin_name="$2"
   jq --arg pluginName "${plugin_name}" '
     if type == "array" then
-      map(select((.InternalName // .Name // "") == $pluginName))[0]
+      first(.[] | select((.Name? == $pluginName) or (.InternalName? == $pluginName)))
     else
       .
     end
@@ -213,31 +308,73 @@ get_upstream_version() {
   jq -r '.AssemblyVersion // .Version // .VersionString // empty' "${entry_file}"
 }
 
-get_download_link_install() {
-  local manifest_file="$1"
-  local plugin_name="$2"
-  jq -r --arg pluginName "${plugin_name}" '
-    if type == "array" then
-      map(select((.InternalName // .Name // "") == $pluginName))[0].DownloadLinkInstall // empty
-    else
-      .DownloadLinkInstall // empty
-    end
-  ' "${manifest_file}"
+parse_download_url_parts() {
+  local url="$1"
+  local without_scheme="${url#*://}"
+  local path="/${without_scheme#*/}"
+  printf '%s\n' "${path}"
+}
+
+find_local_payload_file() {
+  local local_repo_dir="$1"
+  local download_url="$2"
+  local asset_name="${download_url##*/}"
+  local relative_path
+  relative_path="$(parse_download_url_parts "${download_url}")"
+
+  local candidates=(
+    "${local_repo_dir}/${relative_path#/}"
+    "${local_repo_dir}/${asset_name}"
+    "${local_repo_dir}/plugins/${asset_name%.*}/latest.zip"
+    "${local_repo_dir}/plugins/${asset_name}"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+get_download_link_install_from_entry() {
+  local entry_file="$1"
+  jq -r '.DownloadLinkInstall // empty' "${entry_file}"
 }
 
 download_plugin_payload_for_release() {
   local source_kind="$1"
   local download_url="$2"
   local output_file="$3"
+  local local_source_kind="${4:-}"
+  local local_source_value="${5:-}"
   mkdir -p "$(dirname "${output_file}")"
 
-  case "${source_kind}" in
-    github-private-pluginmaster)
-      [[ -n "${BARDTOOLBOX_GH_TOKEN:-}" ]] || die "BARDTOOLBOX_GH_TOKEN must be set to download private release asset ${download_url}"
-      curl -fsSL -H "Authorization: Bearer ${BARDTOOLBOX_GH_TOKEN}" "${download_url}" -o "${output_file}"
+  case "${local_source_kind}" in
+    local-repo)
+      local candidate
+      candidate="$(find_local_payload_file "${local_source_value}" "${download_url}")" || die "Could not locate local plugin payload for ${download_url} under ${local_source_value}"
+      cp -f "${candidate}" "${output_file}"
+      ;;
+    local-publish-dir)
+      [[ -d "${local_source_value}" ]] || die "Local publish dir not found: ${local_source_value}"
+      printf '%s\n' "${local_source_value}"
+      return 0
       ;;
     *)
-      curl -fsSL "${download_url}" -o "${output_file}"
+      case "${source_kind}" in
+        github-private-pluginmaster|github-private-release)
+          local token="${BARDTOOLBOX_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+          [[ -n "${token}" ]] || die "BARDTOOLBOX_GH_TOKEN (or GH_TOKEN/GITHUB_TOKEN) must be set to download private release asset ${download_url}"
+          curl -fsSL -H "Authorization: Bearer ${token}" "${download_url}" -o "${output_file}"
+          ;;
+        *)
+          curl -fsSL "${download_url}" -o "${output_file}"
+          ;;
+      esac
       ;;
   esac
 }
@@ -288,10 +425,21 @@ sort_pluginmaster_file() {
 install_runtime_files() {
   local plugin_root="$1"
   local shim_dir="$2"
-  local runtime_dir="${plugin_root}/x64/linux"
 
-  mkdir -p "${runtime_dir}"
-  cp -a "${shim_dir}/." "${runtime_dir}/"
+  while IFS= read -r -d '' artifact; do
+    local filename
+    local replaced_any=0
+    filename="$(basename "$artifact")"
+
+    while IFS= read -r -d '' target; do
+      cp -f "${artifact}" "${target}"
+      replaced_any=1
+    done < <(find "${plugin_root}" -type f -name "${filename}" -print0)
+
+    if [[ "${replaced_any}" -eq 0 ]]; then
+      cp -f "${artifact}" "${plugin_root}/${filename}"
+    fi
+  done < <(find "${shim_dir}" -maxdepth 1 -type f     \( -name '*.dll' -o -name '*.deps.json' -o -name '*.runtimeconfig.json' \) -print0)
 }
 
 emit_plugin_folder_manifest() {

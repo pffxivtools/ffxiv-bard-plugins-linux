@@ -98,7 +98,7 @@ pack_semver_artifacts() {
 
   local target
   while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value default_abi_flavor _local_source_kind _local_source_value <<<"${target}"
+    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value local_source_kind local_source_value default_abi_flavor <<<"${target}"
 
     local abi_flavor
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
@@ -108,7 +108,6 @@ pack_semver_artifacts() {
 
     local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
     local original_entry_file="${WORK_DIR}/${asset_slug}.original-entry.json"
-    local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
     local extract_dir="${WORK_DIR}/${asset_slug}.extract"
     local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
     local release_url
@@ -126,13 +125,17 @@ pack_semver_artifacts() {
     local asset_path="${ASSETS_DIR}/${asset_name}"
 
     local download_url
-    download_url="$(get_download_link_install "${manifest_file}" "${plugin_name}")"
+    download_url="$(get_download_link_install_from_entry "${original_entry_file}")"
     [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Missing DownloadLinkInstall for ${plugin_name}"
 
-    download_plugin_payload_for_release "${manifest_source_kind}" "${download_url}" "${upstream_zip}"
-
     local plugin_root
-    plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
+    if [[ "${local_source_kind}" == "local-publish-dir" ]]; then
+      plugin_root="$(prepare_plugin_tree_from_dir "${local_source_value}" "${extract_dir}")"
+    else
+      local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
+      download_plugin_payload_for_release "${manifest_source_kind}" "${download_url}" "${upstream_zip}" "${local_source_kind}" "${local_source_value}"
+      plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
+    fi
     install_runtime_files "${plugin_root}" "${shim_dir}"
     emit_plugin_folder_manifest "${original_entry_file}" "${asset_slug}" "${plugin_root}"
     create_plugin_zip "${plugin_root}" "${asset_path}"
@@ -174,7 +177,7 @@ pack_plugin_release_artifacts() {
 
   local target
   while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value default_abi_flavor _local_source_kind _local_source_value <<<"${target}"
+    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value local_source_kind local_source_value default_abi_flavor <<<"${target}"
 
     local abi_flavor
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
@@ -195,7 +198,6 @@ pack_plugin_release_artifacts() {
     upstream_zip_url="$(jq -r '.DownloadLinkInstall // empty' "${entry_file}")"
     [[ -n "${upstream_zip_url}" ]] || die "Missing DownloadLinkInstall for ${plugin_name}"
 
-    local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
     local extract_dir="${WORK_DIR}/${asset_slug}.extract"
     local asset_name="${asset_slug}-${upstream_version}.zip"
     local asset_path="${ASSETS_DIR}/${asset_name}"
@@ -204,10 +206,14 @@ pack_plugin_release_artifacts() {
     local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
     local release_url
 
-    download_plugin_payload_for_release "${manifest_source_kind}" "${upstream_zip_url}" "${upstream_zip}"
-
     local plugin_root
-    plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
+    if [[ "${local_source_kind}" == "local-publish-dir" ]]; then
+      plugin_root="$(prepare_plugin_tree_from_dir "${local_source_value}" "${extract_dir}")"
+    else
+      local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
+      download_plugin_payload_for_release "${manifest_source_kind}" "${upstream_zip_url}" "${upstream_zip}" "${local_source_kind}" "${local_source_value}"
+      plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
+    fi
     install_runtime_files "${plugin_root}" "${shim_dir}"
     emit_plugin_folder_manifest "${entry_file}" "${asset_slug}" "${plugin_root}"
     create_plugin_zip "${plugin_root}" "${asset_path}"

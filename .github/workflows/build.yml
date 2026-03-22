@@ -68,4 +68,7 @@ jobs:
           --filter "FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests"
 
       - name: Validate publish scripts
-        run: bash -n scripts/release-common.sh scripts/publish-local.sh scripts/publish-release.sh
+        run: bash -n scripts/release-common.sh scripts/publish-local.sh scripts/publish-release.sh scripts/test-publish-fixtures.sh
+
+      - name: Run fixture publish script tests
+        run: bash scripts/test-publish-fixtures.sh
