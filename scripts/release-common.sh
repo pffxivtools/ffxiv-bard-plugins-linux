@@ -36,6 +36,7 @@ ensure_common_prereqs() {
   require_cmd find
   require_cmd python3
   require_cmd curl
+  require_cmd base64
 }
 
 ensure_release_prereqs() {
@@ -154,6 +155,11 @@ download_file() {
   curl -fsSL --retry 3 --retry-delay 1 -o "${output_file}" "${url}"
 }
 
+gh_api_json() {
+  local endpoint="$1"
+  GH_TOKEN="$(resolve_github_token)" gh api "${endpoint}"
+}
+
 fetch_github_file_with_gh() {
   local owner_repo="$1"
   local path="$2"
@@ -162,11 +168,19 @@ fetch_github_file_with_gh() {
 
   mkdir -p "$(dirname "${output_file}")"
 
-  GH_TOKEN="$(resolve_github_token)" \
-    gh api \
-      -H "Accept: application/vnd.github.raw+json" \
-      "repos/${owner_repo}/contents/${path}?ref=${ref}" \
-      > "${output_file}"
+  local sha
+  sha="$(
+    gh_api_json "repos/${owner_repo}/contents/${path}?ref=${ref}" \
+      | jq -r '.sha // empty'
+  )"
+  [[ -n "${sha}" && "${sha}" != "null" ]] || die "Could not resolve blob SHA for ${owner_repo}/${path}@${ref}"
+
+  gh_api_json "repos/${owner_repo}/git/blobs/${sha}" \
+    | jq -r '.content // empty' \
+    | tr -d '\n' \
+    | base64 -d > "${output_file}"
+
+  [[ -s "${output_file}" ]] || die "Fetched empty GitHub file for ${owner_repo}/${path}@${ref}"
 }
 
 download_github_release_asset_with_gh() {
@@ -253,7 +267,19 @@ extract_plugin_entry() {
 
   jq --arg plugin_name "${plugin_name}" '
     if type == "array" then
-      first(.[] | select((.Name? == $plugin_name) or (.InternalName? == $plugin_name)))
+      first(
+        .[]
+        | select(
+            (.Name? == $plugin_name) or
+            (.InternalName? == $plugin_name)
+          )
+      )
+    elif type == "object" then
+      if (.Name? == $plugin_name) or (.InternalName? == $plugin_name) then
+        .
+      else
+        empty
+      end
     else
       empty
     end
