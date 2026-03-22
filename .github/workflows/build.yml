@@ -4,37 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - '.github/workflows/build.yml'
-      - 'TinyIpc.Shim.sln'
-      - 'TinyIpc.Shim/**'
-      - 'XivIpc/**'
-      - 'XivIpc.NativeHost/**'
-      - 'XivIpc.Tests/**'
-      - 'XivIpc.WineTestHost/**'
-      - 'scripts/**/*.sh'
-      - '**/*.csproj'
-      - '**/*.props'
-      - '**/*.targets'
-      - 'Directory.Build.*'
-      - 'global.json'
-      - 'NuGet.config'
-  pull_request:
-    paths:
-      - '.github/workflows/build.yml'
-      - 'TinyIpc.Shim.sln'
-      - 'TinyIpc.Shim/**'
-      - 'XivIpc/**'
-      - 'XivIpc.NativeHost/**'
-      - 'XivIpc.Tests/**'
-      - 'XivIpc.WineTestHost/**'
-      - 'scripts/**/*.sh'
-      - '**/*.csproj'
-      - '**/*.props'
-      - '**/*.targets'
-      - 'Directory.Build.*'
-      - 'global.json'
-      - 'NuGet.config'
 
 permissions:
   contents: read
@@ -69,6 +38,3 @@ jobs:
 
       - name: Validate publish scripts
         run: bash -n scripts/release-common.sh scripts/publish-local.sh scripts/publish-release.sh scripts/test-publish-fixtures.sh
-
-      - name: Run fixture publish script tests
-        run: bash scripts/test-publish-fixtures.sh

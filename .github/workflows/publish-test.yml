@@ -4,21 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - '.github/workflows/publish-plugins.yml'
-      - '.github/workflows/publish-semver.yml'
-      - '.github/workflows/publish-test.yml'
-      - 'scripts/**/*.sh'
-      - 'TinyIpc.Shim.sln'
-      - 'TinyIpc.Shim/**'
-      - 'XivIpc/**'
-      - 'XivIpc.NativeHost/**'
-      - '**/*.csproj'
-      - '**/*.props'
-      - '**/*.targets'
-      - 'Directory.Build.*'
-      - 'global.json'
-      - 'NuGet.config'
   workflow_dispatch:
 
 permissions:
