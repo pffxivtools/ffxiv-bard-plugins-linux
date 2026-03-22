@@ -525,7 +525,6 @@ pack_nuget_project() {
 
   dotnet pack "${project_path}" \
     -c Release \
-    -f "${PUBLISH_TFM}" \
     -o "${output_dir}" \
     -p:Version="${package_version}" \
     -p:PackageVersion="${package_version}" \
