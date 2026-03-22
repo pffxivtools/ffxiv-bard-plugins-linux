@@ -247,7 +247,7 @@ fetch_manifest_for_target() {
   case "${source_kind}" in
     local-bardtoolbox)
       local repo_dir manifest_file
-      repo_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and publish/BardToolbox/"
+      repo_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and dist/"
       manifest_file="${repo_dir}/pluginmaster.json"
       [[ -f "${manifest_file}" ]] || die "BardToolbox local repo not found. Expected ${repo_dir}/pluginmaster.json"
       cp -f "${manifest_file}" "${output_file}"
@@ -299,7 +299,7 @@ resolve_bardtoolbox_local_dir() {
 
   local c
   for c in "${candidates[@]}"; do
-    if [[ -f "${c}/pluginmaster.json" && -d "${c}/publish/BardToolbox" ]]; then
+    if [[ -f "${c}/pluginmaster.json" && -d "${c}/dist" ]]; then
       printf '%s\n' "${c}"
       return 0
     fi
@@ -418,8 +418,6 @@ install_runtime_files() {
   [[ -d "${dist_dir}" ]] || die "Missing dist directory: ${dist_dir}"
 
   mkdir -p "${plugin_root}"
-
-  find "${plugin_root}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
   cp -a "${dist_dir}/." "${plugin_root}/"
 }

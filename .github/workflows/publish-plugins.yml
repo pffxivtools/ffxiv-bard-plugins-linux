@@ -60,11 +60,6 @@ jobs:
           repositories: |
             BardToolbox
 
-
-      - name: Verify gh is available
-        shell: bash
-        run: gh --version
-
       - name: Generate plugin assets and manifest
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -73,30 +68,27 @@ jobs:
           BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
         run: bash scripts/publish-release.sh
 
-      - name: Publish GitHub releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release matrix
+        id: releases
         shell: bash
         run: |
-          force="$(printf '%s' "${FORCE_REPUBLISH}" | tr '[:upper:]' '[:lower:]')"
+          set -Eeuo pipefail
+
+          jq -c '{include: [.releases[] | {
+            tag: .tag,
+            title: .title,
+            notes_file: ("dist/github/metadata/" + .tag + ".notes.md"),
+            asset_glob: (.assets | join("\n"))
+          }]}' dist/github/metadata/releases.json > releases-matrix.json
+
+          jq -r '.releases[] | .notes' dist/github/metadata/releases.json >/dev/null
+
           jq -c '.releases[]' dist/github/metadata/releases.json | while IFS= read -r release; do
             tag="$(jq -r '.tag' <<<"${release}")"
-            title="$(jq -r '.title' <<<"${release}")"
-            notes_file="$(mktemp)"
-            jq -r '.notes' <<<"${release}" > "${notes_file}"
-            mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
-
-            if gh release view "${tag}" >/dev/null 2>&1; then
-              if [[ "${force}" == "true" ]]; then
-                gh release upload "${tag}" "${assets[@]}" --clobber
-                gh release edit "${tag}" --title "${title}" --notes-file "${notes_file}"
-              else
-                echo "Release ${tag} already exists; skipping upload"
-              fi
-            else
-              gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}" --prerelease --latest=false
-            fi
+            jq -r '.notes' <<<"${release}" > "dist/github/metadata/${tag}.notes.md"
           done
+
+          echo "matrix=$(cat releases-matrix.json)" >> "$GITHUB_OUTPUT"
 
       - name: Commit updated pluginmaster.json
         shell: bash
@@ -111,3 +103,29 @@ jobs:
           git add pluginmaster.json
           git commit -m "Update pluginmaster.json"
           git push
+
+  publish_releases:
+    name: Publish ${{ matrix.tag }}
+    needs: publish
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.publish.outputs.matrix) }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.tag }}
+          name: ${{ matrix.title }}
+          body_path: ${{ matrix.notes_file }}
+          generate_release_notes: true
+          files: ${{ matrix.asset_glob }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}

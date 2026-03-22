@@ -52,7 +52,6 @@ jobs:
           repositories: |
             BardToolbox
 
-
       - name: Generate release assets and manifest
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -82,60 +81,45 @@ jobs:
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
 
-      - name: Publish GitHub release
+      - name: Prepare release notes
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SOURCE_REF: ${{ env.SOURCE_REF }}
-        shell: bash
         run: |
           set -Eeuo pipefail
 
           release="$(jq -c '.releases[0]' dist/github/metadata/releases.json)"
-          tag="$(jq -r '.tag' <<<"${release}")"
           title="$(jq -r '.title' <<<"${release}")"
 
-          custom_notes_file="$(mktemp)"
-          combined_notes_file="$(mktemp)"
+          jq -r '.notes' <<<"${release}" > dist/github/metadata/custom-notes.md
 
-          jq -r '.notes' <<<"${release}" > "${custom_notes_file}"
-          mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
-
-          if [[ "${#assets[@]}" -eq 0 ]]; then
-            echo "No GitHub release assets were generated"
-            exit 1
-          fi
-
-          generate_notes() {
+          {
+            cat dist/github/metadata/custom-notes.md
+            echo
+            echo "---"
+            echo
             gh api \
               -X POST \
               -H "Accept: application/vnd.github+json" \
               "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-              -f tag_name="${tag}" \
-              -f target_commitish="${tag}" \
+              -f tag_name="${RELEASE_VERSION}" \
+              -f target_commitish="${GITHUB_SHA}" \
               --jq '.body'
-          }
+          } > dist/github/metadata/release-notes.md
 
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            generated_notes="$(generate_notes)"
+          echo "RELEASE_TITLE=${title}" >> "$GITHUB_ENV"
 
-            {
-              cat "${custom_notes_file}"
-              echo
-              echo "---"
-              echo
-              printf '%s\n' "${generated_notes}"
-            } > "${combined_notes_file}"
-
-            gh release upload "${tag}" "${assets[@]}" --clobber
-            gh release edit "${tag}" --title "${title}" --notes-file "${combined_notes_file}"
-          else
-            gh release create "${tag}" "${assets[@]}" \
-              --title "${title}" \
-              --generate-notes \
-              --notes "$(cat "${custom_notes_file}")" \
-              --latest
-          fi
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: ${{ env.RELEASE_TITLE }}
+          body_path: dist/github/metadata/release-notes.md
+          generate_release_notes: true
+          files: |
+            dist/github/assets/*
+          make_latest: true
 
       - name: Commit pluginmaster.json to default branch
         shell: bash

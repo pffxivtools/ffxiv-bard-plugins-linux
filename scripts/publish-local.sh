@@ -115,9 +115,10 @@ main() {
     local plugin_root
     if [[ "${source_kind}" == "local-bardtoolbox" ]]; then
       local local_repo_dir
-      local_repo_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and publish/BardToolbox/"
+      local_repo_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and dist/"
       plugin_root="${WORK_DIR}/${asset_slug}.root"
-      copy_tree_contents "${local_repo_dir}/publish/BardToolbox" "${plugin_root}"
+      copy_tree_contents "${local_repo_dir}/dist" "${plugin_root}"
+      cp ${original_entry_file} "${plugin_root}/BardToolbox.json"
     else
       local download_url upstream_zip extract_dir
       download_url="$(jq -r '.DownloadLinkInstall // empty' "${original_entry_file}")"
