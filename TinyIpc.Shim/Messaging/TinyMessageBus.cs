@@ -511,6 +511,7 @@ internal interface IShimTinyMessageBus : IDisposable, IAsyncDisposable
 internal sealed class XivMessageBusAdapter : IShimTinyMessageBus
 {
     private readonly IXivMessageBus _inner;
+    private int _disposeSignaled;
 
     public XivMessageBusAdapter(IXivMessageBus inner)
     {
@@ -524,12 +525,18 @@ internal sealed class XivMessageBusAdapter : IShimTinyMessageBus
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposeSignaled, 1) != 0)
+            return;
+
         _inner.MessageReceived -= OnInnerMessageReceived;
         _inner.Dispose();
     }
 
     public ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeSignaled, 1) != 0)
+            return ValueTask.CompletedTask;
+
         _inner.MessageReceived -= OnInnerMessageReceived;
         return _inner.DisposeAsync();
     }

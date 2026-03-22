@@ -42,21 +42,30 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Create GitHub App token for BardToolbox
+        id: bardtoolbox_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BARDTOOLBOX_APP_ID }}
+          private-key: ${{ secrets.BARDTOOLBOX_APP_PRIVATE_KEY }}
+          owner: pffxivtools
+          repositories: |
+            BardToolbox
+
       - name: Generate release assets and manifest
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PUBLISH_SCHEME: semver
+          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
         run: bash scripts/publish-release.sh
 
       - name: NuGet login (OIDC → temp API key)
-        if: github.event_name == 'push'
         uses: NuGet/login@v1
         id: login
         with:
           user: ${{ secrets.NUGET_USER }}
 
       - name: Publish NuGet packages
-        if: github.event_name == 'push'
         shell: bash
         run: |
           shopt -s nullglob
@@ -74,20 +83,56 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ env.SOURCE_REF }}
         shell: bash
         run: |
+          set -Eeuo pipefail
+
           release="$(jq -c '.releases[0]' dist/github/metadata/releases.json)"
           tag="$(jq -r '.tag' <<<"${release}")"
           title="$(jq -r '.title' <<<"${release}")"
-          notes_file="$(mktemp)"
-          jq -r '.notes' <<<"${release}" > "${notes_file}"
+
+          custom_notes_file="$(mktemp)"
+          combined_notes_file="$(mktemp)"
+
+          jq -r '.notes' <<<"${release}" > "${custom_notes_file}"
           mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
 
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "No GitHub release assets were generated"
+            exit 1
+          fi
+
+          generate_notes() {
+            gh api \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${tag}" \
+              -f target_commitish="${tag}" \
+              --jq '.body'
+          }
+
           if gh release view "${tag}" >/dev/null 2>&1; then
+            generated_notes="$(generate_notes)"
+
+            {
+              cat "${custom_notes_file}"
+              echo
+              echo "---"
+              echo
+              printf '%s\n' "${generated_notes}"
+            } > "${combined_notes_file}"
+
             gh release upload "${tag}" "${assets[@]}" --clobber
-            gh release edit "${tag}" --title "${title}" --notes-file "${notes_file}"
+            gh release edit "${tag}" --title "${title}" --notes-file "${combined_notes_file}"
           else
-            gh release create "${tag}" "${assets[@]}" --title "${title}" --notes-file "${notes_file}" --latest
+            gh release create "${tag}" "${assets[@]}" \
+              --title "${title}" \
+              --generate-notes \
+              --notes "$(cat "${custom_notes_file}")" \
+              --latest
           fi
 
       - name: Commit pluginmaster.json to default branch

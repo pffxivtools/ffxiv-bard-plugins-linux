@@ -27,6 +27,7 @@ reset_output_dirs() {
 ensure_release_prereqs() {
   ensure_common_prereqs
   require_cmd mktemp
+  require_cmd zip
 }
 
 semver_release_notes() {
@@ -46,10 +47,10 @@ semver_release_notes() {
 plugin_release_notes() {
   local plugin_name="$1"
   local upstream_version="$2"
-  local manifest_url="$3"
+  local manifest_descriptor="$3"
 
-  printf 'Republished %s %s with TinyIpc shim replacement.\n\nUpstream manifest:\n%s\n' \
-    "${plugin_name}" "${upstream_version}" "${manifest_url}"
+  printf 'Republished %s %s with TinyIpc shim replacement.\n\nUpstream manifest source:\n%s\n' \
+    "${plugin_name}" "${upstream_version}" "${manifest_descriptor}"
 }
 
 emit_metadata() {
@@ -63,6 +64,16 @@ emit_metadata() {
       pluginmasterPath: $pluginmasterPath,
       releases: $releases[0]
     }' > "${output_file}"
+}
+
+prepare_plugin_tree_from_zip() {
+  local zip_path="$1"
+  local extract_dir="$2"
+
+  rm -rf "${extract_dir}"
+  mkdir -p "${extract_dir}"
+  extract_zip_normalized "${zip_path}" "${extract_dir}"
+  resolve_extracted_root "${extract_dir}"
 }
 
 pack_semver_artifacts() {
@@ -87,7 +98,7 @@ pack_semver_artifacts() {
 
   local target
   while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name pluginmaster_url default_abi_flavor <<<"${target}"
+    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value default_abi_flavor _local_source_kind _local_source_value <<<"${target}"
 
     local abi_flavor
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
@@ -102,8 +113,8 @@ pack_semver_artifacts() {
     local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
     local release_url
 
-    log "Fetching upstream manifest: ${pluginmaster_url}"
-    download_file "${pluginmaster_url}" "${manifest_file}"
+    log "Fetching upstream manifest for ${plugin_name}"
+    fetch_manifest_for_target "${manifest_source_kind}" "${manifest_source_value}" "${manifest_file}"
     extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${original_entry_file}"
     jq -e '.' "${original_entry_file}" >/dev/null 2>&1 || die "Could not find manifest entry for ${plugin_name}"
 
@@ -118,14 +129,12 @@ pack_semver_artifacts() {
     download_url="$(get_download_link_install "${manifest_file}" "${plugin_name}")"
     [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Missing DownloadLinkInstall for ${plugin_name}"
 
-    download_file "${download_url}" "${upstream_zip}"
-    rm -rf "${extract_dir}"
-    mkdir -p "${extract_dir}"
-    extract_zip_normalized "${upstream_zip}" "${extract_dir}"
+    download_plugin_payload_for_release "${manifest_source_kind}" "${download_url}" "${upstream_zip}"
 
     local plugin_root
-    plugin_root="$(resolve_extracted_root "${extract_dir}")"
+    plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
     install_runtime_files "${plugin_root}" "${shim_dir}"
+    emit_plugin_folder_manifest "${original_entry_file}" "${asset_slug}" "${plugin_root}"
     create_plugin_zip "${plugin_root}" "${asset_path}"
 
     release_url="$(github_release_asset_url "${GITHUB_REPOSITORY}" "${semver_tag}" "${asset_name}")"
@@ -148,7 +157,6 @@ pack_semver_artifacts() {
     --arg tag "${semver_tag}" \
     --arg title "Release ${release_version}" \
     --rawfile notes "${notes_file}" \
-    --arg nativeHost "${native_host_asset}" \
     --slurpfile assets <(find "${ASSETS_DIR}" -maxdepth 1 -type f | sort | jq -R . | jq -s .) \
     '{
       tag: $tag,
@@ -166,15 +174,17 @@ pack_plugin_release_artifacts() {
 
   local target
   while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name pluginmaster_url default_abi_flavor <<<"${target}"
+    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value default_abi_flavor _local_source_kind _local_source_value <<<"${target}"
 
     local abi_flavor
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
     local shim_dir="${WORK_DIR}/${asset_slug}.shim"
     publish_shim_flavor "${abi_flavor}" "${shim_dir}"
 
+    local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
     local entry_file="${WORK_DIR}/${asset_slug}.entry.json"
-    fetch_upstream_entry "${pluginmaster_url}" "${plugin_name}" > "${entry_file}"
+    fetch_manifest_for_target "${manifest_source_kind}" "${manifest_source_value}" "${manifest_file}"
+    extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${entry_file}"
     jq -e '.' "${entry_file}" >/dev/null 2>&1 || die "Could not find plugin entry for ${plugin_name}"
 
     local upstream_version
@@ -194,21 +204,19 @@ pack_plugin_release_artifacts() {
     local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
     local release_url
 
-    download_file "${upstream_zip_url}" "${upstream_zip}"
-    rm -rf "${extract_dir}"
-    mkdir -p "${extract_dir}"
-    extract_zip_normalized "${upstream_zip}" "${extract_dir}"
+    download_plugin_payload_for_release "${manifest_source_kind}" "${upstream_zip_url}" "${upstream_zip}"
 
     local plugin_root
-    plugin_root="$(resolve_extracted_root "${extract_dir}")"
+    plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
     install_runtime_files "${plugin_root}" "${shim_dir}"
+    emit_plugin_folder_manifest "${entry_file}" "${asset_slug}" "${plugin_root}"
     create_plugin_zip "${plugin_root}" "${asset_path}"
 
     release_url="$(github_release_asset_url "${GITHUB_REPOSITORY}" "${tag}" "${asset_name}")"
     build_republished_entry "${entry_file}" "${release_url}" "${republished_entry}"
     merge_plugin_entry "${PLUGINMASTER_OUTPUT}" "${republished_entry}"
 
-    plugin_release_notes "${plugin_name}" "${upstream_version}" "${pluginmaster_url}" > "${notes_file}"
+    plugin_release_notes "${plugin_name}" "${upstream_version}" "${manifest_source_kind}:${manifest_source_value}" > "${notes_file}"
 
     jq -n \
       --arg tag "${tag}" \

@@ -49,10 +49,26 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Create GitHub App token for BardToolbox
+        id: bardtoolbox_app_token
+        if: ${{ env.TOOL_SELECTION == 'all' || env.TOOL_SELECTION == 'BardToolbox' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BARDTOOLBOX_APP_ID }}
+          private-key: ${{ secrets.BARDTOOLBOX_APP_PRIVATE_KEY }}
+          owner: pffxivtools
+          repositories: |
+            BardToolbox
+
+      - name: Verify gh is available
+        shell: bash
+        run: gh --version
+
       - name: Generate plugin assets and manifest
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PUBLISH_SCHEME: plugins
+          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
         run: bash scripts/publish-release.sh
 
       - name: Publish GitHub releases

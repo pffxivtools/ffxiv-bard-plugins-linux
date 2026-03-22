@@ -1,0 +1,111 @@
+name: Publish Tooling Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-plugins.yml'
+      - '.github/workflows/publish-semver.yml'
+      - '.github/workflows/publish-test.yml'
+      - 'scripts/**/*.sh'
+      - 'TinyIpc.Shim.sln'
+      - 'TinyIpc.Shim/**'
+      - 'XivIpc/**'
+      - 'XivIpc.NativeHost/**'
+      - '**/*.csproj'
+      - '**/*.props'
+      - '**/*.targets'
+      - 'Directory.Build.*'
+      - 'global.json'
+      - 'NuGet.config'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate publish scripts (no release)
+    runs-on: ubuntu-latest
+
+    env:
+      DOTNET_NOLOGO: true
+      TEST_RELEASE_VERSION: 0.0.0-ci.${{ github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Create GitHub App token for BardToolbox
+        id: bardtoolbox_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BARDTOOLBOX_APP_ID }}
+          private-key: ${{ secrets.BARDTOOLBOX_APP_PRIVATE_KEY }}
+          owner: pffxivtools
+          repositories: |
+            BardToolbox
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          bash -n scripts/release-common.sh scripts/publish-local.sh scripts/publish-release.sh
+
+      - name: Generate plugin publish artifacts
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SCHEME: plugins
+          TOOL_SELECTION: BardToolbox
+          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
+        shell: bash
+        run: |
+          bash scripts/publish-release.sh
+          test -f dist/github/pluginmaster.json
+          test -f dist/github/metadata/releases.json
+          jq -e '.releases | length > 0' dist/github/metadata/releases.json >/dev/null
+          jq -e 'map(select(.InternalName == "BardToolbox")) | length == 1' dist/github/pluginmaster.json >/dev/null
+
+      - name: Summarize plugin publish results
+        shell: bash
+        run: |
+          echo "Plugin publish validation completed"
+          jq -r '.releases[] | "- \(.tag): \(.title)"' dist/github/metadata/releases.json
+          find dist/github -maxdepth 2 -type f | sort
+
+      - name: Generate semver publish artifacts
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SCHEME: semver
+          RELEASE_VERSION: ${{ env.TEST_RELEASE_VERSION }}
+          TOOL_SELECTION: BardToolbox
+          BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
+        shell: bash
+        run: |
+          bash scripts/publish-release.sh
+          test -f dist/github/pluginmaster.json
+          test -f dist/github/metadata/releases.json
+          compgen -G 'dist/github/assets/*.nupkg' >/dev/null
+          compgen -G 'dist/github/assets/*.tar.gz' >/dev/null
+          jq -e '.releases | length == 1' dist/github/metadata/releases.json >/dev/null
+          jq -e '.releases[0].tag == env.TEST_RELEASE_VERSION' dist/github/metadata/releases.json >/dev/null
+          jq -e '.releases[0].assets | length >= 3' dist/github/metadata/releases.json >/dev/null
+          jq -e 'map(select(.InternalName == "BardToolbox")) | length == 1' dist/github/pluginmaster.json >/dev/null
+
+      - name: Summarize semver publish results
+        shell: bash
+        run: |
+          echo "Semver publish validation completed"
+          jq -r '.releases[] | "- \(.tag): \(.title)"' dist/github/metadata/releases.json
+          find dist/github -maxdepth 2 -type f | sort
