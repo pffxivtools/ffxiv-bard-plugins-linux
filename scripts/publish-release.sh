@@ -5,264 +5,141 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# shellcheck source=./release-common.sh
 source "${SCRIPT_DIR}/release-common.sh"
-
-export PUBLISH_CONTEXT=release
 
 : "${PUBLISH_SCHEME:?PUBLISH_SCHEME must be set to semver or plugins}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
-: "${TOOL_SELECTION:=all}"
 
-DIST_ROOT="${REPO_ROOT}/dist/github"
-ASSETS_DIR="${DIST_ROOT}/assets"
-WORK_DIR="${DIST_ROOT}/work"
-METADATA_DIR="${DIST_ROOT}/metadata"
-PLUGINMASTER_OUTPUT="${REPO_ROOT}/pluginmaster.json"
-DIST_PLUGINMASTER_COPY="${DIST_ROOT}/pluginmaster.json"
+DIST_DIR="${REPO_ROOT}/dist/github"
+WORK_DIR="${DIST_DIR}/work"
+ASSETS_DIR="${DIST_DIR}/assets"
+METADATA_DIR="${DIST_DIR}/metadata"
+RELEASE_ITEMS_DIR="${METADATA_DIR}/release-items"
+PLUGINMASTER_FILE="${DIST_DIR}/pluginmaster.json"
+ROOT_PLUGINMASTER_FILE="${REPO_ROOT}/pluginmaster.json"
+SHIM_WORK_ROOT="${WORK_DIR}"
+NATIVE_HOST_DIR="${WORK_DIR}/native-host"
 
-reset_output_dirs() {
-  rm -rf "${DIST_ROOT}"
-  mkdir -p "${ASSETS_DIR}" "${WORK_DIR}" "${METADATA_DIR}"
+reset_release_dirs() {
+  rm -rf "${DIST_DIR}"
+  mkdir -p "${WORK_DIR}" "${ASSETS_DIR}" "${METADATA_DIR}" "${RELEASE_ITEMS_DIR}"
+  printf '[]\n' > "${PLUGINMASTER_FILE}"
 }
 
-ensure_release_prereqs() {
-  ensure_common_prereqs
-  require_cmd mktemp
-  require_cmd zip
+release_notes_for_plugin() {
+  local plugin_name="$1" upstream_version="$2"
+  cat <<TXT
+Republished ${plugin_name} with TinyIpc.Shim and XivIpc runtime files.
+
+Upstream version: ${upstream_version:-unknown}
+TXT
 }
 
 semver_release_notes() {
   local version="$1"
-  local upstream_summary_file="$2"
+  cat <<TXT
+Release ${version}
 
-  jq -r --arg version "${version}" '
-    [
-      "Semver release " + $version,
-      "",
-      "Republished plugin inputs:",
-      (.[] | "- " + .pluginName + " " + .upstreamVersion)
-    ] | join("\n")
-  ' "${upstream_summary_file}"
+Includes TinyIpc.Shim and XivIpc packages, native host payload, and republished plugin artifacts.
+TXT
 }
 
-plugin_release_notes() {
-  local plugin_name="$1"
-  local upstream_version="$2"
-  local manifest_descriptor="$3"
-
-  printf 'Republished %s %s with TinyIpc shim replacement.\n\nUpstream manifest source:\n%s\n' \
-    "${plugin_name}" "${upstream_version}" "${manifest_descriptor}"
-}
-
-emit_metadata() {
-  local release_items_dir="$1"
-  local output_file="$2"
-
+build_plugin_tracking_release_item() {
+  local asset_slug="$1" plugin_name="$2" version="$3" asset_path="$4" output_file="$5"
+  local tag="${asset_slug}-${version}"
+  local title="${plugin_name} ${version}"
+  local notes
+  notes="$(release_notes_for_plugin "$plugin_name" "$version")"
   jq -n \
-    --arg pluginmasterPath "${DIST_PLUGINMASTER_COPY}" \
-    --slurpfile releases <(jq -s '.' "${release_items_dir}"/*.json) \
-    '{
-      pluginmasterPath: $pluginmasterPath,
-      releases: $releases[0]
-    }' > "${output_file}"
+    --arg tag "$tag" \
+    --arg title "$title" \
+    --arg notes "$notes" \
+    --arg asset "$asset_path" \
+    '{tag:$tag,title:$title,notes:$notes,assets:[$asset]}' > "$output_file"
 }
 
-prepare_plugin_tree_from_zip() {
-  local zip_path="$1"
-  local extract_dir="$2"
-
-  rm -rf "${extract_dir}"
-  mkdir -p "${extract_dir}"
-  extract_zip_normalized "${zip_path}" "${extract_dir}"
-  resolve_extracted_root "${extract_dir}"
-}
-
-pack_semver_artifacts() {
-  local release_version="$1"
-  local repository_url="https://github.com/${GITHUB_REPOSITORY}"
-  local release_items_dir="${METADATA_DIR}/release-items"
-  local semver_tag="${release_version}"
-  local semver_release_file="${release_items_dir}/semver.json"
-  local upstream_summary_file="${WORK_DIR}/semver.upstream-summary.json"
-  local host_publish_dir="${WORK_DIR}/native-host"
-
-  mkdir -p "${release_items_dir}"
-  printf '[]\n' > "${PLUGINMASTER_OUTPUT}"
-  printf '[]\n' > "${upstream_summary_file}"
-
-  pack_nuget_project "XivIpc/XivIpc.csproj" "${ASSETS_DIR}" "${release_version}" "${repository_url}"
-  pack_nuget_project "TinyIpc.Shim/TinyIpc.Shim.csproj" "${ASSETS_DIR}" "${release_version}" "${repository_url}"
-
-  publish_native_host "${host_publish_dir}"
-  local native_host_asset="${ASSETS_DIR}/XivIpc.NativeHost-linux-x64-${release_version}.tar.gz"
-  archive_native_host "${host_publish_dir}" "${native_host_asset}"
-
-  local target
-  while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value local_source_kind local_source_value default_abi_flavor <<<"${target}"
-
-    local abi_flavor
-    abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
-
-    local shim_dir="${WORK_DIR}/${asset_slug}.shim"
-    publish_shim_flavor "${abi_flavor}" "${shim_dir}"
-
-    local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
-    local original_entry_file="${WORK_DIR}/${asset_slug}.original-entry.json"
-    local extract_dir="${WORK_DIR}/${asset_slug}.extract"
-    local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
-    local release_url
-
-    log "Fetching upstream manifest for ${plugin_name}"
-    fetch_manifest_for_target "${manifest_source_kind}" "${manifest_source_value}" "${manifest_file}"
-    extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${original_entry_file}"
-    jq -e '.' "${original_entry_file}" >/dev/null 2>&1 || die "Could not find manifest entry for ${plugin_name}"
-
-    local upstream_version
-    upstream_version="$(get_upstream_version "${original_entry_file}")"
-    [[ -n "${upstream_version}" ]] || die "Could not determine upstream version for ${plugin_name}"
-
-    local asset_name="${asset_slug}-${upstream_version}.zip"
-    local asset_path="${ASSETS_DIR}/${asset_name}"
-
-    local download_url
-    download_url="$(get_download_link_install_from_entry "${original_entry_file}")"
-    [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Missing DownloadLinkInstall for ${plugin_name}"
-
-    local plugin_root
-    if [[ "${local_source_kind}" == "local-publish-dir" ]]; then
-      plugin_root="$(prepare_plugin_tree_from_dir "${local_source_value}" "${extract_dir}")"
-    else
-      local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
-      download_plugin_payload_for_release "${manifest_source_kind}" "${download_url}" "${upstream_zip}" "${local_source_kind}" "${local_source_value}"
-      plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
-    fi
-    install_runtime_files "${plugin_root}" "${shim_dir}"
-    emit_plugin_folder_manifest "${original_entry_file}" "${asset_slug}" "${plugin_root}"
-    create_plugin_zip "${plugin_root}" "${asset_path}"
-
-    release_url="$(github_release_asset_url "${GITHUB_REPOSITORY}" "${semver_tag}" "${asset_name}")"
-    build_republished_entry "${original_entry_file}" "${release_url}" "${republished_entry}"
-    merge_plugin_entry "${PLUGINMASTER_OUTPUT}" "${republished_entry}"
-
-    jq --arg pluginName "${plugin_name}" --arg upstreamVersion "${upstream_version}" \
-      '. += [{"pluginName": $pluginName, "upstreamVersion": $upstreamVersion}]' \
-      "${upstream_summary_file}" > "${upstream_summary_file}.tmp"
-    mv "${upstream_summary_file}.tmp" "${upstream_summary_file}"
-  done < <(selected_targets)
-
-  sort_pluginmaster_file "${PLUGINMASTER_OUTPUT}"
-  cp "${PLUGINMASTER_OUTPUT}" "${DIST_PLUGINMASTER_COPY}"
-
-  local notes_file="${WORK_DIR}/semver.notes.md"
-  semver_release_notes "${release_version}" "${upstream_summary_file}" > "${notes_file}"
-
+build_semver_release_item() {
+  local version="$1" output_file="$2"
   jq -n \
-    --arg tag "${semver_tag}" \
-    --arg title "Release ${release_version}" \
-    --rawfile notes "${notes_file}" \
-    --slurpfile assets <(find "${ASSETS_DIR}" -maxdepth 1 -type f | sort | jq -R . | jq -s .) \
-    '{
-      tag: $tag,
-      title: $title,
-      notes: $notes,
-      assets: $assets[0]
-    }' > "${semver_release_file}"
-}
-
-pack_plugin_release_artifacts() {
-  local release_items_dir="${METADATA_DIR}/release-items"
-
-  mkdir -p "${release_items_dir}"
-  ensure_pluginmaster_file "${PLUGINMASTER_OUTPUT}"
-
-  local target
-  while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value local_source_kind local_source_value default_abi_flavor <<<"${target}"
-
-    local abi_flavor
-    abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
-    local shim_dir="${WORK_DIR}/${asset_slug}.shim"
-    publish_shim_flavor "${abi_flavor}" "${shim_dir}"
-
-    local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
-    local entry_file="${WORK_DIR}/${asset_slug}.entry.json"
-    fetch_manifest_for_target "${manifest_source_kind}" "${manifest_source_value}" "${manifest_file}"
-    extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${entry_file}"
-    jq -e '.' "${entry_file}" >/dev/null 2>&1 || die "Could not find plugin entry for ${plugin_name}"
-
-    local upstream_version
-    upstream_version="$(get_upstream_version "${entry_file}")"
-    [[ -n "${upstream_version}" ]] || die "Could not determine upstream version for ${plugin_name}"
-
-    local upstream_zip_url
-    upstream_zip_url="$(jq -r '.DownloadLinkInstall // empty' "${entry_file}")"
-    [[ -n "${upstream_zip_url}" ]] || die "Missing DownloadLinkInstall for ${plugin_name}"
-
-    local extract_dir="${WORK_DIR}/${asset_slug}.extract"
-    local asset_name="${asset_slug}-${upstream_version}.zip"
-    local asset_path="${ASSETS_DIR}/${asset_name}"
-    local tag="${asset_slug}-${upstream_version}"
-    local notes_file="${WORK_DIR}/${asset_slug}.notes.md"
-    local republished_entry="${WORK_DIR}/${asset_slug}.republished-entry.json"
-    local release_url
-
-    local plugin_root
-    if [[ "${local_source_kind}" == "local-publish-dir" ]]; then
-      plugin_root="$(prepare_plugin_tree_from_dir "${local_source_value}" "${extract_dir}")"
-    else
-      local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
-      download_plugin_payload_for_release "${manifest_source_kind}" "${upstream_zip_url}" "${upstream_zip}" "${local_source_kind}" "${local_source_value}"
-      plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
-    fi
-    install_runtime_files "${plugin_root}" "${shim_dir}"
-    emit_plugin_folder_manifest "${entry_file}" "${asset_slug}" "${plugin_root}"
-    create_plugin_zip "${plugin_root}" "${asset_path}"
-
-    release_url="$(github_release_asset_url "${GITHUB_REPOSITORY}" "${tag}" "${asset_name}")"
-    build_republished_entry "${entry_file}" "${release_url}" "${republished_entry}"
-    merge_plugin_entry "${PLUGINMASTER_OUTPUT}" "${republished_entry}"
-
-    plugin_release_notes "${plugin_name}" "${upstream_version}" "${manifest_source_kind}:${manifest_source_value}" > "${notes_file}"
-
-    jq -n \
-      --arg tag "${tag}" \
-      --arg title "${plugin_name} ${upstream_version}" \
-      --rawfile notes "${notes_file}" \
-      --arg assetPath "${asset_path}" \
-      '{
-        tag: $tag,
-        title: $title,
-        notes: $notes,
-        assets: [$assetPath]
-      }' > "${release_items_dir}/${asset_slug}.json"
-  done < <(selected_targets)
-
-  sort_pluginmaster_file "${PLUGINMASTER_OUTPUT}"
-  cp "${PLUGINMASTER_OUTPUT}" "${DIST_PLUGINMASTER_COPY}"
+    --arg tag "$version" \
+    --arg title "$version" \
+    --arg notes "$(semver_release_notes "$version")" \
+    --argjson assets "$(find "$ASSETS_DIR" -maxdepth 1 -type f -printf '%p\n' | jq -R . | jq -s .)" \
+    '{tag:$tag,title:$title,notes:$notes,assets:$assets}' > "$output_file"
 }
 
 main() {
-  ensure_release_prereqs
-  reset_output_dirs
+  ensure_common_prereqs
+  reset_release_dirs
 
-  case "${PUBLISH_SCHEME}" in
-    semver)
-      : "${RELEASE_VERSION:?RELEASE_VERSION must be set for semver publishing}"
-      pack_semver_artifacts "${RELEASE_VERSION}"
-      ;;
-    plugins)
-      pack_plugin_release_artifacts
-      ;;
-    *)
-      die "Unsupported PUBLISH_SCHEME: ${PUBLISH_SCHEME}"
-      ;;
-  esac
+  local target
+  while IFS= read -r target; do
+    IFS='|' read -r asset_slug plugin_name source_kind source_value default_abi_flavor <<<"${target}"
+    log "Processing ${plugin_name}"
 
-  emit_metadata "${METADATA_DIR}/release-items" "${METADATA_DIR}/releases.json"
+    local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
+    if [[ "${source_kind}" == "local-bardtoolbox" ]]; then
+      source_kind="github-url-pluginmaster"
+      source_value="https://raw.githubusercontent.com/${BARDTOOLBOX_PRIVATE_REPO}/${BARDTOOLBOX_PRIVATE_REF}/pluginmaster.json"
+    fi
+    fetch_manifest_for_target "$source_kind" "$source_value" "$manifest_file"
+
+    local original_entry_file="${WORK_DIR}/${asset_slug}.original-entry.json"
+    extract_plugin_entry "$manifest_file" "$plugin_name" > "$original_entry_file"
+    jq -e '.' "$original_entry_file" >/dev/null 2>&1 || die "Could not extract manifest entry for ${plugin_name}"
+
+    local download_url upstream_version abi_flavor upstream_zip extract_dir plugin_root shim_dir artifact_filename artifact_path republished_entry_file placeholder_url release_item_file
+    download_url="$(jq -r '.DownloadLinkInstall // empty' "$original_entry_file")"
+    [[ -n "$download_url" && "$download_url" != "null" ]] || die "Could not find DownloadLinkInstall for ${plugin_name}"
+    upstream_version="$(get_upstream_version "$original_entry_file")"
+    abi_flavor="$(resolve_abi_flavor "$plugin_name" "$default_abi_flavor")"
+    shim_dir="${SHIM_WORK_ROOT}/${asset_slug}.shim"
+    publish_shim_flavor "$abi_flavor" "$shim_dir"
+
+    upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
+    download_plugin_payload_for_release "$source_kind" "$source_value" "$download_url" "$upstream_zip"
+    extract_dir="${WORK_DIR}/${asset_slug}.extract"
+    plugin_root="$(prepare_plugin_tree_from_zip "$upstream_zip" "$extract_dir")"
+    install_runtime_files "$plugin_root" "$shim_dir"
+
+    artifact_filename="${asset_slug}.zip"
+    if [[ "$PUBLISH_SCHEME" == "plugins" ]]; then
+      artifact_filename="${asset_slug}-${upstream_version:-unknown}.zip"
+    fi
+    artifact_path="${ASSETS_DIR}/${artifact_filename}"
+    create_plugin_zip "$plugin_root" "$artifact_path"
+
+    local target_tag
+    if [[ "$PUBLISH_SCHEME" == "plugins" ]]; then
+      target_tag="${asset_slug}-${upstream_version:-unknown}"
+    else
+      target_tag="${RELEASE_VERSION:?RELEASE_VERSION must be set for semver publishing}"
+    fi
+    placeholder_url="$(github_release_asset_url "$GITHUB_REPOSITORY" "$target_tag" "$artifact_filename")"
+    republished_entry_file="${WORK_DIR}/${asset_slug}.republished-entry.json"
+    build_republished_entry "$original_entry_file" "$placeholder_url" "$republished_entry_file"
+    merge_plugin_entry "$PLUGINMASTER_FILE" "$republished_entry_file"
+
+    if [[ "$PUBLISH_SCHEME" == "plugins" ]]; then
+      release_item_file="${RELEASE_ITEMS_DIR}/${asset_slug}.json"
+      build_plugin_tracking_release_item "$asset_slug" "$plugin_name" "$upstream_version" "$artifact_path" "$release_item_file"
+    fi
+  done < <(selected_targets)
+
+  if [[ "$PUBLISH_SCHEME" == "semver" ]]; then
+    local version="${RELEASE_VERSION:?RELEASE_VERSION must be set for semver publishing}"
+    pack_nuget_project TinyIpc.Shim/TinyIpc.Shim.csproj "$ASSETS_DIR" "$version" "https://github.com/${GITHUB_REPOSITORY}"
+    pack_nuget_project XivIpc/XivIpc.csproj "$ASSETS_DIR" "$version" "https://github.com/${GITHUB_REPOSITORY}"
+    publish_native_host "$NATIVE_HOST_DIR"
+    archive_native_host "$NATIVE_HOST_DIR" "$ASSETS_DIR/XivIpc.NativeHost-linux-x64.tar.gz"
+    build_semver_release_item "$version" "${RELEASE_ITEMS_DIR}/semver.json"
+  fi
+
+  sort_pluginmaster_file "$PLUGINMASTER_FILE"
+  cp -f "$PLUGINMASTER_FILE" "$ROOT_PLUGINMASTER_FILE"
+  jq -s '{releases: .}' ${RELEASE_ITEMS_DIR}/*.json > "${METADATA_DIR}/releases.json"
   log "Release metadata written to ${METADATA_DIR}/releases.json"
-  log "Pluginmaster written to ${PLUGINMASTER_OUTPUT}"
+  log "Pluginmaster written to ${ROOT_PLUGINMASTER_FILE}"
 }
 
 main "$@"

@@ -3,108 +3,195 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-FIXTURES_DIR="${REPO_ROOT}/test-fixtures"
-FAKEBIN_DIR="${FIXTURES_DIR}/fakebin"
-OUTPUT_ROOT="${REPO_ROOT}/.test-out"
+TMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
-mkdir -p "${FIXTURES_DIR}" "${FAKEBIN_DIR}"
+FAKE_BIN="$TMP_ROOT/bin"
+FIXTURES="$TMP_ROOT/fixtures"
+mkdir -p "$FAKE_BIN" "$FIXTURES"
 
-cat > "${FAKEBIN_DIR}/dotnet" <<'DOTNET'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-cmd="$1"; shift || true
-case "$cmd" in
-  build)
-    exit 0
-    ;;
-  publish)
-    out=""; project=""; tfm=""; rid=""; abi="";
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        -o) out="$2"; shift 2 ;;
-        -f) tfm="$2"; shift 2 ;;
-        -r) rid="$2"; shift 2 ;;
-        -p:TinyIpcAbiFlavor=*) abi="${1#*=}"; shift ;;
-        *.csproj|TinyIpc.Shim|XivIpc.NativeHost) project="$1"; shift ;;
-        *) shift ;;
-      esac
-    done
-    mkdir -p "$out"
-    case "$project" in
-      TinyIpc.Shim/TinyIpc.Shim.csproj|TinyIpc.Shim)
-        printf 'shim abi=%s tfm=%s\n' "$abi" "$tfm" > "$out/TinyIpc.dll"
-        printf 'xivipc\n' > "$out/XivIpc.dll"
-        printf '{}\n' > "$out/TinyIpc.deps.json"
-        printf '{}\n' > "$out/TinyIpc.runtimeconfig.json"
-        ;;
-      XivIpc.NativeHost/XivIpc.NativeHost.csproj|XivIpc.NativeHost)
-        printf '#!/usr/bin/env bash\necho native host rid=%s tfm=%s\n' "$rid" "$tfm" > "$out/XivIpc.NativeHost"
-        chmod +x "$out/XivIpc.NativeHost"
-        ;;
-      *)
-        echo "unknown publish project: $project" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-  pack)
-    out=""; version="0.0.0"; project="";
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        -o) out="$2"; shift 2 ;;
-        -p:Version=*) version="${1#*=}"; shift ;;
-        *.csproj) project="$1"; shift ;;
-        *) shift ;;
-      esac
-    done
-    mkdir -p "$out"
-    base="$(basename "$project" .csproj)"
-    printf 'package %s %s\n' "$base" "$version" > "$out/${base}.${version}.nupkg"
-    ;;
-  *)
-    echo "unsupported fake dotnet command: $cmd" >&2
-    exit 1
-    ;;
-esac
-DOTNET
-chmod +x "${FAKEBIN_DIR}/dotnet"
+make_zip() {
+  local src="$1" out="$2"
+  mkdir -p "$(dirname "$out")"
+  (cd "$src" && zip -qr "$out" .)
+}
 
-make_plugin_fixture() {
-  local slug="$1"
-  local display_name="$2"
-  local version="$3"
-  local repo_dir="${FIXTURES_DIR}/${slug}"
-  rm -rf "${repo_dir}"
-  mkdir -p "${repo_dir}/payload/${slug}"
-  printf 'dummy %s dll\n' "$slug" > "${repo_dir}/payload/${slug}/${slug}.dll"
-  printf '{"name":"%s"}\n' "$slug" > "${repo_dir}/payload/${slug}/${slug}.json"
-  (cd "${repo_dir}/payload" && zip -qr "${repo_dir}/latest.zip" "${slug}")
-  cat > "${repo_dir}/pluginmaster.json" <<JSON
+mkdir -p "$FIXTURES/BardToolboxRepo/publish/BardToolbox"
+cat > "$FIXTURES/BardToolboxRepo/pluginmaster.json" <<'JSON'
 [
   {
-    "Name": "${display_name}",
-    "InternalName": "${slug}",
-    "AssemblyVersion": "${version}",
-    "DownloadLinkInstall": "file://${repo_dir}/latest.zip"
+    "Name": "BardToolbox",
+    "InternalName": "BardToolbox",
+    "AssemblyVersion": "1.2.3",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip"
   }
 ]
 JSON
-}
+printf 'bard dll\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/BardToolbox.dll"
+printf 'bard json\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/BardToolbox.json"
+printf 'orig tinyipc\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/TinyIpc.dll"
+make_zip "$FIXTURES/BardToolboxRepo/publish/BardToolbox" "$FIXTURES/BardToolboxRepo/BardToolbox.zip"
 
-make_plugin_fixture "BardToolbox" "BardToolbox" "1.2.3"
-make_plugin_fixture "MidiBard2" "MidiBard 2" "2.3.4"
-make_plugin_fixture "MasterOfPuppets" "MasterOfPuppets" "3.4.5"
+mkdir -p "$FIXTURES/MidiBard2Src"
+printf 'midi dll\n' > "$FIXTURES/MidiBard2Src/MidiBard2.dll"
+printf 'orig tinyipc\n' > "$FIXTURES/MidiBard2Src/TinyIpc.dll"
+make_zip "$FIXTURES/MidiBard2Src" "$FIXTURES/MidiBard2.zip"
+cat > "$FIXTURES/MidiBard2.pluginmaster.json" <<'JSON'
+[
+  {
+    "Name": "MidiBard 2",
+    "InternalName": "MidiBard2",
+    "AssemblyVersion": "2.0.0",
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip",
+    "DownloadLinkTesting": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip"
+  }
+]
+JSON
 
-export PATH="${FAKEBIN_DIR}:$PATH"
-export BARDTOOLBOX_LOCAL_DIR="${FIXTURES_DIR}/BardToolbox"
-export MIDIBARD2_PLUGINMASTER="file://${FIXTURES_DIR}/MidiBard2/pluginmaster.json"
-export MASTEROFPUPPETS_PLUGINMASTER="file://${FIXTURES_DIR}/MasterOfPuppets/pluginmaster.json"
+mkdir -p "$FIXTURES/MopSrc"
+printf 'mop dll\n' > "$FIXTURES/MopSrc/MasterOfPuppets.dll"
+printf 'orig tinyipc\n' > "$FIXTURES/MopSrc/TinyIpc.dll"
+make_zip "$FIXTURES/MopSrc" "$FIXTURES/MasterOfPuppets.zip"
+cat > "$FIXTURES/MasterOfPuppets.pluginmaster.json" <<'JSON'
+[
+  {
+    "Name": "MasterOfPuppets",
+    "InternalName": "MasterOfPuppets",
+    "AssemblyVersion": "3.0.0",
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip",
+    "DownloadLinkTesting": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip"
+  }
+]
+JSON
 
-rm -rf "${OUTPUT_ROOT}"
-mkdir -p "${OUTPUT_ROOT}"
+cat > "$FAKE_BIN/dotnet" <<'EOF2'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cmd="$1"; shift
+out=""
+project=""
+version=""
+abi="compat"
+rid=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -p:PackageVersion=*|-p:Version=*) version="${1#*=}"; shift ;;
+    -p:TinyIpcAbiFlavor=*) abi="${1#*=}"; shift ;;
+    -r) rid="$2"; shift 2 ;;
+    *.csproj|*.sln) project="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$cmd" in
+  build)
+    exit 0 ;;
+  publish)
+    mkdir -p "$out"
+    case "$project" in
+      *TinyIpc.Shim.csproj)
+        printf 'shim %s\n' "$abi" > "$out/TinyIpc.dll"
+        printf 'xivipc from shim\n' > "$out/XivIpc.dll"
+        printf '{}' > "$out/TinyIpc.deps.json"
+        printf '{}' > "$out/TinyIpc.runtimeconfig.json"
+        ;;
+      *XivIpc.NativeHost.csproj)
+        printf '#!/bin/sh\nexit 0\n' > "$out/XivIpc.NativeHost"
+        chmod +x "$out/XivIpc.NativeHost"
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  pack)
+    mkdir -p "$out"
+    base="$(basename "$project" .csproj)"
+    touch "$out/${base}.${version}.nupkg"
+    ;;
+  *) exit 1 ;;
+esac
+EOF2
+chmod +x "$FAKE_BIN/dotnet"
 
-OUTPUT_DIR="${OUTPUT_ROOT}/plugins" TINYIPC_SHARED_DIR="${OUTPUT_ROOT}/shared" bash "${SCRIPT_DIR}/publish-local.sh"
-PUBLISH_SCHEME=plugins GITHUB_REPOSITORY=example/repo bash "${SCRIPT_DIR}/publish-release.sh"
-PUBLISH_SCHEME=semver GITHUB_REPOSITORY=example/repo RELEASE_VERSION=9.9.9 bash "${SCRIPT_DIR}/publish-release.sh"
+cat > "$FAKE_BIN/gh" <<'EOF2'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+FIXTURES_DIR="__FIXTURES__"
+sub="$1"; shift
+case "$sub" in
+  api)
+    route=""
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        repos/*) route="$1"; shift ;;
+        *) shift ;;
+      esac
+    done
+    case "$route" in
+      repos/pffxivtools/BardToolbox/contents/pluginmaster.json?ref=main)
+        cat "$FIXTURES_DIR/BardToolboxRepo/pluginmaster.json" ;;
+      repos/reckhou/DalamudPlugins-Ori/contents/pluginmaster.json?ref=api6)
+        cat "$FIXTURES_DIR/MidiBard2.pluginmaster.json" ;;
+      repos/zunetrix/DalamudPlugins/contents/pluginmaster.json?ref=refs/heads/main)
+        cat "$FIXTURES_DIR/MasterOfPuppets.pluginmaster.json" ;;
+      repos/reckhou/DalamudPlugins-Ori/contents/plugins/MidiBard2/latest.zip?ref=api6)
+        cat "$FIXTURES_DIR/MidiBard2.zip" ;;
+      repos/zunetrix/DalamudPlugins/contents/plugins/MasterOfPuppets/latest.zip?ref=refs/heads/main|repos/zunetrix/DalamudPlugins/contents/plugins/MasterOfPuppets/latest.zip?ref=main)
+        cat "$FIXTURES_DIR/MasterOfPuppets.zip" ;;
+      *) echo "unsupported route: $route" >&2; exit 1 ;;
+    esac
+    ;;
+  release)
+    sub2="$1"; shift
+    case "$sub2" in
+      download)
+        tag="$1"; shift
+        repo=""; pattern=""; dir=""
+        while [[ "$#" -gt 0 ]]; do
+          case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            --pattern) pattern="$2"; shift 2 ;;
+            --dir) dir="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        mkdir -p "$dir"
+        if [[ "$repo" == "pffxivtools/BardToolbox" && "$pattern" == "BardToolbox.zip" ]]; then
+          cp "$FIXTURES_DIR/BardToolboxRepo/BardToolbox.zip" "$dir/BardToolbox.zip"
+        else
+          echo "unsupported release download: $repo $tag $pattern" >&2; exit 1
+        fi
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  --version)
+    echo gh-fake ;;
+  *) echo "unsupported gh subcommand: $sub" >&2; exit 1 ;;
+esac
+EOF2
+sed -i "s|__FIXTURES__|$FIXTURES|g" "$FAKE_BIN/gh"
+chmod +x "$FAKE_BIN/gh"
 
-echo "Fixture publish tests passed"
+export PATH="$FAKE_BIN:$PATH"
+export GH_TOKEN=fake
+export BARDTOOLBOX_LOCAL_DIR="$FIXTURES/BardToolboxRepo"
+export TINYIPC_SHARED_GROUP=doesnotexist
+
+cd "$REPO_ROOT"
+
+OUTPUT_DIR="$TMP_ROOT/output" TINYIPC_SHARED_DIR="$TMP_ROOT/shared" BASE_URL="https://example.invalid" bash scripts/publish-local.sh
+[[ -f "$TMP_ROOT/output/artifacts/BardToolbox.zip" ]]
+[[ -f "$TMP_ROOT/output/artifacts/MidiBard2.zip" ]]
+[[ -f "$TMP_ROOT/output/artifacts/MasterOfPuppets.zip" ]]
+
+PUBLISH_SCHEME=plugins GITHUB_REPOSITORY=example/repo bash scripts/publish-release.sh
+jq -e '.releases | length == 3' dist/github/metadata/releases.json >/dev/null
+
+PUBLISH_SCHEME=semver RELEASE_VERSION=1.2.3 GITHUB_REPOSITORY=example/repo TOOL_SELECTION=BardToolbox bash scripts/publish-release.sh
+jq -e '.releases | length == 1' dist/github/metadata/releases.json >/dev/null
+compgen -G 'dist/github/assets/*.nupkg' >/dev/null
+compgen -G 'dist/github/assets/*.tar.gz' >/dev/null

@@ -5,23 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+export PUBLISH_CONTEXT=local
+
 # shellcheck source=./release-common.sh
 source "${SCRIPT_DIR}/release-common.sh"
-
-export PUBLISH_CONTEXT=local
 
 DIST_DIR="${REPO_ROOT}/dist"
 SHIM_DIST_DIR="${DIST_DIR}/shim"
 HOST_DIST_DIR="${DIST_DIR}/native-host"
 
-OUTPUT_DIR="${OUTPUT_DIR:-/home/shared/plugins}"
+OUTPUT_DIR="/home/shared/plugins"
 WORK_DIR="${OUTPUT_DIR}/work"
 ARTIFACTS_DIR="${OUTPUT_DIR}/artifacts"
 MANIFESTS_DIR="${OUTPUT_DIR}/manifests"
 
 : "${TINYIPC_SHARED_DIR:=/home/shared/tinyipc-shared-ffxiv}"
 : "${BASE_URL:=https://example.com/dalamud}"
-: "${TOOL_SELECTION:=all}"
 
 ensure_local_prereqs() {
   ensure_common_prereqs
@@ -61,6 +60,7 @@ stage_native_host_payload() {
 
   while IFS= read -r -d '' artifact; do
     local dest="${staging_dir}/$(basename "${artifact}")"
+
     install -m 660 -- "${artifact}" "${dest}"
 
     if [[ -x "${artifact}" ]]; then
@@ -77,7 +77,7 @@ stage_native_host_payload() {
 
 reset_dirs() {
   rm -rf "${OUTPUT_DIR}" "${DIST_DIR}"
-  mkdir -p "${WORK_DIR}" "${ARTIFACTS_DIR}" "${MANIFESTS_DIR}" "${SHIM_DIST_DIR}" "${HOST_DIST_DIR}"
+  mkdir -p "${WORK_DIR}" "${ARTIFACTS_DIR}" "${MANIFESTS_DIR}" "${DIST_DIR}"
 }
 
 make_placeholder_url() {
@@ -93,42 +93,44 @@ main() {
 
   local target
   while IFS= read -r target; do
-    IFS='|' read -r asset_slug plugin_name manifest_source_kind manifest_source_value local_source_kind local_source_value default_abi_flavor <<<"${target}"
+    IFS='|' read -r asset_slug plugin_name source_kind source_value default_abi_flavor <<<"${target}"
 
     local abi_flavor
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
+
     log "Publishing TinyIpc ABI flavor ${abi_flavor} for ${plugin_name}"
     publish_shim_flavor "${abi_flavor}" "${SHIM_DIST_DIR}"
     publish_native_host "${HOST_DIST_DIR}"
     stage_native_host_payload
 
     log "Processing ${plugin_name}"
-    log "Fetching pluginmaster from ${manifest_source_kind}:${manifest_source_value}"
 
     local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
-    fetch_manifest_for_target "${manifest_source_kind}" "${manifest_source_value}" "${manifest_file}"
+    fetch_manifest_for_target "${source_kind}" "${source_value}" "${manifest_file}"
 
     local original_entry_file="${WORK_DIR}/${asset_slug}.original-entry.json"
     extract_plugin_entry "${manifest_file}" "${plugin_name}" > "${original_entry_file}"
     jq -e '.' "${original_entry_file}" >/dev/null 2>&1 || die "Could not extract manifest entry for ${plugin_name}"
 
-    local download_url
-    download_url="$(get_download_link_install_from_entry "${original_entry_file}")"
-    [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Could not find DownloadLinkInstall for ${plugin_name}"
-
-    local extract_dir="${WORK_DIR}/${asset_slug}.extract"
     local plugin_root
-    if [[ "${local_source_kind}" == "local-publish-dir" ]]; then
-      plugin_root="$(prepare_plugin_tree_from_dir "${local_source_value}" "${extract_dir}")"
+    if [[ "${source_kind}" == "local-bardtoolbox" ]]; then
+      local local_repo_dir
+      local_repo_dir="$(resolve_bardtoolbox_local_dir)" || die "BardToolbox local repo not found. Expected ../BardToolbox with pluginmaster.json and publish/BardToolbox/"
+      plugin_root="${WORK_DIR}/${asset_slug}.root"
+      copy_tree_contents "${local_repo_dir}/publish/BardToolbox" "${plugin_root}"
     else
-      local upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
-      download_plugin_payload_for_release "${manifest_source_kind}" "${download_url}" "${upstream_zip}" "${local_source_kind}" "${local_source_value}"
+      local download_url upstream_zip extract_dir
+      download_url="$(jq -r '.DownloadLinkInstall // empty' "${original_entry_file}")"
+      [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Could not find DownloadLinkInstall for ${plugin_name}"
+
+      upstream_zip="${WORK_DIR}/${asset_slug}.upstream.zip"
+      download_plugin_payload_for_release "${source_kind}" "${source_value}" "${download_url}" "${upstream_zip}"
+
+      extract_dir="${WORK_DIR}/${asset_slug}.extract"
       plugin_root="$(prepare_plugin_tree_from_zip "${upstream_zip}" "${extract_dir}")"
     fi
-    log "Plugin root resolved to: ${plugin_root}"
 
     install_runtime_files "${plugin_root}" "${SHIM_DIST_DIR}"
-    emit_plugin_folder_manifest "${original_entry_file}" "${asset_slug}" "${plugin_root}"
 
     local artifact_filename="${asset_slug}.zip"
     local artifact_path="${ARTIFACTS_DIR}/${artifact_filename}"
@@ -142,15 +144,12 @@ main() {
     merge_plugin_entry "${MANIFESTS_DIR}/pluginmaster.json" "${republished_entry_file}"
 
     log "Created artifact: ${artifact_path}"
-    log "Placeholder URL: ${placeholder_url}"
   done < <(selected_targets)
 
   sort_pluginmaster_file "${MANIFESTS_DIR}/pluginmaster.json"
-
   log "Generated manifest: ${MANIFESTS_DIR}/pluginmaster.json"
   log "Artifacts directory: ${ARTIFACTS_DIR}"
   log "Native host staged at: ${TINYIPC_SHARED_DIR}/tinyipc-native-host"
-  log "Done"
 }
 
 main "$@"

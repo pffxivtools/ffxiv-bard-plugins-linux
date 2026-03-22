@@ -69,6 +69,7 @@ jobs:
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PUBLISH_SCHEME: plugins
+          GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
           BARDTOOLBOX_GH_TOKEN: ${{ steps.bardtoolbox_app_token.outputs.token }}
         run: bash scripts/publish-release.sh
 
