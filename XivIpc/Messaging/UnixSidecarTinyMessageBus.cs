@@ -5,7 +5,7 @@ using XivIpc.Internal;
 
 namespace XivIpc.Messaging
 {
-    internal sealed class UnixSidecarTinyMessageBus : IXivMessageBus
+    public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
     {
         private const int DefaultHeartbeatIntervalMs = 2000;
         private const int DefaultHeartbeatTimeoutMs = 60000;

@@ -558,14 +558,14 @@ pack_nuget_project() {
 archive_native_host() {
   local published_dir="$1"
   local output_file="$2"
+  local host_file="${published_dir}/XivIpc.NativeHost"
+
+  [[ -f "${host_file}" ]] || die "Missing ${host_file}"
 
   rm -f "${output_file}"
   mkdir -p "$(dirname "${output_file}")"
 
-  (
-    cd "${published_dir}"
-    tar -czf "${output_file}" .
-  )
+  tar -C "${published_dir}" -czf "${output_file}" "XivIpc.NativeHost"
 }
 
 download_plugin_payload_for_release() {
