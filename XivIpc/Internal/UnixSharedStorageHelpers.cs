@@ -10,9 +10,31 @@ namespace XivIpc.Internal
 {
     internal static class UnixSharedStorageHelpers
     {
+        private const string DefaultSharedDirectoryUnix = "/tmp/tinyipc-shared-ffxiv";
         private static readonly TimeSpan LockWaitTimeout = TimeSpan.FromSeconds(5);
         private static readonly ConcurrentDictionary<string, object> ProcessGates =
             new(StringComparer.Ordinal);
+        private static readonly AsyncLocal<DefaultSharedDirectoryOverrideScope?> CurrentDefaultSharedDirectoryOverride = new();
+
+        internal static IDisposable OverrideDefaultSharedDirectoryForTests(string? unixSharedDirectory)
+        {
+            DefaultSharedDirectoryOverrideScope? previous = CurrentDefaultSharedDirectoryOverride.Value;
+            var next = new DefaultSharedDirectoryOverrideScope(previous, unixSharedDirectory);
+            CurrentDefaultSharedDirectoryOverride.Value = next;
+            return next;
+        }
+
+        internal static string ResolveSharedDirectoryForCurrentRuntime(string? explicitPath)
+        {
+            if (!string.IsNullOrWhiteSpace(explicitPath))
+                return ResolvePathForCurrentRuntime(explicitPath);
+
+            RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+            string defaultUnixPath = GetDefaultSharedDirectoryUnixPath();
+            return runtime.IsWindowsProcess
+                ? NormalizeWindowsRuntimePath(defaultUnixPath)
+                : defaultUnixPath;
+        }
 
         internal static void EnsureSharedDirectoryExists()
         {
@@ -154,22 +176,7 @@ namespace XivIpc.Internal
                         ("groupName", groupName));
                 }
 
-                uint fallbackMode = Convert.ToUInt32(isDirectory ? "1777" : "666", 8);
-                int fallbackChmodResult = chmod(unixPath, fallbackMode);
-                if (fallbackChmodResult != 0)
-                {
-                    int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
-                    TinyIpcLogger.Warning(
-                        nameof(UnixSharedStorageHelpers),
-                        "PermissionApplyFailed",
-                        "Failed to apply fallback shared Unix permissions.",
-                        null,
-                        ("path", path),
-                        ("unixPath", unixPath),
-                        ("isDirectory", isDirectory),
-                        ("mode", isDirectory ? "1777" : "666"),
-                        ("errno", errno));
-                }
+                ApplyOpenSharedPermissions(path, unixPath, isDirectory);
             }
             catch (Exception ex)
             {
@@ -192,7 +199,7 @@ namespace XivIpc.Internal
 
             string? groupName = GetConfiguredGroup();
             if (string.IsNullOrWhiteSpace(groupName))
-                throw new InvalidOperationException("Brokered TinyIpc requires TINYIPC_SHARED_GROUP to be configured.");
+                return;
 
             if (GetGroupId(groupName) < 0)
                 throw new InvalidOperationException($"Brokered TinyIpc shared group '{groupName}' could not be resolved.");
@@ -207,7 +214,10 @@ namespace XivIpc.Internal
             string unixPath = ConvertPathToUnix(path);
             string? groupName = GetConfiguredGroup();
             if (string.IsNullOrWhiteSpace(groupName))
-                throw new InvalidOperationException("Brokered TinyIpc requires TINYIPC_SHARED_GROUP to be configured.");
+            {
+                ApplyOpenSharedPermissions(path, unixPath, isDirectory);
+                return;
+            }
 
             int gid = GetGroupId(groupName);
             if (gid < 0)
@@ -331,6 +341,50 @@ namespace XivIpc.Internal
             }
         }
 
+        internal static void ApplyHostExecutablePermissions(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+
+            if (!string.IsNullOrWhiteSpace(GetConfiguredGroup()))
+                return;
+
+            string unixPath = ConvertPathToUnix(path);
+            try
+            {
+                RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+                if (runtime.IsWindowsProcess)
+                {
+                    if (!TryRunUnixPermissionCommand("chmod", "755", unixPath))
+                    {
+                        TinyIpcLogger.Warning(
+                            nameof(UnixSharedStorageHelpers),
+                            "ExecutablePermissionApplyFailed",
+                            "Failed to set native host executable permissions via chmod command.",
+                            null,
+                            ("path", path),
+                            ("unixPath", unixPath),
+                            ("mode", "755"));
+                    }
+
+                    return;
+                }
+
+                ApplyUnixMode(path, unixPath, isDirectory: false, modeText: "755");
+            }
+            catch (Exception ex)
+            {
+                TinyIpcLogger.Warning(
+                    nameof(UnixSharedStorageHelpers),
+                    "ExecutablePermissionApplyFailed",
+                    "Failed to set native host executable permissions.",
+                    ex,
+                    ("path", path),
+                    ("unixPath", unixPath),
+                    ("mode", "755"));
+            }
+        }
+
         internal static IDisposable AcquireProcessLock(string path)
         {
             RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
@@ -344,7 +398,7 @@ namespace XivIpc.Internal
             string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
             if (!string.IsNullOrWhiteSpace(explicitPath))
             {
-                string resolved = ResolvePathForCurrentRuntime(explicitPath);
+                string resolved = ResolveSharedDirectoryForCurrentRuntime(explicitPath);
 
                 TinyIpcLogger.Debug(
                     nameof(UnixSharedStorageHelpers),
@@ -356,24 +410,16 @@ namespace XivIpc.Internal
                 return resolved;
             }
 
-            RuntimeEnvironmentInfo runtime = RuntimeEnvironmentDetector.Detect();
+            string fallback = ResolveSharedDirectoryForCurrentRuntime(null);
+            TinyIpcLogger.Warning(
+                nameof(UnixSharedStorageHelpers),
+                "SharedDirectoryDefaulted",
+                "Using the built-in TinyIpc shared directory default because TINYIPC_SHARED_DIR is not set.",
+                null,
+                ("directory", fallback),
+                ("runtime", RuntimeEnvironmentDetector.Detect().Kind));
 
-            if (runtime.IsWindowsProcess)
-            {
-                string fallback = Path.GetTempPath();
-
-                TinyIpcLogger.Warning(
-                    nameof(UnixSharedStorageHelpers),
-                    "SharedDirectoryDefaulted",
-                    "Wine/runtime is using the process temp directory because TINYIPC_SHARED_DIR is not set.",
-                    null,
-                    ("directory", fallback),
-                    ("runtime", runtime.Kind));
-
-                return fallback;
-            }
-
-            return "/tmp";
+            return fallback;
         }
 
         private static string ResolvePathForCurrentRuntime(string path)
@@ -439,6 +485,53 @@ namespace XivIpc.Internal
         {
             string? group = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
             return string.IsNullOrWhiteSpace(group) ? null : group;
+        }
+
+        private static string GetDefaultSharedDirectoryUnixPath()
+            => CurrentDefaultSharedDirectoryOverride.Value?.UnixSharedDirectory ?? DefaultSharedDirectoryUnix;
+
+        private static void ApplyOpenSharedPermissions(string path, string unixPath, bool isDirectory)
+            => ApplyUnixMode(path, unixPath, isDirectory, isDirectory ? "1777" : "666");
+
+        private static void ApplyUnixMode(string path, string unixPath, bool isDirectory, string modeText)
+        {
+            uint modeBits = Convert.ToUInt32(modeText, 8);
+            int chmodResult = chmod(unixPath, modeBits);
+            if (chmodResult != 0)
+            {
+                int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+                TinyIpcLogger.Warning(
+                    nameof(UnixSharedStorageHelpers),
+                    "PermissionApplyFailed",
+                    "Failed to apply Unix permissions.",
+                    null,
+                    ("path", path),
+                    ("unixPath", unixPath),
+                    ("isDirectory", isDirectory),
+                    ("mode", modeText),
+                    ("errno", errno));
+            }
+        }
+
+        private static bool TryRunUnixPermissionCommand(string command, string modeOrGroup, string unixPath)
+        {
+            try
+            {
+                using var process = Process.Start(new ProcessStartInfo("/usr/bin/env")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    ArgumentList = { command, modeOrGroup, unixPath }
+                });
+
+                process?.WaitForExit();
+                return process is { ExitCode: 0 };
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static int GetGroupId(string groupName)
@@ -572,6 +665,29 @@ namespace XivIpc.Internal
         private static extern int chown(string path, int owner, int group);
 
         private readonly record struct UnixPathMetadata(int GroupId, int Mode);
+
+        private sealed class DefaultSharedDirectoryOverrideScope : IDisposable
+        {
+            private readonly DefaultSharedDirectoryOverrideScope? _previous;
+            private bool _disposed;
+
+            internal DefaultSharedDirectoryOverrideScope(DefaultSharedDirectoryOverrideScope? previous, string? unixSharedDirectory)
+            {
+                _previous = previous;
+                UnixSharedDirectory = unixSharedDirectory;
+            }
+
+            internal string? UnixSharedDirectory { get; }
+
+            public void Dispose()
+            {
+                if (_disposed)
+                    return;
+
+                CurrentDefaultSharedDirectoryOverride.Value = _previous;
+                _disposed = true;
+            }
+        }
 
         private sealed class NoOpLockHandle : IDisposable
         {

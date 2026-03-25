@@ -92,6 +92,9 @@ main() {
   reset_dirs
   printf '[]\n' > "${MANIFESTS_DIR}/pluginmaster.json"
 
+  publish_native_host "${HOST_DIST_DIR}"
+  stage_native_host_payload
+
   local target
   while IFS= read -r target; do
     IFS='|' read -r asset_slug plugin_name source_kind source_value default_abi_flavor <<<"${target}"
@@ -101,8 +104,6 @@ main() {
 
     log "Publishing TinyIpc ABI flavor ${abi_flavor} for ${plugin_name}"
     publish_shim_flavor "${abi_flavor}" "${SHIM_DIST_DIR}"
-    publish_native_host "${HOST_DIST_DIR}"
-    stage_native_host_payload
 
     log "Processing ${plugin_name}"
 

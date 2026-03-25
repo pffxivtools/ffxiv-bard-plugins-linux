@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Diagnostics;
+using System.Net;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
 using XivIpc.Internal;
@@ -99,36 +100,79 @@ public sealed class ProductionPathStartupTests
         Assert.False(process.HasExited);
     }
 
+    [Fact]
+    public void AutoBackend_WithoutConfiguredPaths_DownloadsDefaultHost_AndUsesOpenPermissions()
+    {
+        using TestEnvironmentScope scope = new(StagedHostMode.None, setSharedGroup: false, useDefaultPaths: true, downloadDefaultHost: true);
+        using var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, 4096), disposeFile: true);
+
+        scope.WaitForSocket();
+        scope.WaitForStateFile();
+
+        string clientLog = scope.WaitForClientLog("BrokerLaunchPrepared");
+        string nativeLog = scope.WaitForUnixProcessLog("BrokerStartupObservedEnvironment");
+
+        ProductionPathTestEnvironment.AssertStartedSidecar(clientLog);
+        ProductionPathTestEnvironment.AssertHealthyNativeBrokerLog(nativeLog);
+        ProductionPathTestEnvironment.AssertLaunchContract(clientLog, nativeLog, scope.UnixSharedDirectory, scope.SocketPath, scope.StagedHostPath);
+        Assert.True(File.Exists(scope.StagedHostPath));
+        Assert.Equal("1777", ProductionPathTestEnvironment.ReadUnixMode(scope.UnixSharedDirectory));
+        Assert.Equal("666", ProductionPathTestEnvironment.ReadUnixMode(scope.SocketPath));
+        Assert.Equal("666", ProductionPathTestEnvironment.ReadUnixMode(scope.StatePath));
+        Assert.Equal("755", ProductionPathTestEnvironment.ReadUnixMode(scope.StagedHostPath));
+    }
+
     private sealed class TestEnvironmentScope : IDisposable
     {
-        private readonly IDisposable _overrides;
+        private readonly List<IDisposable> _cleanup = new();
 
-        public TestEnvironmentScope(StagedHostMode stagedHostMode, bool setSharedGroup = true)
+        public TestEnvironmentScope(StagedHostMode stagedHostMode, bool setSharedGroup = true, bool useDefaultPaths = false, bool downloadDefaultHost = false)
         {
             ChannelName = $"xivipc-production-startup-{Guid.NewGuid():N}";
             UnixSharedDirectory = Path.Combine(Path.GetTempPath(), "xivipc-production-startup-tests", Guid.NewGuid().ToString("N"));
             SharedDirectory = ProductionPathTestEnvironment.ToWindowsStylePath(UnixSharedDirectory);
             SocketPath = Path.Combine(UnixSharedDirectory, "tinyipc-sidecar.sock");
             StatePath = Path.Combine(UnixSharedDirectory, "tinyipc-sidecar.state.json");
+            StagedHostDirectory = useDefaultPaths
+                ? Path.Combine(Path.GetTempPath(), "xivipc-production-startup-hosts", Guid.NewGuid().ToString("N"), "tinyipc-native-host")
+                : Path.Combine(UnixSharedDirectory, "tinyipc-native-host");
 
             Directory.CreateDirectory(UnixSharedDirectory);
-            if (stagedHostMode == StagedHostMode.Valid)
+            if (stagedHostMode == StagedHostMode.Valid && useDefaultPaths)
+            {
+                Directory.CreateDirectory(StagedHostDirectory);
+                ProductionPathTestEnvironment.PrepareStandaloneNativeHost(StagedHostPath);
+            }
+            else if (stagedHostMode == StagedHostMode.Valid)
                 StagedHostDirectory = ProductionPathTestEnvironment.PrepareStagedNativeHost(UnixSharedDirectory);
             else if (stagedHostMode == StagedHostMode.Invalid)
                 StagedHostDirectory = ProductionPathTestEnvironment.PrepareInvalidStagedNativeHost(UnixSharedDirectory);
-            else
-                StagedHostDirectory = Path.Combine(UnixSharedDirectory, "tinyipc-native-host");
+
+            if (useDefaultPaths)
+            {
+                _cleanup.Add(UnixSharedStorageHelpers.OverrideDefaultSharedDirectoryForTests(UnixSharedDirectory));
+
+                NativeHostArchiveServer? server = null;
+                if (downloadDefaultHost)
+                {
+                    server = new NativeHostArchiveServer(ProductionPathTestEnvironment.CreateNativeHostArchiveBytes());
+                    _cleanup.Add(server);
+                }
+
+                _cleanup.Add(XivIpc.Messaging.UnixSidecarProcessManager.OverrideNativeHostDefaultsForTests(StagedHostPath, server?.Url));
+            }
 
             ProductionPathTestEnvironment.ResetLogger();
-            _overrides = TinyIpcEnvironment.Override(
+            _cleanup.Add(TinyIpcEnvironment.Override(
                 (TinyIpcEnvironment.MessageBusBackend, null),
                 (TinyIpcEnvironment.NativeHostPath, null),
-                (TinyIpcEnvironment.SharedDirectory, SharedDirectory),
+                (TinyIpcEnvironment.BrokerDirectory, null),
+                (TinyIpcEnvironment.SharedDirectory, useDefaultPaths ? null : SharedDirectory),
                 (TinyIpcEnvironment.SharedGroup, setSharedGroup ? ProductionPathTestEnvironment.ResolveSharedGroup() : null),
                 (TinyIpcEnvironment.LogDirectory, SharedDirectory),
                 (TinyIpcEnvironment.LogLevel, "info"),
                 (TinyIpcEnvironment.EnableLogging, "1"),
-                (TinyIpcEnvironment.FileNotifier, "auto"));
+                (TinyIpcEnvironment.FileNotifier, "auto")));
         }
 
         public string ChannelName { get; }
@@ -254,8 +298,19 @@ public sealed class ProductionPathStartupTests
 
         public void Dispose()
         {
-            _overrides.Dispose();
+            for (int i = _cleanup.Count - 1; i >= 0; i--)
+                _cleanup[i].Dispose();
+
             ProductionPathTestEnvironment.ResetLogger();
+
+            try
+            {
+                if (Directory.Exists(Path.GetDirectoryName(StagedHostDirectory) ?? string.Empty))
+                    Directory.Delete(Path.GetDirectoryName(StagedHostDirectory)!, recursive: true);
+            }
+            catch
+            {
+            }
 
             try
             {
@@ -274,5 +329,96 @@ public sealed class ProductionPathStartupTests
         None,
         Valid,
         Invalid
+    }
+
+    private sealed class NativeHostArchiveServer : IDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _serverTask;
+        private readonly byte[] _payload;
+
+        public NativeHostArchiveServer(byte[] payload)
+        {
+            _payload = payload;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            Url = $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/XivIpc.NativeHost-linux-x64.tar.gz";
+            _serverTask = Task.Run(ServeAsync);
+        }
+
+        public string Url { get; }
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+
+            try
+            {
+                _listener.Stop();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _serverTask.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch
+            {
+            }
+
+            _cts.Dispose();
+        }
+
+        private async Task ServeAsync()
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                TcpClient client;
+                try
+                {
+                    client = await _listener.AcceptTcpClientAsync(_cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;
+                }
+
+                _ = Task.Run(() => HandleClientAsync(client), _cts.Token);
+            }
+        }
+
+        private async Task HandleClientAsync(TcpClient client)
+        {
+            using (client)
+            using (NetworkStream stream = client.GetStream())
+            {
+                using var reader = new StreamReader(stream, System.Text.Encoding.ASCII, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
+
+                while (!_cts.IsCancellationRequested)
+                {
+                    string? line = await reader.ReadLineAsync();
+                    if (line is null || line.Length == 0)
+                        break;
+                }
+
+                string header =
+                    "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: application/gzip\r\n"
+                    + $"Content-Length: {_payload.Length}\r\n"
+                    + "Connection: close\r\n\r\n";
+
+                byte[] headerBytes = System.Text.Encoding.ASCII.GetBytes(header);
+                await stream.WriteAsync(headerBytes, _cts.Token);
+                await stream.WriteAsync(_payload, _cts.Token);
+                await stream.FlushAsync(_cts.Token);
+            }
+        }
     }
 }

@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
+using System.Net.Http;
 using System.Net.Sockets;
 using XivIpc.Internal;
 
@@ -6,15 +9,26 @@ namespace XivIpc.Messaging;
 
 internal static class UnixSidecarProcessManager
 {
-    private const string BrokerDirectoryName = "xivipc";
     private const string BrokerSocketFileName = "tinyipc-sidecar.sock";
+    private const string DefaultNativeHostPathUnix = "/tmp/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost";
+    private const string DefaultNativeHostDownloadUrl = "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/latest/download/XivIpc.NativeHost-linux-x64.tar.gz";
     private const int StartupTimeoutMs = 10_000;
     private static readonly TimeSpan BrokerTerminationTimeout = TimeSpan.FromSeconds(5);
+    private static readonly HttpClient NativeHostHttpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
 
     private static readonly object Sync = new();
+    private static readonly AsyncLocal<NativeHostDefaultsOverrideScope?> CurrentNativeHostDefaultsOverride = new();
 
     private static Process? _process;
     private static int _refCount;
+
+    internal static IDisposable OverrideNativeHostDefaultsForTests(string? defaultNativeHostPath = null, string? downloadUrl = null)
+    {
+        NativeHostDefaultsOverrideScope? previous = CurrentNativeHostDefaultsOverride.Value;
+        var next = new NativeHostDefaultsOverrideScope(previous, defaultNativeHostPath, downloadUrl);
+        CurrentNativeHostDefaultsOverride.Value = next;
+        return next;
+    }
 
     internal static Lease Acquire()
         => Acquire(CaptureSettings());
@@ -45,7 +59,8 @@ internal static class UnixSidecarProcessManager
         string? explicitHostPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.NativeHostPath);
         string? explicitSocketPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath);
 
-        string resolvedBrokerDirectory = ResolveBrokerDirectory(sharedDirectory, brokerDirectory);
+        string resolvedSharedDirectory = UnixSharedStorageHelpers.ResolveSharedDirectoryForCurrentRuntime(sharedDirectory);
+        string resolvedBrokerDirectory = ResolveBrokerDirectory(resolvedSharedDirectory, brokerDirectory);
         string socketPath = string.IsNullOrWhiteSpace(explicitSocketPath)
             ? CombineUnixPath(resolvedBrokerDirectory, BrokerSocketFileName)
             : ResolveUnixPath(explicitSocketPath);
@@ -54,7 +69,7 @@ internal static class UnixSidecarProcessManager
         return new RuntimeSettings(
             socketPath,
             resolvedBrokerDirectory,
-            string.IsNullOrWhiteSpace(sharedDirectory) ? string.Empty : ResolveUnixPath(sharedDirectory),
+            ResolveUnixPath(resolvedSharedDirectory),
             diagnosticsDirectory,
             sharedGroup,
             enableLogging,
@@ -174,10 +189,10 @@ internal static class UnixSidecarProcessManager
         hostPathUnix = ConvertWindowsPathToUnix(hostPathWindows);
         launchId = Guid.NewGuid().ToString("N");
 
-        string diagnosticsDirectory = settings.DiagnosticsDirectory;
+        string diagnosticsDirectory = ResolveUnixPath(settings.DiagnosticsDirectory);
         Directory.CreateDirectory(diagnosticsDirectory);
-        stdoutLogPath = Path.Combine(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stdout.log");
-        stderrLogPath = Path.Combine(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stderr.log");
+        stdoutLogPath = CombineUnixPath(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stdout.log");
+        stderrLogPath = CombineUnixPath(diagnosticsDirectory, $"tinyipc-sidecar-{launchId}.stderr.log");
 
         bool isDll = string.Equals(Path.GetExtension(hostPathUnix), ".dll", StringComparison.OrdinalIgnoreCase);
         ProcessStartInfo psi;
@@ -279,19 +294,17 @@ internal static class UnixSidecarProcessManager
     private static string ResolveBrokerDirectory()
     {
         return ResolveBrokerDirectory(
-            TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory),
+            UnixSharedStorageHelpers.ResolveSharedDirectoryForCurrentRuntime(
+                TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
             TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory));
     }
 
-    private static string ResolveBrokerDirectory(string? sharedDirectory, string? explicitDirectory)
+    private static string ResolveBrokerDirectory(string sharedDirectory, string? explicitDirectory)
     {
         if (!string.IsNullOrWhiteSpace(explicitDirectory))
             return ResolveUnixPath(explicitDirectory);
 
-        if (!string.IsNullOrWhiteSpace(sharedDirectory))
-            return ResolveUnixPath(sharedDirectory);
-
-        return Path.Combine("/run", BrokerDirectoryName);
+        return ResolveUnixPath(sharedDirectory);
     }
 
     private static string BuildBrokerStartupDiagnostics(RuntimeSettings settings, string socketPath, string statePath)
@@ -340,6 +353,8 @@ internal static class UnixSidecarProcessManager
                 return resolved;
         }
 
+        EnsureDefaultNativeHostAvailable(settings);
+
         string[] candidates = GetNativeHostCandidatePathsForDiagnostics(settings);
 
         string? existing = candidates.FirstOrDefault(File.Exists);
@@ -386,6 +401,11 @@ internal static class UnixSidecarProcessManager
         if (!string.IsNullOrWhiteSpace(brokerDirectory))
             AddCandidates(Path.Combine(brokerDirectory, "tinyipc-native-host"));
 
+        string resolvedDefaultHostPath = ResolveNativePath(GetDefaultNativeHostPathRaw());
+        candidates.Add(resolvedDefaultHostPath);
+        candidates.Add(resolvedDefaultHostPath + ".dll");
+        candidates.Add(resolvedDefaultHostPath + ".exe");
+
         string baseDir = AppContext.BaseDirectory;
         candidates.Add(Path.Combine(baseDir, "XivIpc.NativeHost"));
         candidates.Add(Path.Combine(baseDir, "XivIpc.NativeHost.dll"));
@@ -401,6 +421,160 @@ internal static class UnixSidecarProcessManager
         candidates.Add(Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "XivIpc.NativeHost", "bin", "Release", "net9.0", "XivIpc.NativeHost.dll")));
 
         return candidates.Distinct(StringComparer.Ordinal).ToArray();
+    }
+
+    private static void EnsureDefaultNativeHostAvailable(RuntimeSettings settings)
+    {
+        if (!string.IsNullOrWhiteSpace(settings.ExplicitNativeHostPath))
+            return;
+
+        string defaultHostPath = ResolveNativePath(GetDefaultNativeHostPathRaw());
+        string defaultHostUnixPath = ResolveUnixPath(GetDefaultNativeHostPathRaw());
+        if (File.Exists(defaultHostPath))
+        {
+            UnixSharedStorageHelpers.ApplyHostExecutablePermissions(defaultHostPath);
+            return;
+        }
+
+        string? hostDirectory = Path.GetDirectoryName(defaultHostPath);
+        string? hostDirectoryUnix = Path.GetDirectoryName(defaultHostUnixPath);
+        if (string.IsNullOrWhiteSpace(hostDirectory))
+            throw new SidecarStartupException("The default native host path must have a parent directory.");
+        if (string.IsNullOrWhiteSpace(hostDirectoryUnix))
+            throw new SidecarStartupException("The default native host Unix path must have a parent directory.");
+
+        Directory.CreateDirectory(hostDirectory);
+        string lockPath = Path.Combine(hostDirectory, ".tinyipc-native-host.install.lock");
+        using var installLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+        if (File.Exists(defaultHostPath))
+        {
+            UnixSharedStorageHelpers.ApplyHostExecutablePermissions(defaultHostPath);
+            return;
+        }
+
+        string archivePath = Path.Combine(hostDirectory, "XivIpc.NativeHost-linux-x64.tar.gz.download");
+        string archiveUnixPath = Path.Combine(hostDirectoryUnix, "XivIpc.NativeHost-linux-x64.tar.gz.download");
+        string tempExtractDirectory = Path.Combine(hostDirectory, ".tinyipc-native-host.extract");
+        string tempExtractDirectoryUnix = Path.Combine(hostDirectoryUnix, ".tinyipc-native-host.extract");
+        string tempExtractPath = Path.Combine(tempExtractDirectory, "XivIpc.NativeHost");
+
+        try
+        {
+            DownloadNativeHostArchive(archivePath);
+            ExtractNativeHostFromArchive(archivePath, archiveUnixPath, tempExtractDirectory, tempExtractDirectoryUnix);
+            UnixSharedStorageHelpers.ApplyHostExecutablePermissions(tempExtractPath);
+            File.Move(tempExtractPath, defaultHostPath, overwrite: true);
+            UnixSharedStorageHelpers.ApplyHostExecutablePermissions(defaultHostPath);
+        }
+        finally
+        {
+            TryDeleteDirectory(tempExtractDirectory);
+            TryDeleteFile(archivePath);
+        }
+    }
+
+    private static void DownloadNativeHostArchive(string archivePath)
+    {
+        using HttpResponseMessage response = NativeHostHttpClient.GetAsync(GetDefaultNativeHostDownloadUrl(), HttpCompletionOption.ResponseHeadersRead)
+            .GetAwaiter()
+            .GetResult();
+        response.EnsureSuccessStatusCode();
+
+        using Stream responseStream = response.Content.ReadAsStream();
+        using var output = new FileStream(archivePath, FileMode.Create, FileAccess.Write, FileShare.None);
+        responseStream.CopyTo(output);
+    }
+
+    private static void ExtractNativeHostFromArchive(string archivePath, string archiveUnixPath, string destinationDirectory, string destinationDirectoryUnix)
+    {
+        TryDeleteDirectory(destinationDirectory);
+        Directory.CreateDirectory(destinationDirectory);
+
+        if (RuntimeEnvironmentDetector.Detect().IsWindowsProcess &&
+            TryExtractNativeHostWithTarCommand(archiveUnixPath, destinationDirectoryUnix))
+        {
+            string extractedHostPath = Path.Combine(destinationDirectory, "XivIpc.NativeHost");
+            if (File.Exists(extractedHostPath))
+                return;
+
+            throw new SidecarStartupException("The native tar extraction path completed without producing XivIpc.NativeHost.");
+        }
+
+        using var archiveStream = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var gzipStream = new GZipStream(archiveStream, CompressionMode.Decompress);
+        using var reader = new TarReader(gzipStream);
+
+        TarEntry? entry;
+        while ((entry = reader.GetNextEntry()) is not null)
+        {
+            if (entry.EntryType is TarEntryType.Directory)
+                continue;
+
+            string name = entry.Name.Replace('\\', '/');
+            if (!string.Equals(Path.GetFileName(name), "XivIpc.NativeHost", StringComparison.Ordinal))
+                continue;
+
+            using Stream entryStream = entry.DataStream ?? throw new InvalidOperationException("Native host archive entry did not include file contents.");
+            using var output = new FileStream(Path.Combine(destinationDirectory, "XivIpc.NativeHost"), FileMode.Create, FileAccess.Write, FileShare.None);
+            entryStream.CopyTo(output);
+            return;
+        }
+
+        throw new SidecarStartupException("Downloaded native host archive did not contain XivIpc.NativeHost.");
+    }
+
+    private static bool TryExtractNativeHostWithTarCommand(string archiveUnixPath, string destinationDirectoryUnix)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo("/usr/bin/env")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                ArgumentList =
+                {
+                    "tar",
+                    "-xzf",
+                    archiveUnixPath,
+                    "-C",
+                    destinationDirectoryUnix,
+                    "XivIpc.NativeHost"
+                }
+            });
+
+            process?.WaitForExit();
+            return process is { ExitCode: 0 };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+        }
     }
 
     internal static int GetOwnedProcessIdForDiagnostics()
@@ -662,6 +836,12 @@ internal static class UnixSidecarProcessManager
     private static string QuoteForShell(string value)
         => "'" + value.Replace("'", "'\"'\"'") + "'";
 
+    private static string GetDefaultNativeHostPathRaw()
+        => CurrentNativeHostDefaultsOverride.Value?.DefaultNativeHostPath ?? DefaultNativeHostPathUnix;
+
+    private static string GetDefaultNativeHostDownloadUrl()
+        => CurrentNativeHostDefaultsOverride.Value?.DownloadUrl ?? DefaultNativeHostDownloadUrl;
+
     internal readonly struct Lease : IDisposable
     {
         internal Lease(string socketPath) => SocketPath = socketPath;
@@ -682,4 +862,29 @@ internal static class UnixSidecarProcessManager
         string? LogFileCount,
         string? FileNotifier,
         string? ExplicitNativeHostPath);
+
+    private sealed class NativeHostDefaultsOverrideScope : IDisposable
+    {
+        private readonly NativeHostDefaultsOverrideScope? _previous;
+        private bool _disposed;
+
+        internal NativeHostDefaultsOverrideScope(NativeHostDefaultsOverrideScope? previous, string? defaultNativeHostPath, string? downloadUrl)
+        {
+            _previous = previous;
+            DefaultNativeHostPath = defaultNativeHostPath;
+            DownloadUrl = downloadUrl;
+        }
+
+        internal string? DefaultNativeHostPath { get; }
+        internal string? DownloadUrl { get; }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            CurrentNativeHostDefaultsOverride.Value = _previous;
+            _disposed = true;
+        }
+    }
 }

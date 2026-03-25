@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using XivIpc.Internal;
 
 namespace XivIpc.Messaging;
@@ -16,11 +17,8 @@ internal sealed record BrokerStateSnapshot(
     int ChannelCount,
     long LastUpdatedUtcTicks)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    private static readonly JsonTypeInfo<BrokerStateSnapshot> JsonTypeInfo =
+        BrokerStateSnapshotJsonContext.Default.BrokerStateSnapshot;
 
     internal static string ResolvePath(string socketPath)
     {
@@ -57,7 +55,7 @@ internal sealed record BrokerStateSnapshot(
                 return null;
 
             string json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<BrokerStateSnapshot>(json, JsonOptions);
+            return JsonSerializer.Deserialize(json, JsonTypeInfo);
         }
         catch
         {
@@ -78,7 +76,7 @@ internal sealed record BrokerStateSnapshot(
         }
 
         string tempPath = path + "." + snapshot.InstanceId + ".tmp";
-        string json = JsonSerializer.Serialize(snapshot, JsonOptions);
+        string json = JsonSerializer.Serialize(snapshot, JsonTypeInfo);
 
         File.WriteAllText(tempPath, json);
         UnixSharedStorageHelpers.ApplyBrokerPermissions(tempPath, isDirectory: false);
@@ -151,4 +149,12 @@ internal sealed record BrokerStateSnapshot(
             return null;
         }
     }
+}
+
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(BrokerStateSnapshot))]
+internal partial class BrokerStateSnapshotJsonContext : JsonSerializerContext
+{
 }

@@ -441,6 +441,7 @@ publish_native_host() {
     -r linux-x64 \
     --self-contained true \
     -p:PublishSingleFile=true \
+    -p:PublishTrimmed=true \
     -o "${host_dist_dir}"
 
   [[ -f "${host_dist_dir}/XivIpc.NativeHost" ]] || die "Missing ${host_dist_dir}/XivIpc.NativeHost"

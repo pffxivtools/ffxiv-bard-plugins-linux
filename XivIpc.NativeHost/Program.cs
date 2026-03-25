@@ -29,6 +29,8 @@ TinyIpcLogger.Info(
     ("sharedGroup", Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP") ?? string.Empty),
     ("brokerSocketPath", Environment.GetEnvironmentVariable("TINYIPC_BROKER_SOCKET_PATH") ?? string.Empty),
     ("backend", Environment.GetEnvironmentVariable("TINYIPC_BUS_BACKEND") ?? string.Empty));
+if (!string.IsNullOrWhiteSpace(Environment.ProcessPath))
+    UnixSharedStorageHelpers.ApplyHostExecutablePermissions(Environment.ProcessPath);
 UnixSharedStorageHelpers.EnsureBrokerAccessConfigured();
 
 string socketPath = ResolveSocketPath();

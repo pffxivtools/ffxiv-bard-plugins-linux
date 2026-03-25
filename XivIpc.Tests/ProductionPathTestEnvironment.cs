@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using XivIpc.Internal;
 using Xunit;
@@ -8,6 +10,8 @@ namespace XivIpc.Tests;
 internal static class ProductionPathTestEnvironment
 {
     internal const string BackendName = "production-auto";
+    private static readonly object PublishedHostSync = new();
+    private static string? _publishedHostPath;
 
     internal static bool IsProductionPath(string backendOrMode)
         => string.Equals(backendOrMode, BackendName, StringComparison.OrdinalIgnoreCase);
@@ -60,6 +64,39 @@ internal static class ProductionPathTestEnvironment
         }
 
         return stagingDirectory;
+    }
+
+    internal static string PrepareStandaloneNativeHost(string hostPath)
+    {
+        string sourceHost = ResolvePublishedHostPath();
+        string? directory = Path.GetDirectoryName(hostPath);
+        if (!string.IsNullOrWhiteSpace(directory))
+            Directory.CreateDirectory(directory);
+
+        File.Copy(sourceHost, hostPath, overwrite: true);
+        EnsureExecutablePermissions(hostPath);
+        return hostPath;
+    }
+
+    internal static byte[] CreateNativeHostArchiveBytes()
+    {
+        string sourceHost = ResolvePublishedHostPath();
+
+        using var archiveStream = new MemoryStream();
+        using (var gzipStream = new GZipStream(archiveStream, CompressionLevel.SmallestSize, leaveOpen: true))
+        using (var tarWriter = new TarWriter(gzipStream, leaveOpen: true))
+        {
+            var entry = new PaxTarEntry(TarEntryType.RegularFile, "XivIpc.NativeHost")
+            {
+                DataStream = File.OpenRead(sourceHost),
+                Mode = (UnixFileMode)Convert.ToInt32("755", 8)
+            };
+
+            using (entry.DataStream)
+                tarWriter.WriteEntry(entry);
+        }
+
+        return archiveStream.ToArray();
     }
 
     internal static string PrepareInvalidStagedNativeHost(string unixSharedDirectory)
@@ -269,6 +306,27 @@ internal static class ProductionPathTestEnvironment
         return Convert.ToHexString(SHA256.HashData(stream));
     }
 
+    internal static string ReadUnixMode(string path)
+    {
+        using var process = Process.Start(new ProcessStartInfo("stat")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            ArgumentList = { "-c", "%a", path }
+        }) ?? throw new InvalidOperationException("Failed to start 'stat'.");
+
+        string output = process.StandardOutput.ReadToEnd().Trim();
+        process.WaitForExit();
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+        {
+            string error = process.StandardError.ReadToEnd().Trim();
+            throw new InvalidOperationException($"stat '%a' failed for '{path}' with exit code {process.ExitCode}: {error}");
+        }
+
+        return output;
+    }
+
     internal static string ExtractField(string logContents, string eventMarker, string key)
     {
         foreach (string line in logContents.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries))
@@ -307,6 +365,53 @@ internal static class ProductionPathTestEnvironment
 
         return candidates.FirstOrDefault(File.Exists)
             ?? throw new InvalidOperationException("Could not resolve a built XivIpc.NativeHost artifact for production-path tests.");
+    }
+
+    private static string ResolvePublishedHostPath()
+    {
+        lock (PublishedHostSync)
+        {
+            if (!string.IsNullOrWhiteSpace(_publishedHostPath) && File.Exists(_publishedHostPath))
+                return _publishedHostPath;
+
+            string baseDir = AppContext.BaseDirectory;
+            string repoRoot = Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", ".."));
+            string projectPath = Path.Combine(repoRoot, "XivIpc.NativeHost", "XivIpc.NativeHost.csproj");
+            string outputDir = Path.Combine(Path.GetTempPath(), "xivipc-native-host-publish-tests", "linux-x64");
+            Directory.CreateDirectory(outputDir);
+
+            using var process = Process.Start(new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                ArgumentList =
+                {
+                    "publish",
+                    projectPath,
+                    "-c", "Release",
+                    "-f", "net9.0",
+                    "-r", "linux-x64",
+                    "--self-contained", "true",
+                    "-p:PublishSingleFile=true",
+                    "-o", outputDir
+                }
+            }) ?? throw new InvalidOperationException("Failed to start 'dotnet publish' for native host test fixture generation.");
+
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            string publishedHostPath = Path.Combine(outputDir, "XivIpc.NativeHost");
+            if (process.ExitCode != 0 || !File.Exists(publishedHostPath))
+            {
+                throw new InvalidOperationException(
+                    $"Failed to publish a self-contained XivIpc.NativeHost test fixture. exitCode={process.ExitCode}{Environment.NewLine}{stdout}{Environment.NewLine}{stderr}");
+            }
+
+            _publishedHostPath = publishedHostPath;
+            return publishedHostPath;
+        }
     }
 
     private static bool IsCurrentUserInGroup(string groupName)
@@ -353,6 +458,14 @@ internal static class ProductionPathTestEnvironment
 
         process.WaitForExit();
         return process.ExitCode == 0;
+    }
+
+    private static void EnsureExecutablePermissions(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        ApplyCommand("chmod", "755", path);
     }
 
     private static void ApplyCommand(string command, string argument, string path)
