@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Net.Sockets;
 using System.Reflection;
-using TinyIpc.IO;
 using TinyIpc.Messaging;
 using XivIpc.Internal;
 using XivIpc.Messaging;
