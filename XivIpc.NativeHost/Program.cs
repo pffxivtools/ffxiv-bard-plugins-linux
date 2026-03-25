@@ -670,7 +670,7 @@ bool AuthorizePeer(LinuxBrokerInterop.PeerCredentials credentials)
 {
     string? groupName = Environment.GetEnvironmentVariable("TINYIPC_SHARED_GROUP");
     if (string.IsNullOrWhiteSpace(groupName))
-        return false;
+        return true;
 
     uint? gid = ResolveGroupId(groupName);
     if (!gid.HasValue)
