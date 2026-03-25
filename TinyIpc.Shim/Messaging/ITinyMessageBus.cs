@@ -1,5 +1,3 @@
-using System.Collections.Generic;
-
 namespace TinyIpc.Messaging;
 
 public interface ITinyMessageBus : IDisposable, IAsyncDisposable

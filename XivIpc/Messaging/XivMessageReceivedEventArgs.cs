@@ -1,14 +1,11 @@
-using System;
+namespace XivIpc.Messaging;
 
-namespace XivIpc.Messaging
+public sealed class XivMessageReceivedEventArgs : EventArgs
 {
-    public sealed class XivMessageReceivedEventArgs : EventArgs
+    public XivMessageReceivedEventArgs(byte[] message)
     {
-        public XivMessageReceivedEventArgs(byte[] message)
-        {
-            Message = message ?? throw new ArgumentNullException(nameof(message));
-        }
-
-        public byte[] Message { get; }
+        Message = message ?? throw new ArgumentNullException(nameof(message));
     }
+
+    public byte[] Message { get; }
 }

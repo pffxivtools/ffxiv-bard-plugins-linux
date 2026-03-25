@@ -1,12 +1,9 @@
-using System;
+namespace XivIpc.Messaging;
 
-namespace XivIpc.Messaging
+internal sealed class UnixSharedMemoryBackendUnavailableException : Exception
 {
-    internal sealed class UnixSharedMemoryBackendUnavailableException : Exception
+    public UnixSharedMemoryBackendUnavailableException(string message, Exception? innerException = null)
+        : base(message, innerException)
     {
-        public UnixSharedMemoryBackendUnavailableException(string message, Exception? innerException = null)
-            : base(message, innerException)
-        {
-        }
     }
 }

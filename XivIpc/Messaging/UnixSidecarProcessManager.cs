@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Formats.Tar;
 using System.IO.Compression;
-using System.Net.Http;
 using System.Net.Sockets;
 using XivIpc.Internal;
 

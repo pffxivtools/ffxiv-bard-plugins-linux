@@ -1,5 +1,3 @@
-using System.Threading;
-
 namespace TinyIpc.Synchronization;
 
 public interface ITinyReadWriteLock : IDisposable
