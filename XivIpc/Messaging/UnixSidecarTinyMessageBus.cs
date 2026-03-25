@@ -6,13 +6,11 @@ namespace XivIpc.Messaging;
 
 public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 {
-    public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
-    {
-        private const int DefaultHeartbeatIntervalMs = 2000;
-        private const int DefaultHeartbeatTimeoutMs = 60000;
-        private const int MaxReconnectQueuedMessages = 64;
-        private const int InitialConnectRetryAttempts = 5;
-        private const int InitialConnectRetryDelayMs = 50;
+    private const int DefaultHeartbeatIntervalMs = 2000;
+    private const int DefaultHeartbeatTimeoutMs = 60000;
+    private const int MaxReconnectQueuedMessages = 64;
+    private const int InitialConnectRetryAttempts = 5;
+    private const int InitialConnectRetryDelayMs = 50;
 
     private static readonly TimeSpan[] ReconnectBackoffSchedule =
     {
@@ -312,6 +310,41 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
     private async Task ConnectAndAttachAsync(CancellationToken cancellationToken)
     {
+        Exception? lastTransient = null;
+
+        for (int attempt = 1; attempt <= InitialConnectRetryAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                await ConnectAndAttachOnceAsync(cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (attempt < InitialConnectRetryAttempts && IsTransientStartupConnectFailure(ex))
+            {
+                lastTransient = ex;
+                TinyIpcLogger.Warning(
+                    nameof(UnixSidecarTinyMessageBus),
+                    "InitialConnectTransientFailure",
+                    "Observed a transient sidecar connect or handshake failure immediately after broker acquisition; retrying inline.",
+                    ex,
+                    ("channel", _channelName),
+                    ("attempt", attempt),
+                    ("maxAttempts", InitialConnectRetryAttempts),
+                    ("delayMs", InitialConnectRetryDelayMs));
+
+                await Task.Delay(InitialConnectRetryDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Transient sidecar startup retries were exhausted without establishing a broker session.",
+            lastTransient);
+    }
+
+    private async Task ConnectAndAttachOnceAsync(CancellationToken cancellationToken)
+    {
         lock (_stateGate)
         {
             if (_disposed)
@@ -327,41 +360,45 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
         try
         {
-            Exception? lastTransient = null;
+            lease = UnixSidecarProcessManager.Acquire(_runtimeSettings);
+            socket = ConnectOnce(lease.SocketPath);
 
-            for (int attempt = 1; attempt <= InitialConnectRetryAttempts; attempt++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+            SidecarProtocol.WriteHello(socket, new SidecarHello(
+                _channelName,
+                _requestedBufferBytes,
+                RuntimeEnvironmentDetector.GetCurrentProcessId(),
+                ResolveHeartbeatIntervalMs(),
+                ResolveHeartbeatTimeoutMs(),
+                _clientInstanceId));
 
-                try
-                {
-                    await ConnectAndAttachOnceAsync(cancellationToken).ConfigureAwait(false);
-                    return;
-                }
-                catch (Exception ex) when (attempt < InitialConnectRetryAttempts && IsTransientStartupConnectFailure(ex))
-                {
-                    lastTransient = ex;
-                    TinyIpcLogger.Warning(
-                        nameof(UnixSidecarTinyMessageBus),
-                        "InitialConnectTransientFailure",
-                        "Observed a transient sidecar connect or handshake failure immediately after broker acquisition; retrying inline.",
-                        ex,
-                        ("channel", _channelName),
-                        ("attempt", attempt),
-                        ("maxAttempts", InitialConnectRetryAttempts),
-                        ("delayMs", InitialConnectRetryDelayMs));
+            SidecarFrame attachFrame = SidecarProtocol.ReadFrame(socket);
+            LogAttachFrameReceived(attachFrame);
+            SidecarAttachRing attach = DecodeAttachFrame(attachFrame);
+            journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, ResolveMinMessageAgeMs());
+            JournalSizing sizing = JournalSizingPolicy.Compute(_requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
 
-                    await Task.Delay(InitialConnectRetryDelayMs, cancellationToken).ConfigureAwait(false);
-                }
-            }
+            SidecarFrame readyFrame = SidecarProtocol.ReadFrame(socket);
+            if (readyFrame.Type == SidecarFrameType.Error)
+                throw new InvalidOperationException(System.Text.Encoding.UTF8.GetString(readyFrame.Payload.Span));
 
-            throw new InvalidOperationException(
-                "Transient sidecar startup retries were exhausted without establishing a broker session.",
-                lastTransient);
-        }
+            if (readyFrame.Type != SidecarFrameType.Ready)
+                throw new InvalidOperationException($"Expected sidecar READY but received '{readyFrame.Type}'.");
 
-        private async Task ConnectAndAttachOnceAsync(CancellationToken cancellationToken)
-        {
+            connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Socket eventSocket = socket;
+            BrokeredChannelJournal eventJournal = journal;
+            CancellationTokenSource eventConnectionCts = connectionCts;
+
+            Task eventLoopTask = ObserveTaskFault(
+                Task.Run(() => EventLoopAsync(eventSocket, eventJournal, attach.SessionId, eventConnectionCts.Token)),
+                "EventLoopFaulted",
+                "The broker-backed event loop faulted unexpectedly.");
+
+            Task heartbeatTask = ObserveTaskFault(
+                Task.Run(() => HeartbeatLoopAsync(eventSocket, eventConnectionCts.Token)),
+                "HeartbeatLoopFaulted",
+                "The broker-backed heartbeat loop faulted unexpectedly.");
+
             lock (_stateGate)
             {
                 if (_disposed)
@@ -1025,35 +1062,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                     "Failed to dispose journal during connection teardown.");
             }
 
-        private static bool IsTransientStartupConnectFailure(Exception ex)
-        {
-            ex = UnwrapConnectionException(ex);
-            return ex is SocketException
-                or IOException
-                or EndOfStreamException;
-        }
-
-        private static Exception UnwrapConnectionException(Exception ex)
-        {
-            while (true)
-            {
-                switch (ex)
-                {
-                    case AggregateException aggregate when aggregate.InnerExceptions.Count == 1:
-                        ex = aggregate.InnerExceptions[0];
-                        continue;
-                    case InvalidOperationException invalid when invalid.InnerException is not null:
-                        ex = invalid.InnerException;
-                        continue;
-                    default:
-                        return ex;
-                }
-            }
-        }
-
-        private SidecarAttachRing DecodeAttachFrame(SidecarFrame frame)
-        {
-            if (frame.Type == SidecarFrameType.Error)
+            if (lease.HasValue)
             {
                 UnixSidecarProcessManager.Lease leaseValue = lease.Value;
                 SafeInvoke(
@@ -1288,6 +1297,32 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         {
             socket.Dispose();
             throw;
+        }
+    }
+
+    private static bool IsTransientStartupConnectFailure(Exception ex)
+    {
+        ex = UnwrapConnectionException(ex);
+        return ex is SocketException
+            or IOException
+            or EndOfStreamException;
+    }
+
+    private static Exception UnwrapConnectionException(Exception ex)
+    {
+        while (true)
+        {
+            switch (ex)
+            {
+                case AggregateException aggregate when aggregate.InnerExceptions.Count == 1:
+                    ex = aggregate.InnerExceptions[0];
+                    continue;
+                case InvalidOperationException invalid when invalid.InnerException is not null:
+                    ex = invalid.InnerException;
+                    continue;
+                default:
+                    return ex;
+            }
         }
     }
 
