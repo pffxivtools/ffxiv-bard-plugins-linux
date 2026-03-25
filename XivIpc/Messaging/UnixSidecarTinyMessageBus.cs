@@ -10,6 +10,8 @@ namespace XivIpc.Messaging
         private const int DefaultHeartbeatIntervalMs = 2000;
         private const int DefaultHeartbeatTimeoutMs = 60000;
         private const int MaxReconnectQueuedMessages = 64;
+        private const int InitialConnectRetryAttempts = 5;
+        private const int InitialConnectRetryDelayMs = 50;
 
         private static readonly TimeSpan[] ReconnectBackoffSchedule =
         {
@@ -308,6 +310,41 @@ namespace XivIpc.Messaging
         }
 
         private async Task ConnectAndAttachAsync(CancellationToken cancellationToken)
+        {
+            Exception? lastTransient = null;
+
+            for (int attempt = 1; attempt <= InitialConnectRetryAttempts; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    await ConnectAndAttachOnceAsync(cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+                catch (Exception ex) when (attempt < InitialConnectRetryAttempts && IsTransientStartupConnectFailure(ex))
+                {
+                    lastTransient = ex;
+                    TinyIpcLogger.Warning(
+                        nameof(UnixSidecarTinyMessageBus),
+                        "InitialConnectTransientFailure",
+                        "Observed a transient sidecar connect or handshake failure immediately after broker acquisition; retrying inline.",
+                        ex,
+                        ("channel", _channelName),
+                        ("attempt", attempt),
+                        ("maxAttempts", InitialConnectRetryAttempts),
+                        ("delayMs", InitialConnectRetryDelayMs));
+
+                    await Task.Delay(InitialConnectRetryDelayMs, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            throw new InvalidOperationException(
+                "Transient sidecar startup retries were exhausted without establishing a broker session.",
+                lastTransient);
+        }
+
+        private async Task ConnectAndAttachOnceAsync(CancellationToken cancellationToken)
         {
             lock (_stateGate)
             {
@@ -1261,6 +1298,32 @@ namespace XivIpc.Messaging
             {
                 socket.Dispose();
                 throw;
+            }
+        }
+
+        private static bool IsTransientStartupConnectFailure(Exception ex)
+        {
+            ex = UnwrapConnectionException(ex);
+            return ex is SocketException
+                or IOException
+                or EndOfStreamException;
+        }
+
+        private static Exception UnwrapConnectionException(Exception ex)
+        {
+            while (true)
+            {
+                switch (ex)
+                {
+                    case AggregateException aggregate when aggregate.InnerExceptions.Count == 1:
+                        ex = aggregate.InnerExceptions[0];
+                        continue;
+                    case InvalidOperationException invalid when invalid.InnerException is not null:
+                        ex = invalid.InnerException;
+                        continue;
+                    default:
+                        return ex;
+                }
             }
         }
 
