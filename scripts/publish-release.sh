@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-export PUBLISH_CONTEXT=release
+: "${PUBLISH_CONTEXT:=release}"
+export PUBLISH_CONTEXT
 
 # shellcheck source=./release-common.sh
 source "${SCRIPT_DIR}/release-common.sh"
@@ -26,7 +27,12 @@ NATIVE_HOST_DIR="${WORK_DIR}/native-host"
 reset_release_dirs() {
   rm -rf "${DIST_DIR}"
   mkdir -p "${WORK_DIR}" "${ASSETS_DIR}" "${METADATA_DIR}" "${RELEASE_ITEMS_DIR}"
-  printf '[]\n' > "${PLUGINMASTER_FILE}"
+
+  if [[ -f "${ROOT_PLUGINMASTER_FILE}" ]]; then
+    cp -f "${ROOT_PLUGINMASTER_FILE}" "${PLUGINMASTER_FILE}"
+  else
+    printf '[]\n' > "${PLUGINMASTER_FILE}"
+  fi
 }
 
 release_notes_for_plugin() {
@@ -85,6 +91,7 @@ build_semver_release_item() {
 main() {
   ensure_release_prereqs
   reset_release_dirs
+  ensure_pluginmaster_file "${PLUGINMASTER_FILE}"
 
   local target
   while IFS= read -r target; do
@@ -92,7 +99,7 @@ main() {
     log "Processing ${plugin_name}"
 
     local manifest_file="${WORK_DIR}/${asset_slug}.pluginmaster.json"
-    if [[ "${source_kind}" == "local-bardtoolbox" ]]; then
+    if [[ "${source_kind}" == "local-bardtoolbox" && "${PUBLISH_CONTEXT}" != "local" ]]; then
       source_kind="github-url-pluginmaster"
       source_value="https://raw.githubusercontent.com/${BARDTOOLBOX_PRIVATE_REPO}/${BARDTOOLBOX_PRIVATE_REF}/pluginmaster.json"
     fi
@@ -107,6 +114,15 @@ main() {
     [[ -n "${download_url}" && "${download_url}" != "null" ]] || die "Could not find DownloadLinkInstall for ${plugin_name}"
 
     upstream_version="$(get_upstream_version "${original_entry_file}")"
+
+    local local_version
+    local_version="$(get_local_plugin_version_from_pluginmaster "${PLUGINMASTER_FILE}" "${plugin_name}")"
+
+    if [[ "${PUBLISH_SCHEME}" == "plugins" ]] && ! plugin_version_changed "${local_version}" "${upstream_version}"; then
+      log "Skipping ${plugin_name}: upstream version ${upstream_version} matches local pluginmaster version"
+      continue
+    fi
+
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"
     shim_dir="${SHIM_WORK_ROOT}/${asset_slug}.shim"
 
@@ -157,7 +173,12 @@ main() {
 
   sort_pluginmaster_file "${PLUGINMASTER_FILE}"
   cp -f "${PLUGINMASTER_FILE}" "${ROOT_PLUGINMASTER_FILE}"
-  jq -s '{releases: .}' "${RELEASE_ITEMS_DIR}"/*.json > "${METADATA_DIR}/releases.json"
+
+  if compgen -G "${RELEASE_ITEMS_DIR}/*.json" >/dev/null; then
+    jq -s '{releases: .}' "${RELEASE_ITEMS_DIR}"/*.json > "${METADATA_DIR}/releases.json"
+  else
+    jq -n '{releases: []}' > "${METADATA_DIR}/releases.json"
+  fi
 
   log "Release metadata written to ${METADATA_DIR}/releases.json"
   log "Pluginmaster written to ${ROOT_PLUGINMASTER_FILE}"

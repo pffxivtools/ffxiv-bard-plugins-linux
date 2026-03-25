@@ -8,3 +8,4 @@ docker/.xlcore-snapshot/
 docker/artifacts/
 docker/.xlcore-wine-snapshot/
 docker/.xlcore-proton-snapshot/
+.github/act/

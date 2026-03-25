@@ -3,195 +3,122 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+FIXTURE_ROOT="${1:-${REPO_ROOT}/.github/act/fixtures/publish}"
+FIXTURE_ROOT="$(realpath -m "${FIXTURE_ROOT}")"
+FIXTURE_VERSION_MODE="${FIXTURE_VERSION_MODE:-changed}"
 
-FAKE_BIN="$TMP_ROOT/bin"
-FIXTURES="$TMP_ROOT/fixtures"
-mkdir -p "$FAKE_BIN" "$FIXTURES"
+rm -rf "${FIXTURE_ROOT}"
+mkdir -p "${FIXTURE_ROOT}"
 
-make_zip() {
-  local src="$1" out="$2"
-  mkdir -p "$(dirname "$out")"
-  (cd "$src" && zip -qr "$out" .)
+make_plugin_zip() {
+  local plugin_dir="$1"
+  local plugin_dll_name="$2"
+  local output_zip="$3"
+
+  mkdir -p "${plugin_dir}"
+  mkdir -p "$(dirname "${output_zip}")"
+  printf 'stub for %s\n' "${plugin_dll_name}" > "${plugin_dir}/${plugin_dll_name}.dll"
+  printf '{"name":"%s"}\n' "${plugin_dll_name}" > "${plugin_dir}/${plugin_dll_name}.json"
+  output_zip="$(realpath -m "${output_zip}")"
+  (
+    cd "${plugin_dir}"
+    zip -qr "${output_zip}" .
+  )
 }
 
-mkdir -p "$FIXTURES/BardToolboxRepo/publish/BardToolbox"
-cat > "$FIXTURES/BardToolboxRepo/pluginmaster.json" <<'JSON'
+version_for_plugin() {
+  local plugin_name="$1"
+
+  case "${FIXTURE_VERSION_MODE}" in
+    changed)
+      case "${plugin_name}" in
+        BardToolbox) printf '99.99.99-fixture.1\n' ;;
+        MidiBard2) printf '98.98.98-fixture.1\n' ;;
+        MasterOfPuppets) printf '97.97.97-fixture.1\n' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    unchanged)
+      jq -r --arg plugin_name "${plugin_name}" '
+        first(
+          .[]
+          | select(
+              (.Name? == $plugin_name) or
+              (.InternalName? == $plugin_name)
+            )
+          | (.AssemblyVersion // .Version // .TestingAssemblyVersion // empty)
+        ) // empty
+      ' "${REPO_ROOT}/pluginmaster.json"
+      ;;
+    *)
+      printf 'Unsupported FIXTURE_VERSION_MODE: %s\n' "${FIXTURE_VERSION_MODE}" >&2
+      return 1
+      ;;
+  esac
+}
+
+BARDTOOLBOX_VERSION="$(version_for_plugin "BardToolbox")"
+MIDIBARD2_VERSION="$(version_for_plugin "MidiBard2")"
+MASTEROFPUPPETS_VERSION="$(version_for_plugin "MasterOfPuppets")"
+
+# BardToolbox local fixture repo
+BARDTOOLBOX_REPO="${FIXTURE_ROOT}/BardToolbox"
+mkdir -p "${BARDTOOLBOX_REPO}/dist/assets" "${BARDTOOLBOX_REPO}/src/BardToolbox"
+make_plugin_zip "${BARDTOOLBOX_REPO}/src/BardToolbox" "BardToolbox" "${BARDTOOLBOX_REPO}/dist/assets/BardToolbox-upstream.zip"
+cat > "${BARDTOOLBOX_REPO}/pluginmaster.json" <<JSON
 [
   {
+    "Author": "fixture",
     "Name": "BardToolbox",
     "InternalName": "BardToolbox",
-    "AssemblyVersion": "1.2.3",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/BardToolbox/releases/download/1.2.3/BardToolbox.zip"
+    "AssemblyVersion": "${BARDTOOLBOX_VERSION}",
+    "TestingAssemblyVersion": "${BARDTOOLBOX_VERSION}",
+    "DownloadLinkInstall": "file://${BARDTOOLBOX_REPO}/dist/assets/BardToolbox-upstream.zip",
+    "DownloadLinkUpdate": "file://${BARDTOOLBOX_REPO}/dist/assets/BardToolbox-upstream.zip",
+    "DownloadLinkTesting": "file://${BARDTOOLBOX_REPO}/dist/assets/BardToolbox-upstream.zip",
+    "IsHide": false,
+    "LastUpdate": "0"
   }
 ]
 JSON
-printf 'bard dll\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/BardToolbox.dll"
-printf 'bard json\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/BardToolbox.json"
-printf 'orig tinyipc\n' > "$FIXTURES/BardToolboxRepo/publish/BardToolbox/TinyIpc.dll"
-make_zip "$FIXTURES/BardToolboxRepo/publish/BardToolbox" "$FIXTURES/BardToolboxRepo/BardToolbox.zip"
 
-mkdir -p "$FIXTURES/MidiBard2Src"
-printf 'midi dll\n' > "$FIXTURES/MidiBard2Src/MidiBard2.dll"
-printf 'orig tinyipc\n' > "$FIXTURES/MidiBard2Src/TinyIpc.dll"
-make_zip "$FIXTURES/MidiBard2Src" "$FIXTURES/MidiBard2.zip"
-cat > "$FIXTURES/MidiBard2.pluginmaster.json" <<'JSON'
+# Public plugin fixture manifests
+mkdir -p "${FIXTURE_ROOT}/manifests" "${FIXTURE_ROOT}/assets/MidiBard2" "${FIXTURE_ROOT}/assets/MasterOfPuppets"
+make_plugin_zip "${FIXTURE_ROOT}/assets/MidiBard2/root" "MidiBard2" "${FIXTURE_ROOT}/assets/MidiBard2/MidiBard2-upstream.zip"
+make_plugin_zip "${FIXTURE_ROOT}/assets/MasterOfPuppets/root" "MasterOfPuppets" "${FIXTURE_ROOT}/assets/MasterOfPuppets/MasterOfPuppets-upstream.zip"
+
+cat > "${FIXTURE_ROOT}/manifests/MidiBard2.pluginmaster.json" <<JSON
 [
   {
+    "Author": "fixture",
     "Name": "MidiBard 2",
     "InternalName": "MidiBard2",
-    "AssemblyVersion": "2.0.0",
-    "DownloadLinkInstall": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip",
-    "DownloadLinkUpdate": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip",
-    "DownloadLinkTesting": "https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/plugins/MidiBard2/latest.zip"
+    "AssemblyVersion": "${MIDIBARD2_VERSION}",
+    "TestingAssemblyVersion": "${MIDIBARD2_VERSION}",
+    "DownloadLinkInstall": "file://${FIXTURE_ROOT}/assets/MidiBard2/MidiBard2-upstream.zip",
+    "DownloadLinkUpdate": "file://${FIXTURE_ROOT}/assets/MidiBard2/MidiBard2-upstream.zip",
+    "DownloadLinkTesting": "file://${FIXTURE_ROOT}/assets/MidiBard2/MidiBard2-upstream.zip",
+    "IsHide": false,
+    "LastUpdate": "0"
   }
 ]
 JSON
 
-mkdir -p "$FIXTURES/MopSrc"
-printf 'mop dll\n' > "$FIXTURES/MopSrc/MasterOfPuppets.dll"
-printf 'orig tinyipc\n' > "$FIXTURES/MopSrc/TinyIpc.dll"
-make_zip "$FIXTURES/MopSrc" "$FIXTURES/MasterOfPuppets.zip"
-cat > "$FIXTURES/MasterOfPuppets.pluginmaster.json" <<'JSON'
+cat > "${FIXTURE_ROOT}/manifests/MasterOfPuppets.pluginmaster.json" <<JSON
 [
   {
+    "Author": "fixture",
     "Name": "MasterOfPuppets",
     "InternalName": "MasterOfPuppets",
-    "AssemblyVersion": "3.0.0",
-    "DownloadLinkInstall": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip",
-    "DownloadLinkUpdate": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip",
-    "DownloadLinkTesting": "https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/plugins/MasterOfPuppets/latest.zip"
+    "AssemblyVersion": "${MASTEROFPUPPETS_VERSION}",
+    "TestingAssemblyVersion": "${MASTEROFPUPPETS_VERSION}",
+    "DownloadLinkInstall": "file://${FIXTURE_ROOT}/assets/MasterOfPuppets/MasterOfPuppets-upstream.zip",
+    "DownloadLinkUpdate": "file://${FIXTURE_ROOT}/assets/MasterOfPuppets/MasterOfPuppets-upstream.zip",
+    "DownloadLinkTesting": "file://${FIXTURE_ROOT}/assets/MasterOfPuppets/MasterOfPuppets-upstream.zip",
+    "IsHide": false,
+    "LastUpdate": "0"
   }
 ]
 JSON
 
-cat > "$FAKE_BIN/dotnet" <<'EOF2'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-cmd="$1"; shift
-out=""
-project=""
-version=""
-abi="compat"
-rid=""
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    -p:PackageVersion=*|-p:Version=*) version="${1#*=}"; shift ;;
-    -p:TinyIpcAbiFlavor=*) abi="${1#*=}"; shift ;;
-    -r) rid="$2"; shift 2 ;;
-    *.csproj|*.sln) project="$1"; shift ;;
-    *) shift ;;
-  esac
-done
-case "$cmd" in
-  build)
-    exit 0 ;;
-  publish)
-    mkdir -p "$out"
-    case "$project" in
-      *TinyIpc.Shim.csproj)
-        printf 'shim %s\n' "$abi" > "$out/TinyIpc.dll"
-        printf 'xivipc from shim\n' > "$out/XivIpc.dll"
-        printf '{}' > "$out/TinyIpc.deps.json"
-        printf '{}' > "$out/TinyIpc.runtimeconfig.json"
-        ;;
-      *XivIpc.NativeHost.csproj)
-        printf '#!/bin/sh\nexit 0\n' > "$out/XivIpc.NativeHost"
-        chmod +x "$out/XivIpc.NativeHost"
-        ;;
-      *) exit 1 ;;
-    esac
-    ;;
-  pack)
-    mkdir -p "$out"
-    base="$(basename "$project" .csproj)"
-    touch "$out/${base}.${version}.nupkg"
-    ;;
-  *) exit 1 ;;
-esac
-EOF2
-chmod +x "$FAKE_BIN/dotnet"
-
-cat > "$FAKE_BIN/gh" <<'EOF2'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-FIXTURES_DIR="__FIXTURES__"
-sub="$1"; shift
-case "$sub" in
-  api)
-    route=""
-    while [[ "$#" -gt 0 ]]; do
-      case "$1" in
-        repos/*) route="$1"; shift ;;
-        *) shift ;;
-      esac
-    done
-    case "$route" in
-      repos/pffxivtools/BardToolbox/contents/pluginmaster.json?ref=main)
-        cat "$FIXTURES_DIR/BardToolboxRepo/pluginmaster.json" ;;
-      repos/reckhou/DalamudPlugins-Ori/contents/pluginmaster.json?ref=api6)
-        cat "$FIXTURES_DIR/MidiBard2.pluginmaster.json" ;;
-      repos/zunetrix/DalamudPlugins/contents/pluginmaster.json?ref=refs/heads/main)
-        cat "$FIXTURES_DIR/MasterOfPuppets.pluginmaster.json" ;;
-      repos/reckhou/DalamudPlugins-Ori/contents/plugins/MidiBard2/latest.zip?ref=api6)
-        cat "$FIXTURES_DIR/MidiBard2.zip" ;;
-      repos/zunetrix/DalamudPlugins/contents/plugins/MasterOfPuppets/latest.zip?ref=refs/heads/main|repos/zunetrix/DalamudPlugins/contents/plugins/MasterOfPuppets/latest.zip?ref=main)
-        cat "$FIXTURES_DIR/MasterOfPuppets.zip" ;;
-      *) echo "unsupported route: $route" >&2; exit 1 ;;
-    esac
-    ;;
-  release)
-    sub2="$1"; shift
-    case "$sub2" in
-      download)
-        tag="$1"; shift
-        repo=""; pattern=""; dir=""
-        while [[ "$#" -gt 0 ]]; do
-          case "$1" in
-            --repo) repo="$2"; shift 2 ;;
-            --pattern) pattern="$2"; shift 2 ;;
-            --dir) dir="$2"; shift 2 ;;
-            *) shift ;;
-          esac
-        done
-        mkdir -p "$dir"
-        if [[ "$repo" == "pffxivtools/BardToolbox" && "$pattern" == "BardToolbox.zip" ]]; then
-          cp "$FIXTURES_DIR/BardToolboxRepo/BardToolbox.zip" "$dir/BardToolbox.zip"
-        else
-          echo "unsupported release download: $repo $tag $pattern" >&2; exit 1
-        fi
-        ;;
-      *) exit 1 ;;
-    esac
-    ;;
-  --version)
-    echo gh-fake ;;
-  *) echo "unsupported gh subcommand: $sub" >&2; exit 1 ;;
-esac
-EOF2
-sed -i "s|__FIXTURES__|$FIXTURES|g" "$FAKE_BIN/gh"
-chmod +x "$FAKE_BIN/gh"
-
-export PATH="$FAKE_BIN:$PATH"
-export GH_TOKEN=fake
-export BARDTOOLBOX_LOCAL_DIR="$FIXTURES/BardToolboxRepo"
-export TINYIPC_SHARED_GROUP=doesnotexist
-
-cd "$REPO_ROOT"
-
-OUTPUT_DIR="$TMP_ROOT/output" TINYIPC_SHARED_DIR="$TMP_ROOT/shared" BASE_URL="https://example.invalid" bash scripts/publish-local.sh
-[[ -f "$TMP_ROOT/output/artifacts/BardToolbox.zip" ]]
-[[ -f "$TMP_ROOT/output/artifacts/MidiBard2.zip" ]]
-[[ -f "$TMP_ROOT/output/artifacts/MasterOfPuppets.zip" ]]
-
-PUBLISH_SCHEME=plugins GITHUB_REPOSITORY=example/repo bash scripts/publish-release.sh
-jq -e '.releases | length == 3' dist/github/metadata/releases.json >/dev/null
-
-PUBLISH_SCHEME=semver RELEASE_VERSION=1.2.3 GITHUB_REPOSITORY=example/repo TOOL_SELECTION=BardToolbox bash scripts/publish-release.sh
-jq -e '.releases | length == 1' dist/github/metadata/releases.json >/dev/null
-compgen -G 'dist/github/assets/*.nupkg' >/dev/null
-compgen -G 'dist/github/assets/*.tar.gz' >/dev/null
+printf 'Fixtures created at %s (mode=%s)\n' "${FIXTURE_ROOT}" "${FIXTURE_VERSION_MODE}"

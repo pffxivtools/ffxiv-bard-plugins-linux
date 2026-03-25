@@ -1,0 +1,192 @@
+name: Publish Plugin Reusable
+
+on:
+  workflow_call:
+    inputs:
+      plugin_name:
+        required: true
+        type: string
+      force:
+        required: false
+        type: boolean
+        default: false
+      use_bardtoolbox_app:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      BARDTOOLBOX_APP_ID:
+        required: false
+      BARDTOOLBOX_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish_plugin:
+    name: Publish ${{ inputs.plugin_name }}
+    runs-on: ubuntu-latest
+
+    env:
+      DOTNET_NOLOGO: true
+      TOOL_SELECTION: ${{ inputs.plugin_name }}
+      FORCE_REPUBLISH: ${{ inputs.force && 'true' || 'false' }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Snapshot baseline pluginmaster
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp pluginmaster.json "${RUNNER_TEMP}/pluginmaster.before.json"
+
+      - name: Create publish fixtures for act
+        if: ${{ env.ACT == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash scripts/test-publish-fixtures.sh .github/act/fixtures/publish
+
+      - name: Create GitHub App token for BardToolbox
+        id: bardtoolbox_app_token
+        if: ${{ env.ACT != 'true' && inputs.use_bardtoolbox_app }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BARDTOOLBOX_APP_ID }}
+          private-key: ${{ secrets.BARDTOOLBOX_APP_PRIVATE_KEY }}
+          owner: pffxivtools
+          repositories: |
+            BardToolbox
+
+      - name: Generate plugin asset and manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SCHEME: plugins
+          PUBLISH_CONTEXT: ${{ env.ACT == 'true' && 'local' || 'release' }}
+          BARDTOOLBOX_LOCAL_DIR: ${{ env.ACT == 'true' && format('{0}/.github/act/fixtures/publish/BardToolbox', github.workspace) || '' }}
+          MIDIBARD2_PLUGINMASTER: ${{ env.ACT == 'true' && format('file://{0}/.github/act/fixtures/publish/manifests/MidiBard2.pluginmaster.json', github.workspace) || '' }}
+          MASTEROFPUPPETS_PLUGINMASTER: ${{ env.ACT == 'true' && format('file://{0}/.github/act/fixtures/publish/manifests/MasterOfPuppets.pluginmaster.json', github.workspace) || '' }}
+          GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || steps.bardtoolbox_app_token.outputs.token }}
+          BARDTOOLBOX_GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || steps.bardtoolbox_app_token.outputs.token }}
+        run: bash scripts/publish-release.sh
+
+      - name: Validate generated publish output
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          bash scripts/validate-publish-output.sh \
+            --mode plugin \
+            --plugin "${TOOL_SELECTION}" \
+            --output-root dist/github \
+            --github-repository "${GITHUB_REPOSITORY}" \
+            --baseline-pluginmaster-file "${RUNNER_TEMP}/pluginmaster.before.json"
+
+      - name: Check whether plugin changed
+        id: changed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if jq -e '.releases | length > 0' dist/github/metadata/releases.json >/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream version change detected; skipping publish."
+          fi
+
+      - name: Dry-run plugin publish summary
+        if: ${{ env.ACT == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "ACT dry-run: plugin workflow validated for ${{ inputs.plugin_name }}"
+          jq -r '.releases[]? | "- \(.tag): \(.title)"' dist/github/metadata/releases.json || true
+          find dist/github -maxdepth 3 -type f | sort
+
+      - name: Publish GitHub release
+        if: ${{ env.ACT != 'true' && steps.changed.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release="$(jq -c '.releases[0]' dist/github/metadata/releases.json)"
+          tag="$(jq -r '.tag' <<<"${release}")"
+          title="$(jq -r '.title' <<<"${release}")"
+          notes_file="dist/github/metadata/${tag}.notes.md"
+          mapfile -t assets < <(jq -r '.assets[]' <<<"${release}")
+
+          if [[ "${FORCE_REPUBLISH}" == "true" ]]; then
+            if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release delete "${tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
+            fi
+          fi
+
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${tag}" "${assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --notes-file "${notes_file}" \
+              --prerelease \
+              --latest=false
+          fi
+
+      - name: Validate published GitHub release
+        if: ${{ env.ACT != 'true' && steps.changed.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag="$(jq -r '.releases[0].tag' dist/github/metadata/releases.json)"
+          bash scripts/validate-published-release.sh \
+            --mode plugin \
+            --tag "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --metadata-file dist/github/metadata/releases.json
+
+      - name: Commit updated pluginmaster.json
+        if: ${{ env.ACT != 'true' && steps.changed.outputs.changed == 'true' }}
+        shell: bash
+        run: |
+          if git diff --quiet -- pluginmaster.json; then
+            echo "pluginmaster.json unchanged"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git commit -m "Update pluginmaster.json for ${{ inputs.plugin_name }}"
+          git push
+
+      - name: Validate committed pluginmaster.json
+        if: ${{ env.ACT != 'true' && steps.changed.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag="$(jq -r '.releases[0].tag' dist/github/metadata/releases.json)"
+          bash scripts/validate-published-release.sh \
+            --mode plugin \
+            --tag "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --metadata-file dist/github/metadata/releases.json \
+            --expected-pluginmaster-file dist/github/pluginmaster.json \
+            --default-branch "${DEFAULT_BRANCH}"

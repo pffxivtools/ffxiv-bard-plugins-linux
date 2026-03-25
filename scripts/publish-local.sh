@@ -21,6 +21,7 @@ MANIFESTS_DIR="${OUTPUT_DIR}/manifests"
 
 : "${TINYIPC_SHARED_DIR:=/home/shared/tinyipc-shared-ffxiv}"
 : "${BASE_URL:=https://example.com/dalamud}"
+: "${VALIDATE_PUBLISH_OUTPUT:=true}"
 
 ensure_local_prereqs() {
   ensure_common_prereqs
@@ -148,6 +149,15 @@ main() {
   done < <(selected_targets)
 
   sort_pluginmaster_file "${MANIFESTS_DIR}/pluginmaster.json"
+
+  if [[ "${VALIDATE_PUBLISH_OUTPUT}" == "true" ]]; then
+    bash "${SCRIPT_DIR}/validate-publish-output.sh" \
+      --mode local \
+      --output-root "${OUTPUT_DIR}" \
+      --shared-dir "${TINYIPC_SHARED_DIR}" \
+      --base-url "${BASE_URL}"
+  fi
+
   log "Generated manifest: ${MANIFESTS_DIR}/pluginmaster.json"
   log "Artifacts directory: ${ARTIFACTS_DIR}"
   log "Native host staged at: ${TINYIPC_SHARED_DIR}/tinyipc-native-host"

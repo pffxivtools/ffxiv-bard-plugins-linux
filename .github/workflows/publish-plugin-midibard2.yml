@@ -1,0 +1,25 @@
+name: Publish MidiBard2
+
+on:
+  schedule:
+    - cron: '14 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Re-upload the asset if the release already exists
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: publish-midibard2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    uses: ./.github/workflows/publish-plugin-reusable.yml
+    with:
+      plugin_name: MidiBard2
+      force: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+      use_bardtoolbox_app: false
+    secrets: inherit

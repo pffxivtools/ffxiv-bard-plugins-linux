@@ -7,8 +7,8 @@ set -Eeuo pipefail
 : "${BARDTOOLBOX_LOCAL_DIR:=}"
 : "${PUBLISH_CONTEXT:=release}"
 
-MASTEROFPUPPETS_PLUGINMASTER="https://raw.githubusercontent.com/zunetrix/DalamudPlugins/refs/heads/main/pluginmaster.json"
-MIDIBARD2_PLUGINMASTER="https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/pluginmaster.json"
+: "${MASTEROFPUPPETS_PLUGINMASTER:=https://raw.githubusercontent.com/zunetrix/DalamudPlugins/refs/heads/main/pluginmaster.json}"
+: "${MIDIBARD2_PLUGINMASTER:=https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/pluginmaster.json}"
 
 # format:
 # asset_slug|plugin_name_in_manifest|source_kind|source_value|default_abi_flavor
@@ -41,7 +41,9 @@ ensure_common_prereqs() {
 
 ensure_release_prereqs() {
   ensure_common_prereqs
-  require_cmd gh
+  if [[ "${ACT:-false}" != "true" ]]; then
+    require_cmd gh
+  fi
 }
 
 selected_targets() {
@@ -289,6 +291,39 @@ extract_plugin_entry() {
 get_upstream_version() {
   local entry_file="$1"
   jq -r '.AssemblyVersion // .Version // .TestingAssemblyVersion // empty' "${entry_file}"
+}
+
+get_local_plugin_version_from_pluginmaster() {
+  local pluginmaster_file="$1"
+  local plugin_name="$2"
+
+  if [[ ! -f "${pluginmaster_file}" ]]; then
+    return 0
+  fi
+
+  jq -r --arg plugin_name "${plugin_name}" '
+    if type == "array" then
+      first(
+        .[]
+        | select(
+            (.Name? == $plugin_name) or
+            (.InternalName? == $plugin_name)
+          )
+        | (.AssemblyVersion // .Version // .TestingAssemblyVersion // empty)
+      ) // empty
+    else
+      empty
+    end
+  ' "${pluginmaster_file}"
+}
+
+plugin_version_changed() {
+  local local_version="$1"
+  local upstream_version="$2"
+
+  [[ -n "${upstream_version}" ]] || return 0
+  [[ -z "${local_version}" ]] && return 0
+  [[ "${local_version}" != "${upstream_version}" ]]
 }
 
 resolve_bardtoolbox_local_dir() {
@@ -540,7 +575,10 @@ download_plugin_payload_for_release() {
 
   case "${source_kind}" in
     local-bardtoolbox)
-      die "local-bardtoolbox payloads are only supported by publish-local.sh"
+      if [[ "${PUBLISH_CONTEXT}" != "local" ]]; then
+        die "local-bardtoolbox payloads are only supported by publish-local.sh or local test fixtures"
+      fi
+      download_file "${download_url}" "${output_file}"
       ;;
     github-url-pluginmaster)
       if [[ "${download_url}" == https://raw.githubusercontent.com/* ]]; then
