@@ -183,7 +183,8 @@ public sealed class FunctionalTests
         startGate.TrySetResult();
 
         await Task.WhenAll(publisherTasks);
-        await Task.WhenAll(readerTasks).WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForExpectedSubscriberCountsAsync(scope, backend, allObserved, expectedTotal, cts.Token);
+        await Task.WhenAll(readerTasks).WaitAsync(TimeSpan.FromSeconds(10));
 
         string[] expected = Enumerable.Range(0, publisherCount)
             .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
@@ -333,6 +334,42 @@ public sealed class FunctionalTests
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(40), cancellationToken);
     }
 
+    private static async Task WaitForExpectedSubscriberCountsAsync(
+        TestEnvironmentScope scope,
+        string backend,
+        ConcurrentDictionary<int, ConcurrentDictionary<string, byte>> allObserved,
+        int expectedTotal,
+        CancellationToken cancellationToken)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (allObserved.Values.All(messages => messages.Count >= expectedTotal))
+                return;
+
+            await Task.Delay(100, cancellationToken);
+        }
+
+        string counts = string.Join(
+            ", ",
+            allObserved
+                .OrderBy(pair => pair.Key)
+                .Select(pair => $"subscriber[{pair.Key}]={pair.Value.Count}/{expectedTotal}"));
+
+        string diagnostics = string.Empty;
+        if (IsSidecarStyleBackend(backend))
+        {
+            string logTail = scope.ReadLatestLogTail();
+            if (!string.IsNullOrWhiteSpace(logTail))
+                diagnostics = $"{Environment.NewLine}Latest sidecar log tail:{Environment.NewLine}{logTail}";
+        }
+
+        throw new TimeoutException($"Timed out waiting for all subscribers to observe all messages. {counts}{diagnostics}");
+    }
+
     private static bool IsSidecarStyleBackend(string backend)
         => string.Equals(backend, "sidecar", StringComparison.OrdinalIgnoreCase)
             || ProductionPathTestEnvironment.IsProductionPath(backend);
@@ -397,6 +434,9 @@ public sealed class FunctionalTests
                 Directory.CreateDirectory(_testSharedDir);
                 overrides[TinyIpcEnvironment.SharedDirectory] = _testSharedDir;
                 overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
+                overrides[TinyIpcEnvironment.LogDirectory] = _testSharedDir;
+                overrides[TinyIpcEnvironment.LogLevel] = "info";
+                overrides[TinyIpcEnvironment.EnableLogging] = "1";
 
                 string? hostPath = ResolveNativeHostPath();
                 if (!string.IsNullOrWhiteSpace(hostPath))
@@ -407,6 +447,21 @@ public sealed class FunctionalTests
             }
 
             _overrides = TinyIpcEnvironment.Override(overrides);
+        }
+
+        public string ReadLatestLogTail()
+        {
+            string contents = ProductionPathTestEnvironment.ReadLatestLogOrEmpty(_testSharedDir);
+            if (string.IsNullOrWhiteSpace(contents))
+                return string.Empty;
+
+            string[] lines = contents
+                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Where(static line => !string.IsNullOrWhiteSpace(line))
+                .TakeLast(20)
+                .ToArray();
+
+            return string.Join(Environment.NewLine, lines);
         }
 
         public void Dispose()
