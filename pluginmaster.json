@@ -3,7 +3,7 @@
     "Author": "BardToolbox",
     "Name": "BardToolbox",
     "InternalName": "BardToolbox",
-    "AssemblyVersion": "2.2.4.3",
+    "AssemblyVersion": "2.2.4.4",
     "Description": "",
     "ApplicableVersion": "any",
     "RepoUrl": "https://discord.gg/h9Nt5NXZWz",
@@ -72,16 +72,16 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 62310,
-    "LastUpdate": "1774403938",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip"
+    "LastUpdate": "1774424416",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/BardToolbox.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/BardToolbox.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/BardToolbox.zip"
   },
   {
     "Author": "Zune",
     "Name": "Master Of Puppets",
     "InternalName": "MasterOfPuppets",
-    "AssemblyVersion": "1.0.0.145",
+    "AssemblyVersion": "1.0.0.148",
     "DalamudApiLevel": 14,
     "Punchline": "Gremlins Control Center",
     "Description": "FFXIV plugin that lets you create and send custom actions (similar to in-game macros), either locally or via chat-based broadcast. It supports broadcasting actions to multiple clients locally, or through in-game chat channels such as Party, Linkshell, and Cross-World Linkshell. Use it to trigger custom actions like emotes, minions, mounts, fashion changes, and more.",
@@ -93,10 +93,10 @@
     "IconUrl": "https://i.imgur.com/uFq8py7.png",
     "Changelog": "Weird features added",
     "DownloadCount": 0,
-    "LastUpdate": "1774403944",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.0.0.145/MasterOfPuppets-1.0.0.145.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.0.0.145/MasterOfPuppets-1.0.0.145.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.0.0.145/MasterOfPuppets-1.0.0.145.zip",
+    "LastUpdate": "1774424422",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MasterOfPuppets.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MasterOfPuppets.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MasterOfPuppets.zip",
     "IsHide": false
   },
   {
@@ -128,9 +128,9 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 221454,
-    "LastUpdate": "1774403941",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.3.0/MidiBard2-3.2.3.0.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.3.0/MidiBard2-3.2.3.0.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.3.0/MidiBard2-3.2.3.0.zip"
+    "LastUpdate": "1774424419",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MidiBard2.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MidiBard2.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.4/MidiBard2.zip"
   }
 ]
