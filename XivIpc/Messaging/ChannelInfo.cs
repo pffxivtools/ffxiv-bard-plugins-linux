@@ -4,7 +4,7 @@ using XivIpc.Internal;
 
 namespace XivIpc.Messaging
 {
-    internal class ChannelInfo
+    public class ChannelInfo
     {
         public string Name { get; private set; }
         public int Size { get; private set; }

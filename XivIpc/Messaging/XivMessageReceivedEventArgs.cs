@@ -2,7 +2,7 @@ using System;
 
 namespace XivIpc.Messaging
 {
-    internal sealed class XivMessageReceivedEventArgs : EventArgs
+    public sealed class XivMessageReceivedEventArgs : EventArgs
     {
         public XivMessageReceivedEventArgs(byte[] message)
         {
