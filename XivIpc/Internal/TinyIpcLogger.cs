@@ -45,14 +45,27 @@ internal static class TinyIpcLogger
             _runtimeKind = runtime.Kind.ToString();
             _initialized = true;
 
-            if (ReadOptionalBooleanEnvironment(TinyIpcEnvironment.EnableLogging) == false)
+            LoggingSettings logging = TinyIpcRuntimeSettings.ResolveLogging();
+            SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
+            MessageBusSelectionSettings selection = TinyIpcRuntimeSettings.ResolveMessageBusSelection(runtime.IsWindowsProcess);
+
+            if (ReadOptionalBooleanValue(logging.EnableLogging) == false)
                 return;
 
             try
             {
-                _enabledThrough = ParseLogLevel(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogLevel)) ?? TinyIpcLogLevel.Info;
-                _sink = CreateConfiguredSink();
+                _enabledThrough = ParseLogLevel(logging.LogLevel) ?? TinyIpcLogLevel.Info;
+                _sink = CreateConfiguredSink(logging);
                 _enabled = true;
+
+                Info(
+                    "Logging",
+                    "Initialized",
+                    "TinyIpc logging enabled.",
+                    ("runtime", runtime.Kind),
+                    ("sharedDir", sharedScope.SharedDirectory),
+                    ("backend", selection.Backend),
+                    ("notifier", logging.FileNotifier));
             }
             catch (Exception ex)
             {
@@ -85,14 +98,6 @@ internal static class TinyIpcLogger
             }
         }
 
-        Info(
-            "Logging",
-            "Initialized",
-            "TinyIpc logging enabled.",
-            ("runtime", runtime.Kind),
-            ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
-            ("backend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BusBackend)),
-            ("notifier", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.FileNotifier)));
     }
 
     internal static void ResetForTests()
@@ -152,7 +157,7 @@ internal static class TinyIpcLogger
 
     public static string? CreatePayloadPreview(byte[] payload)
     {
-        if (!ReadOptionalBooleanEnvironment(TinyIpcEnvironment.LogPayload).GetValueOrDefault())
+        if (!ReadOptionalBooleanValue(TinyIpcRuntimeSettings.ResolveLogging().LogPayload).GetValueOrDefault())
             return null;
 
         const int previewBytes = 32;
@@ -245,28 +250,27 @@ internal static class TinyIpcLogger
             ("observed", e.Observed));
     }
 
-    private static string ResolveLogDirectory()
+    private static string ResolveLogDirectory(LoggingSettings logging)
     {
-        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory);
-        if (!string.IsNullOrWhiteSpace(configured))
-            return UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(configured);
+        if (!string.IsNullOrWhiteSpace(logging.LogDirectory))
+            return UnixSharedStorageHelpers.ConvertPathForCurrentRuntime(logging.LogDirectory);
 
         return Path.Combine(Path.GetTempPath(), "TinyIpc");
     }
 
-    private static ITinyIpcLogSink CreateConfiguredSink()
+    private static ITinyIpcLogSink CreateConfiguredSink(LoggingSettings logging)
     {
-        string directory = ResolveLogDirectory();
-        return CreateFileSink(directory);
+        string directory = ResolveLogDirectory(logging);
+        return CreateFileSink(directory, logging);
     }
 
     private static ITinyIpcLogSink CreateEmergencyFallbackSink()
     {
         string directory = Path.Combine(Path.GetTempPath(), "TinyIpc");
-        return CreateFileSink(directory);
+        return CreateFileSink(directory, new LoggingSettings(null, null, null, null, null, null, null));
     }
 
-    private static ITinyIpcLogSink CreateFileSink(string directory)
+    private static ITinyIpcLogSink CreateFileSink(string directory, LoggingSettings logging)
     {
         Directory.CreateDirectory(directory);
         try
@@ -279,8 +283,8 @@ internal static class TinyIpcLogger
 
         return new FileTinyIpcLogSink(
             directory,
-            ParsePositiveInt64(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogMaxBytes)) ?? 5 * 1024 * 1024,
-            ParsePositiveInt32(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogFileCount)) ?? 3);
+            ParsePositiveInt64(logging.LogMaxBytes) ?? 5 * 1024 * 1024,
+            ParsePositiveInt32(logging.LogFileCount) ?? 3);
     }
 
     private static void TryWriteEmergencyLine(
@@ -347,9 +351,8 @@ internal static class TinyIpcLogger
         };
     }
 
-    private static bool? ReadOptionalBooleanEnvironment(string name)
+    private static bool? ReadOptionalBooleanValue(string? value)
     {
-        string? value = TinyIpcEnvironment.GetEnvironmentVariable(name);
         if (string.IsNullOrWhiteSpace(value))
             return null;
 
@@ -541,4 +544,3 @@ internal static class TinyIpcLogger
         }
     }
 }
-

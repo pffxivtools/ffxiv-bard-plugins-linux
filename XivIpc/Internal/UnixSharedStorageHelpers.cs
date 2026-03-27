@@ -392,31 +392,28 @@ internal static class UnixSharedStorageHelpers
 
     private static string ResolveSharedDirectory()
     {
-        string? explicitPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
-        if (!string.IsNullOrWhiteSpace(explicitPath))
+        SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
+        if (sharedScope.SharedDirectoryWasConfigured)
         {
-            string resolved = ResolveSharedDirectoryForCurrentRuntime(explicitPath);
-
             TinyIpcLogger.Debug(
                 nameof(UnixSharedStorageHelpers),
                 "SharedDirectoryConfigured",
                 "Using configured shared directory.",
-                ("configuredPath", explicitPath),
-                ("resolvedPath", resolved));
+                ("configuredPath", sharedScope.SharedDirectory),
+                ("resolvedPath", sharedScope.SharedDirectory));
 
-            return resolved;
+            return sharedScope.SharedDirectory;
         }
 
-        string fallback = ResolveSharedDirectoryForCurrentRuntime(null);
         TinyIpcLogger.Warning(
             nameof(UnixSharedStorageHelpers),
             "SharedDirectoryDefaulted",
             "Using the built-in TinyIpc shared directory default because TINYIPC_SHARED_DIR is not set.",
             null,
-            ("directory", fallback),
+            ("directory", sharedScope.SharedDirectory),
             ("runtime", RuntimeEnvironmentDetector.Detect().Kind));
 
-        return fallback;
+        return sharedScope.SharedDirectory;
     }
 
     private static string ResolvePathForCurrentRuntime(string path)
@@ -439,9 +436,7 @@ internal static class UnixSharedStorageHelpers
 
     private static string BuildSharedFileName(string name, string kind)
     {
-        string? prefix = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedPrefix);
-        if (string.IsNullOrWhiteSpace(prefix))
-            prefix = "tinyipc";
+        string prefix = TinyIpcRuntimeSettings.ResolveSharedScope().SharedPrefix;
 
         string safe = SanitizeName(name);
         string hash = ComputeStableHexHash(name);
@@ -480,8 +475,7 @@ internal static class UnixSharedStorageHelpers
 
     private static string? GetConfiguredGroup()
     {
-        string? group = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
-        return string.IsNullOrWhiteSpace(group) ? null : group;
+        return TinyIpcRuntimeSettings.ResolveSharedScope().SharedGroup;
     }
 
     private static string GetDefaultSharedDirectoryUnixPath()
@@ -725,4 +719,3 @@ internal static class UnixSharedStorageHelpers
         }
     }
 }
-

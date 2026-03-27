@@ -6,6 +6,7 @@ internal static class TinyIpcEnvironment
     internal const string BrokerIdleShutdownMs = "TINYIPC_BROKER_IDLE_SHUTDOWN_MS";
     internal const string BrokerSocketPath = "TINYIPC_BROKER_SOCKET_PATH";
     internal const string BusBackend = "TINYIPC_BUS_BACKEND";
+    internal const string DirectStorageMode = "TINYIPC_DIRECT_STORAGE_MODE";
     internal const string EnableLogging = "TINYIPC_ENABLE_LOGGING";
     internal const string FileNotifier = "TINYIPC_FILE_NOTIFIER";
     internal const string LaunchId = "TINYIPC_LAUNCH_ID";
@@ -17,6 +18,9 @@ internal static class TinyIpcEnvironment
     internal const string MessageBusBackend = "TINYIPC_MESSAGE_BUS_BACKEND";
     internal const string MessageTtlMs = "TINYIPC_MESSAGE_TTL_MS";
     internal const string NativeHostPath = "TINYIPC_NATIVE_HOST_PATH";
+    internal const string SidecarHeartbeatIntervalMs = "TINYIPC_SIDECAR_HEARTBEAT_INTERVAL_MS";
+    internal const string SidecarHeartbeatTimeoutMs = "TINYIPC_SIDECAR_HEARTBEAT_TIMEOUT_MS";
+    internal const string SidecarStorageMode = "TINYIPC_SIDECAR_STORAGE_MODE";
     internal const string SharedDirectory = "TINYIPC_SHARED_DIR";
     internal const string SharedGroup = "TINYIPC_SHARED_GROUP";
     internal const string SharedPrefix = "TINYIPC_SHARED_PREFIX";

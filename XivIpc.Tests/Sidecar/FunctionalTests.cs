@@ -423,6 +423,9 @@ public sealed class FunctionalTests
                 overrides[TinyIpcEnvironment.LogLevel] = "info";
                 overrides[TinyIpcEnvironment.EnableLogging] = "1";
                 overrides[TinyIpcEnvironment.FileNotifier] = "auto";
+
+                if (ProductionPathTestEnvironment.IsProductionRingPath(backend))
+                    overrides[TinyIpcEnvironment.SidecarStorageMode] = "ring";
             }
             else
             {

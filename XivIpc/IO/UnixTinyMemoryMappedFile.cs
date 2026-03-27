@@ -280,29 +280,14 @@ internal sealed class UnixTinyMemoryMappedFile : IDisposable
 
     private static bool ShouldDeferInitializationToSidecar()
     {
-        string? backend = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend);
-        if (string.IsNullOrWhiteSpace(backend))
-            backend = "auto";
+        MessageBusSelectionSettings selection = TinyIpcRuntimeSettings.ResolveMessageBusSelection(
+            brokerRequiredForAuto: RuntimeEnvironmentDetector.Detect().IsWindowsProcess);
 
-        string normalized = backend.Trim().ToLowerInvariant();
-
-        normalized = normalized switch
+        return selection.Backend switch
         {
-            "sidecar-shared-memory" => "sidecar",
-            "sidecar_shared_memory" => "sidecar",
-            "shm" => "shared-memory",
-            "sharedmemory" => "shared-memory",
-            "shared_memory" => "shared-memory",
-            _ => normalized
-        };
-
-        return normalized switch
-        {
-            "sidecar" => true,
-            "auto" => RuntimeEnvironmentDetector.Detect().IsWindowsProcess,
-            "direct" => false,
-            "shared-memory" => false,
-            _ => RuntimeEnvironmentDetector.Detect().IsWindowsProcess
+            MessageBusBackendKind.Sidecar => true,
+            MessageBusBackendKind.Auto => selection.BrokerRequiredForAuto,
+            _ => false
         };
     }
 
@@ -496,4 +481,3 @@ internal sealed class UnixTinyMemoryMappedFile : IDisposable
     private static void WriteInt32(byte[] buffer, int offset, int value)
         => BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), value);
 }
-

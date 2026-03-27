@@ -45,39 +45,23 @@ internal static class UnixSidecarProcessManager
 
     internal static RuntimeSettings CaptureSettings()
     {
-        string? brokerDirectory = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory);
-        string? sharedDirectory = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory);
-        string? logDirectory = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory);
-        string? sharedGroup = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup);
-        string? enableLogging = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.EnableLogging);
-        string? logLevel = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogLevel);
-        string? logPayload = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogPayload);
-        string? logMaxBytes = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogMaxBytes);
-        string? logFileCount = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogFileCount);
-        string? fileNotifier = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.FileNotifier);
-        string? explicitHostPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.NativeHostPath);
-        string? explicitSocketPath = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerSocketPath);
-
-        string resolvedSharedDirectory = UnixSharedStorageHelpers.ResolveSharedDirectoryForCurrentRuntime(sharedDirectory);
-        string resolvedBrokerDirectory = ResolveBrokerDirectory(resolvedSharedDirectory, brokerDirectory);
-        string socketPath = string.IsNullOrWhiteSpace(explicitSocketPath)
-            ? CombineUnixPath(resolvedBrokerDirectory, BrokerSocketFileName)
-            : ResolveUnixPath(explicitSocketPath);
-        string diagnosticsDirectory = ResolveDiagnosticsLogDirectory(socketPath, logDirectory);
+        SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
+        BrokerRuntimeSettings brokerRuntime = TinyIpcRuntimeSettings.ResolveBrokerRuntime(sharedScope);
+        LoggingSettings logging = TinyIpcRuntimeSettings.ResolveLogging();
+        NativeHostSettings nativeHost = TinyIpcRuntimeSettings.ResolveNativeHost();
+        SidecarTransportSettings transport = TinyIpcRuntimeSettings.ResolveSidecarTransport();
+        string diagnosticsDirectory = ResolveDiagnosticsLogDirectory(brokerRuntime.SocketPath, logging.LogDirectory);
 
         return new RuntimeSettings(
-            socketPath,
-            resolvedBrokerDirectory,
-            ResolveUnixPath(resolvedSharedDirectory),
+            brokerRuntime.SocketPath,
+            sharedScope.BrokerDirectory,
+            sharedScope.SharedDirectory,
             diagnosticsDirectory,
-            sharedGroup,
-            enableLogging,
-            logLevel,
-            logPayload,
-            logMaxBytes,
-            logFileCount,
-            fileNotifier,
-            explicitHostPath);
+            sharedScope.SharedGroup,
+            brokerRuntime.IdleShutdownDelay,
+            logging,
+            transport,
+            nativeHost.ExplicitNativeHostPath);
     }
 
     private static void EnsureBrokerStarted(RuntimeSettings settings, string socketPath)
@@ -222,16 +206,18 @@ internal static class UnixSidecarProcessManager
 
         CopyFixedPathEnvironment(psi, "TINYIPC_SHARED_DIR", settings.SharedDirectory);
         CopyFixedPathEnvironment(psi, "TINYIPC_BROKER_DIR", settings.BrokerDirectory);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING", settings.EnableLogging);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_ENABLE_LOGGING", settings.Logging.EnableLogging);
         CopyFixedPathEnvironment(psi, "TINYIPC_LOG_DIR", settings.DiagnosticsDirectory);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL", settings.LogLevel);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD", settings.LogPayload);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES", settings.LogMaxBytes);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT", settings.LogFileCount);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_LEVEL", settings.Logging.LogLevel);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_PAYLOAD", settings.Logging.LogPayload);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_MAX_BYTES", settings.Logging.LogMaxBytes);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_LOG_FILE_COUNT", settings.Logging.LogFileCount);
         CopyFixedVerbatimEnvironment(psi, "TINYIPC_SHARED_GROUP", settings.SharedGroup);
-        CopyFixedVerbatimEnvironment(psi, "TINYIPC_FILE_NOTIFIER", settings.FileNotifier);
-        CopyVerbatimEnvironment(psi, TinyIpcEnvironment.MessageTtlMs);
-        CopyVerbatimEnvironment(psi, TinyIpcEnvironment.BrokerIdleShutdownMs);
+        CopyFixedVerbatimEnvironment(psi, "TINYIPC_FILE_NOTIFIER", settings.Logging.FileNotifier);
+        psi.Environment[TinyIpcEnvironment.SidecarStorageMode] = settings.Transport.Storage == SidecarStorageKind.Ring ? "ring" : "journal";
+        psi.Environment[TinyIpcEnvironment.SlotCount] = settings.Transport.RingSlotCount.ToString();
+        psi.Environment[TinyIpcEnvironment.MessageTtlMs] = settings.Transport.MessageTtlMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        psi.Environment[TinyIpcEnvironment.BrokerIdleShutdownMs] = ((int)settings.IdleShutdownDelay.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         psi.Environment["TINYIPC_BROKER_SOCKET_PATH"] = ConvertUnixPathForChild(socketPath);
         psi.Environment["TINYIPC_BUS_BACKEND"] = "sidecar-brokered";
@@ -292,10 +278,8 @@ internal static class UnixSidecarProcessManager
 
     private static string ResolveBrokerDirectory()
     {
-        return ResolveBrokerDirectory(
-            UnixSharedStorageHelpers.ResolveSharedDirectoryForCurrentRuntime(
-                TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
-            TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.BrokerDirectory));
+        SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
+        return ResolveBrokerDirectory(sharedScope.SharedDirectory, sharedScope.BrokerDirectoryWasConfigured ? sharedScope.BrokerDirectory : null);
     }
 
     private static string ResolveBrokerDirectory(string sharedDirectory, string? explicitDirectory)
@@ -686,24 +670,10 @@ internal static class UnixSidecarProcessManager
         }
     }
 
-    private static void CopyVerbatimEnvironment(ProcessStartInfo psi, string variableName)
-    {
-        string? value = TinyIpcEnvironment.GetEnvironmentVariable(variableName);
-        if (!string.IsNullOrWhiteSpace(value))
-            psi.Environment[variableName] = value;
-    }
-
     private static void CopyFixedVerbatimEnvironment(ProcessStartInfo psi, string variableName, string? value)
     {
         if (!string.IsNullOrWhiteSpace(value))
             psi.Environment[variableName] = value;
-    }
-
-    private static void CopyPathEnvironment(ProcessStartInfo psi, string variableName)
-    {
-        string? value = TinyIpcEnvironment.GetEnvironmentVariable(variableName);
-        if (!string.IsNullOrWhiteSpace(value))
-            psi.Environment[variableName] = ResolveUnixPath(value);
     }
 
     private static void CopyFixedPathEnvironment(ProcessStartInfo psi, string variableName, string? value)
@@ -730,9 +700,6 @@ internal static class UnixSidecarProcessManager
         string unixPath = ConvertWindowsPathToUnix(rawPath);
         return Path.IsPathRooted(unixPath) ? unixPath : Path.GetFullPath(unixPath);
     }
-
-    private static string ResolveDiagnosticsLogDirectory(string socketPath)
-        => ResolveDiagnosticsLogDirectory(socketPath, TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.LogDirectory));
 
     private static string ResolveDiagnosticsLogDirectory(string socketPath, string? configured)
     {
@@ -854,12 +821,9 @@ internal static class UnixSidecarProcessManager
         string SharedDirectory,
         string DiagnosticsDirectory,
         string? SharedGroup,
-        string? EnableLogging,
-        string? LogLevel,
-        string? LogPayload,
-        string? LogMaxBytes,
-        string? LogFileCount,
-        string? FileNotifier,
+        TimeSpan IdleShutdownDelay,
+        LoggingSettings Logging,
+        SidecarTransportSettings Transport,
         string? ExplicitNativeHostPath);
 
     private sealed class NativeHostDefaultsOverrideScope : IDisposable

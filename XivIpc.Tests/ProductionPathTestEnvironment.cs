@@ -10,11 +10,16 @@ namespace XivIpc.Tests;
 internal static class ProductionPathTestEnvironment
 {
     internal const string BackendName = "production-auto";
+    internal const string RingBackendName = "production-ring";
     private static readonly object PublishedHostSync = new();
     private static string? _publishedHostPath;
 
     internal static bool IsProductionPath(string backendOrMode)
-        => string.Equals(backendOrMode, BackendName, StringComparison.OrdinalIgnoreCase);
+        => string.Equals(backendOrMode, BackendName, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(backendOrMode, RingBackendName, StringComparison.OrdinalIgnoreCase);
+
+    internal static bool IsProductionRingPath(string backendOrMode)
+        => string.Equals(backendOrMode, RingBackendName, StringComparison.OrdinalIgnoreCase);
 
     internal static string ResolveSharedGroup()
     {

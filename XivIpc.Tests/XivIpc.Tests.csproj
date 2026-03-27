@@ -18,6 +18,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TinyIpc.Shim\TinyIpc.Shim.csproj" />
+    <ProjectReference Include="..\XivIpc.DirectTestHost\XivIpc.DirectTestHost.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\XivIpc\XivIpc.csproj" />
     <ProjectReference Include="..\XivIpc.NativeHost\XivIpc.NativeHost.csproj" />
     <ProjectReference Include="..\XivIpc.WineTestHost\XivIpc.WineTestHost.csproj" ReferenceOutputAssembly="false" />

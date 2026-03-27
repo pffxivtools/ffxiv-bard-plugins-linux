@@ -78,7 +78,7 @@ printf 'Building test project once...\n'
 dotnet test "$TEST_PROJECT" -m:1 -v minimal --no-restore --filter "FullyQualifiedName~__build_smoke_sentinel_that_matches_nothing__" >/dev/null || true
 
 BROKERED_SIDECAR_FILTER="FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests|FullyQualifiedName~XivIpc.Tests.SidecarRuntimeIntegrationTests"
-MULTIUSER_FILTER="FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests"
+MULTIUSER_FILTER="FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests|FullyQualifiedName~XivIpc.Tests.SidecarRingMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathRingMultiUserTests"
 SHARED_GROUP="${TINYIPC_SHARED_GROUP:-steam}"
 
 printf 'Publishing runtime test artifacts...\n'

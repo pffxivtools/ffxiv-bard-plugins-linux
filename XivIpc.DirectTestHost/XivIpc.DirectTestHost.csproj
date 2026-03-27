@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <TargetFrameworks></TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Small direct shared-memory test helper used by XivIpc.Tests for cross-process attach coverage.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TinyIpc.Shim\TinyIpc.Shim.csproj" />
+  </ItemGroup>
+</Project>

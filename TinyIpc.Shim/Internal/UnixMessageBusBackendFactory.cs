@@ -1,6 +1,3 @@
-using System.ComponentModel;
-using System.Net.Sockets;
-using System.Reflection;
 using TinyIpc.Messaging;
 using XivIpc.Internal;
 using XivIpc.Messaging;
@@ -9,47 +6,33 @@ namespace TinyIpc.Internal;
 
 internal static class UnixMessageBusBackendFactory
 {
-    internal const string AutoBackend = "auto";
-    internal const string DirectSharedMemoryBackend = "shared-memory";
-    internal const string DirectAliasBackend = "direct";
-    internal const string SidecarSharedMemoryBackend = "sidecar";
-
     internal static IShimTinyMessageBus Create(ChannelInfo channelInfo)
     {
         ArgumentNullException.ThrowIfNull(channelInfo);
 
-        return ResolveBackendName() switch
-        {
-            DirectAliasBackend or DirectSharedMemoryBackend => CreateDirect(channelInfo),
-            SidecarSharedMemoryBackend => CreateSidecar(channelInfo),
-            AutoBackend => CreateAuto(channelInfo),
+        bool brokerRequired = IsBrokerRequiredForAuto();
+        MessageBusSelectionSettings selection = TinyIpcRuntimeSettings.ResolveMessageBusSelection(brokerRequired);
 
-            var backend => throw new InvalidOperationException($"Unknown TinyIpc message bus backend '{backend}'.")
+        return selection.Backend switch
+        {
+            MessageBusBackendKind.Direct => CreateDirect(channelInfo, selection.DirectStorage),
+            MessageBusBackendKind.Sidecar => CreateSidecar(channelInfo),
+            MessageBusBackendKind.Auto => CreateAuto(channelInfo, selection),
+            _ => throw new InvalidOperationException($"Unknown TinyIpc message bus backend '{selection.Backend}'.")
         };
     }
 
-    internal static string ResolveBackendName()
+    private static IShimTinyMessageBus CreateAuto(ChannelInfo channelInfo, MessageBusSelectionSettings selection)
     {
-        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend);
-        if (string.IsNullOrWhiteSpace(configured))
-            return AutoBackend;
-
-        return NormalizeBackendName(configured);
-    }
-
-    private static IShimTinyMessageBus CreateAuto(ChannelInfo channelInfo)
-    {
-        bool brokerRequired = IsBrokerRequiredForAuto();
         bool nativeHostAvailable = UnixSidecarProcessManager.TryResolveNativeHostPath(out _);
+        SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
 
-        if (brokerRequired || nativeHostAvailable)
-        {
+        if (selection.BrokerRequiredForAuto || nativeHostAvailable)
             return CreateSidecar(channelInfo);
-        }
 
         try
         {
-            return CreateDirect(channelInfo);
+            return CreateDirect(channelInfo, selection.DirectStorage);
         }
         catch (Exception directEx)
         {
@@ -59,8 +42,9 @@ internal static class UnixMessageBusBackendFactory
                 "Direct/in-memory backend initialization failed during auto backend selection; using safe no-op behavior.",
                 directEx,
                 ("channel", channelInfo.Name),
-                ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
-                ("configuredBackend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend) ?? AutoBackend));
+                ("sharedDir", sharedScope.SharedDirectory),
+                ("configuredBackend", selection.Backend),
+                ("directStorage", selection.DirectStorage));
 
             return new DisabledShimMessageBus(
                 channelInfo.Name,
@@ -72,79 +56,18 @@ internal static class UnixMessageBusBackendFactory
         }
     }
 
-    private static IShimTinyMessageBus CreateDirect(ChannelInfo channelInfo)
-        => new XivMessageBusAdapter(new UnixInMemoryTinyMessageBus(channelInfo));
+    private static IShimTinyMessageBus CreateDirect(ChannelInfo channelInfo, DirectStorageKind storage)
+        => new XivMessageBusAdapter(new UnixDirectTinyMessageBus(channelInfo, storage));
 
     private static IShimTinyMessageBus CreateSidecar(ChannelInfo channelInfo)
          => new XivMessageBusAdapter(new UnixSidecarTinyMessageBus(channelInfo));
 
-    private static bool ShouldFallbackFromSidecar(Exception ex)
-    {
-        ex = Unwrap(ex);
-
-        return ex is FileNotFoundException
-            or DirectoryNotFoundException
-            or IOException
-            or PlatformNotSupportedException
-            or SocketException
-            or Win32Exception
-            or SidecarStartupException;
-    }
-
     private static bool IsBrokerRequiredForAuto()
     {
-        if (string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedGroup)))
+        SharedScopeSettings sharedScope = TinyIpcRuntimeSettings.ResolveSharedScope();
+        if (string.IsNullOrWhiteSpace(sharedScope.SharedGroup))
             return false;
 
         return UnixSidecarProcessManager.TryResolveNativeHostPath(out _);
-    }
-
-    private static void LogAutoSidecarFailure(ChannelInfo channelInfo, Exception ex, bool brokerRequired)
-    {
-        TinyIpcLogger.Warning(
-            nameof(UnixMessageBusBackendFactory),
-            brokerRequired ? "AutoBrokerRequiredFailed" : "AutoFallbackToDirect",
-            brokerRequired
-                ? "Sidecar startup failed during auto backend selection; brokered mode was required so TinyIpc will use a safe no-op bus."
-                : "Sidecar startup failed during auto backend selection; falling back to direct/in-memory backend.",
-            ex,
-            ("channel", channelInfo.Name),
-            ("sharedDir", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SharedDirectory)),
-            ("configuredBackend", TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageBusBackend) ?? AutoBackend),
-            ("brokerRequired", brokerRequired),
-            ("nativeHostCandidates", string.Join(";", UnixSidecarProcessManager.GetNativeHostCandidatePathsForDiagnostics())));
-    }
-
-    private static Exception Unwrap(Exception ex)
-    {
-        while (true)
-        {
-            switch (ex)
-            {
-                case AggregateException agg when agg.InnerExceptions.Count == 1:
-                    ex = agg.InnerExceptions[0];
-                    continue;
-                case TargetInvocationException tie when tie.InnerException is not null:
-                    ex = tie.InnerException;
-                    continue;
-                default:
-                    return ex;
-            }
-        }
-    }
-
-    private static string NormalizeBackendName(string configured)
-    {
-        string normalized = configured.Trim().ToLowerInvariant();
-        return normalized switch
-        {
-            "shm" => DirectSharedMemoryBackend,
-            "sharedmemory" => DirectSharedMemoryBackend,
-            "shared_memory" => DirectSharedMemoryBackend,
-            "direct" => DirectAliasBackend,
-            "sidecar-shared-memory" => SidecarSharedMemoryBackend,
-            "sidecar_shared_memory" => SidecarSharedMemoryBackend,
-            _ => normalized
-        };
     }
 }

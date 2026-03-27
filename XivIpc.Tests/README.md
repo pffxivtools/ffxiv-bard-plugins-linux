@@ -31,5 +31,8 @@ dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
 - `FunctionalTests.cs`
 - `SidecarLifecycleTests.cs`
 - `SidecarMultiUserTests.cs`
+- `SidecarRingMultiUserTests.cs`
+- `ProductionPathMultiUserTests.cs`
+- `ProductionPathRingMultiUserTests.cs`
 - `SidecarRuntimeIntegrationTests.cs`
 - `ProductionPathTestEnvironment.cs`

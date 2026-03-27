@@ -3,8 +3,10 @@ using XivIpc.Internal;
 
 namespace XivIpc.Messaging;
 
-internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
+internal sealed class InMemoryDirectStorage : IDirectMessageStorage
 {
+    private const string LogSource = nameof(UnixInMemoryTinyMessageBus);
+
     private static readonly ConcurrentDictionary<string, ChannelState> Channels = new(StringComparer.Ordinal);
 
     private readonly string _channelName;
@@ -19,12 +21,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
     private readonly ChannelState _channelState;
     private bool _disposed;
 
-    public UnixInMemoryTinyMessageBus(ChannelInfo channelInfo)
-        : this(channelInfo.Name, checked(channelInfo.Size))
-    {
-    }
-
-    public UnixInMemoryTinyMessageBus(string channelName, int maxPayloadBytes)
+    public InMemoryDirectStorage(string channelName, int maxPayloadBytes)
     {
         if (string.IsNullOrWhiteSpace(channelName))
             throw new ArgumentException("Channel name must be provided.", nameof(channelName));
@@ -43,7 +40,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         _channelState.AddMember(this, maxPayloadBytes);
 
         TinyIpcLogger.Info(
-            nameof(UnixInMemoryTinyMessageBus),
+            LogSource,
             "Initialized",
             "Initialized in-memory TinyMessageBus.",
             ("channel", _channelName),
@@ -68,7 +65,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         if (TinyIpcLogger.IsEnabled(TinyIpcLogLevel.Debug))
         {
             TinyIpcLogger.Debug(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "Publish",
                 "Publishing message to in-memory bus.",
                 ("channel", _channelName),
@@ -89,7 +86,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         _disposed = true;
 
         TinyIpcLogger.Info(
-            nameof(UnixInMemoryTinyMessageBus),
+            LogSource,
             "Dispose",
             "Disposing in-memory TinyMessageBus.",
             ("channel", _channelName),
@@ -102,7 +99,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         catch (Exception ex)
         {
             TinyIpcLogger.Warning(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "CancelFailed",
                 "Failed to cancel in-memory bus tasks.",
                 ex,
@@ -126,7 +123,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         catch (Exception ex)
         {
             TinyIpcLogger.Warning(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "RemoveMemberFailed",
                 "Failed removing in-memory bus from channel state.",
                 ex,
@@ -140,7 +137,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         catch (Exception ex)
         {
             TinyIpcLogger.Warning(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "WaitFailed",
                 "Timed out or failed waiting for dispatch loop.",
                 ex,
@@ -154,7 +151,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         catch (Exception ex)
         {
             TinyIpcLogger.Warning(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "SignalDisposeFailed",
                 "Failed to dispose pending signal.",
                 ex,
@@ -168,7 +165,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
         catch (Exception ex)
         {
             TinyIpcLogger.Warning(
-                nameof(UnixInMemoryTinyMessageBus),
+                LogSource,
                 "CtsDisposeFailed",
                 "Failed to dispose cancellation source.",
                 ex,
@@ -227,7 +224,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
                 catch (Exception ex)
                 {
                     TinyIpcLogger.Error(
-                        nameof(UnixInMemoryTinyMessageBus),
+                        LogSource,
                         "MessageHandlerFailed",
                         "A MessageReceived handler threw an exception.",
                         ex,
@@ -241,13 +238,13 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
     private void ThrowIfDisposed()
     {
         if (_disposed)
-            throw new ObjectDisposedException(nameof(UnixInMemoryTinyMessageBus));
+            throw new ObjectDisposedException(nameof(InMemoryDirectStorage));
     }
 
     private sealed class ChannelState
     {
         private readonly object _gate = new();
-        private readonly HashSet<UnixInMemoryTinyMessageBus> _members = new();
+        private readonly HashSet<InMemoryDirectStorage> _members = new();
 
         public ChannelState(string channelName, int maxPayloadBytes)
         {
@@ -268,7 +265,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
             }
         }
 
-        public void AddMember(UnixInMemoryTinyMessageBus member, int requestedMaxPayloadBytes)
+        public void AddMember(InMemoryDirectStorage member, int requestedMaxPayloadBytes)
         {
             lock (_gate)
             {
@@ -283,7 +280,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
             }
         }
 
-        public void RemoveMember(UnixInMemoryTinyMessageBus member)
+        public void RemoveMember(InMemoryDirectStorage member)
         {
             lock (_gate)
             {
@@ -291,17 +288,17 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
             }
         }
 
-        public void Publish(UnixInMemoryTinyMessageBus sender, byte[] message)
+        public void Publish(InMemoryDirectStorage sender, byte[] message)
         {
-            UnixInMemoryTinyMessageBus[] recipients;
+            InMemoryDirectStorage[] recipients;
 
             lock (_gate)
             {
-                recipients = new UnixInMemoryTinyMessageBus[_members.Count];
+                recipients = new InMemoryDirectStorage[_members.Count];
                 _members.CopyTo(recipients);
             }
 
-            foreach (UnixInMemoryTinyMessageBus recipient in recipients)
+            foreach (InMemoryDirectStorage recipient in recipients)
             {
                 if (ReferenceEquals(recipient, sender))
                     continue;
@@ -312,7 +309,7 @@ internal sealed class UnixInMemoryTinyMessageBus : IXivMessageBus
                 if (message.Length > recipient.MaxPayloadBytes)
                 {
                     TinyIpcLogger.Warning(
-                        nameof(UnixInMemoryTinyMessageBus),
+                        LogSource,
                         "RecipientCapacityTooSmall",
                         "Skipping delivery to recipient because its configured max payload is smaller than the published message.",
                         null,

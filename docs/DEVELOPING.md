@@ -13,7 +13,8 @@ This repo contains:
 The current production sidecar architecture is:
 
 - control plane over Unix domain sockets
-- broker-owned shared-file ring buffers
+- broker-owned shared-file journal storage by default
+- optional broker-owned shared-file ring storage for bounded retained delivery
 - one native Linux broker process per shared directory
 - strict group-based access for cross-user sidecar mode
 
@@ -25,11 +26,27 @@ The current production sidecar architecture is:
 
 Useful environment variables:
 
-- `TINYIPC_MESSAGE_BUS_BACKEND=sidecar|direct|inmemory|auto`
+- `TINYIPC_MESSAGE_BUS_BACKEND=auto|direct|sidecar`
+- `TINYIPC_DIRECT_STORAGE_MODE=in-memory|shared-memory`
+- `TINYIPC_SIDECAR_STORAGE_MODE=journal|ring`
 - `TINYIPC_SHARED_DIR=/path/to/shared-dir`
 - `TINYIPC_SHARED_GROUP=steam`
 - `TINYIPC_NATIVE_HOST_PATH=/path/to/XivIpc.NativeHost`
 - `TINYIPC_UNIX_SHELL=/bin/sh`
+
+Mode notes:
+
+- `direct + in-memory` is local-process only and mainly useful for tests.
+- `direct + shared-memory` is the native Linux direct IPC mode.
+- `sidecar + journal` is the default brokered production mode.
+- `sidecar + ring` is an alternate brokered mode retained for bounded-storage behavior and future experimentation.
+
+Direct shared-memory discovery contract:
+
+- the shared-memory object name is derived deterministically from the channel name plus the shared-directory scope hash
+- the rendezvous metadata file is `tinyipc_busmeta_<channel>_<hash>.bin` in `TINYIPC_SHARED_DIR`
+- that metadata file records version, slot count, slot payload bytes, image size, TTL, and generation id
+- reopening with compatible sizing reuses the same region and metadata; incompatible larger requests are rejected while another compatible participant is still attached
 
 ## Build
 
@@ -51,7 +68,7 @@ Run the main native test matrix on Linux:
 
 ```bash
 dotnet test XivIpc.Tests/XivIpc.Tests.csproj -v minimal --framework net9.0 \
-  --filter "FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests|FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests"
+  --filter "FullyQualifiedName~XivIpc.Tests.FunctionalTests|FullyQualifiedName~XivIpc.Tests.ParallelFunctionalTests|FullyQualifiedName~XivIpc.Tests.SidecarLifecycleTests|FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests|FullyQualifiedName~XivIpc.Tests.SidecarRingMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathRingMultiUserTests"
 ```
 
 Run only lifecycle coverage:
@@ -68,7 +85,7 @@ TINYIPC_ENABLE_MULTIUSER_TESTS=1 \
 TINYIPC_MULTIUSER_SECONDARY_USER=bff14bard01 \
 TINYIPC_SHARED_GROUP=steam \
 dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net9.0 -v normal \
-  --filter "FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests"
+  --filter "FullyQualifiedName~XivIpc.Tests.SidecarMultiUserTests|FullyQualifiedName~XivIpc.Tests.SidecarRingMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathMultiUserTests|FullyQualifiedName~XivIpc.Tests.ProductionPathRingMultiUserTests"
 ```
 
 ## Multi-User Sidecar Validation
@@ -76,7 +93,8 @@ dotnet test XivIpc.Tests/XivIpc.Tests.csproj --no-build --framework net9.0 -v no
 The brokered sidecar path now requires a valid shared group. For cross-user tests:
 
 - the primary and secondary users must both be members of `TINYIPC_SHARED_GROUP`
-- the broker socket, state file, startup lock, and ring files are expected to be group-owned
+- the host must allow non-interactive user switching for the test runner, since the harness launches the secondary process through `sudo -n -u <user> ...`
+- the broker socket, state file, startup lock, and broker storage files are expected to be group-owned
 - the tests start the broker through the normal client path, not by launching the host directly
 
 The repo includes a helper script that publishes the runtime artifacts and runs:

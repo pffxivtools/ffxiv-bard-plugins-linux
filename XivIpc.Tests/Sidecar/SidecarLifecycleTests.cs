@@ -1306,6 +1306,9 @@ public sealed class SidecarLifecycleTests
                 _overrideValues[TinyIpcEnvironment.EnableLogging] = "1";
                 _overrideValues[TinyIpcEnvironment.FileNotifier] = "auto";
                 _overrideValues[TinyIpcEnvironment.BrokerIdleShutdownMs] = brokerIdleShutdownMs?.ToString();
+
+                if (ProductionPathTestEnvironment.IsProductionRingPath(mode))
+                    _overrideValues[TinyIpcEnvironment.SidecarStorageMode] = "ring";
             }
             else
             {

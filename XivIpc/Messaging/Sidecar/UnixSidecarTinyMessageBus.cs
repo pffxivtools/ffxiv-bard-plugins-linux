@@ -6,8 +6,6 @@ namespace XivIpc.Messaging;
 
 public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 {
-    private const int DefaultHeartbeatIntervalMs = 2000;
-    private const int DefaultHeartbeatTimeoutMs = 60000;
     private const int MaxReconnectQueuedMessages = 64;
     private const int InitialConnectRetryAttempts = 5;
     private const int InitialConnectRetryDelayMs = 50;
@@ -33,6 +31,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
     private readonly string _channelName;
     private readonly int _requestedBufferBytes;
     private readonly Guid _clientInstanceId;
+    private readonly SidecarTransportSettings _transportSettings;
     private readonly UnixSidecarProcessManager.RuntimeSettings _runtimeSettings;
     private readonly object _stateGate = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -49,7 +48,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
     private readonly List<Task> _connectionCleanupTasks = new();
 
     private Socket? _socket;
-    private BrokeredChannelJournal? _journal;
+    private IBrokeredClientStorage? _storage;
     private UnixSidecarProcessManager.Lease? _lease;
     private CancellationTokenSource? _connectionCts;
     private Task? _eventLoopTask;
@@ -86,6 +85,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         _channelName = channelName;
         _requestedBufferBytes = maxPayloadBytes;
         _clientInstanceId = Guid.NewGuid();
+        _transportSettings = TinyIpcRuntimeSettings.ResolveSidecarTransport();
         _runtimeSettings = UnixSidecarProcessManager.CaptureSettings();
         _effectiveSizing = JournalSizingPolicy.Compute(_requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
         _effectiveMaxPayloadBytes = _effectiveSizing.MaxPayloadBytes;
@@ -355,7 +355,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
         UnixSidecarProcessManager.Lease lease = default;
         Socket? socket = null;
-        BrokeredChannelJournal? journal = null;
+        IBrokeredClientStorage? storage = null;
         CancellationTokenSource? connectionCts = null;
 
         try
@@ -367,15 +367,18 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                 _channelName,
                 _requestedBufferBytes,
                 RuntimeEnvironmentDetector.GetCurrentProcessId(),
-                ResolveHeartbeatIntervalMs(),
-                ResolveHeartbeatTimeoutMs(),
+                _transportSettings.HeartbeatIntervalMs,
+                _transportSettings.HeartbeatTimeoutMs,
                 _clientInstanceId));
 
             SidecarFrame attachFrame = SidecarProtocol.ReadFrame(socket);
-            LogAttachFrameReceived(attachFrame);
-            SidecarAttachRing attach = DecodeAttachFrame(attachFrame);
-            journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, ResolveMinMessageAgeMs());
-            JournalSizing sizing = JournalSizingPolicy.Compute(_requestedBufferBytes, BrokeredChannelJournal.HeaderBytes);
+            BrokeredClientAttachment attachment = BrokeredClientAttachmentFactory.AttachFromFrame(
+                attachFrame,
+                _channelName,
+                _requestedBufferBytes,
+                _transportSettings);
+            BrokeredStorageAttachInfo attachInfo = attachment.AttachInfo;
+            storage = attachment.Storage;
 
             SidecarFrame readyFrame = SidecarProtocol.ReadFrame(socket);
             if (readyFrame.Type == SidecarFrameType.Error)
@@ -386,11 +389,11 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
             connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             Socket eventSocket = socket;
-            BrokeredChannelJournal eventJournal = journal;
+            IBrokeredClientStorage eventStorage = storage;
             CancellationTokenSource eventConnectionCts = connectionCts;
 
             Task eventLoopTask = ObserveTaskFault(
-                Task.Run(() => EventLoopAsync(eventSocket, eventJournal, attach.SessionId, eventConnectionCts.Token)),
+                Task.Run(() => EventLoopAsync(eventSocket, eventStorage, attachInfo.SessionId, eventConnectionCts.Token)),
                 "EventLoopFaulted",
                 "The broker-backed event loop faulted unexpectedly.");
 
@@ -406,12 +409,12 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
                 _lease = lease;
                 _socket = socket;
-                _journal = journal;
+                _storage = storage;
                 _connectionCts = connectionCts;
-                _effectiveSizing = sizing;
-                _effectiveMaxPayloadBytes = attach.SlotPayloadBytes;
-                _sessionId = attach.SessionId;
-                _nextSequence = attach.StartSequence;
+                _effectiveSizing = _effectiveSizing with { BudgetBytes = attachment.EffectiveBudgetBytes };
+                _effectiveMaxPayloadBytes = attachInfo.MaxPayloadBytes;
+                _sessionId = attachInfo.SessionId;
+                _nextSequence = attachInfo.StartSequence;
                 _connectionState = ConnectionState.Connected;
                 _connectedTcs.TrySetResult(true);
                 _eventLoopTask = eventLoopTask;
@@ -423,15 +426,15 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                 "ReconnectSucceeded",
                 "Connected or reconnected to the sidecar broker.",
                 ("channel", _channelName),
-                ("sessionId", attach.SessionId),
+                ("sessionId", attachInfo.SessionId),
                 ("requestedBufferBytes", _requestedBufferBytes),
-                ("effectiveBudgetBytes", sizing.BudgetBytes),
-                ("maxPayloadBytes", attach.SlotPayloadBytes),
+                ("effectiveBudgetBytes", attachment.EffectiveBudgetBytes),
+                ("maxPayloadBytes", attachInfo.MaxPayloadBytes),
                 ("socketPath", lease.SocketPath));
 
             lease = default;
             socket = null;
-            journal = null;
+            storage = null;
             connectionCts = null;
             await Task.CompletedTask.ConfigureAwait(false);
         }
@@ -445,12 +448,12 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                     "Failed to dispose connection cancellation source during connection setup cleanup.");
             }
 
-            if (journal is not null)
+            if (storage is not null)
             {
                 SafeInvoke(
-                    () => journal.Dispose(),
-                    "JournalDisposeFailedDuringConnect",
-                    "Failed to dispose unattached journal during connection setup cleanup.");
+                    () => storage.Dispose(),
+                    "StorageDisposeFailedDuringConnect",
+                    "Failed to dispose unattached broker storage during connection setup cleanup.");
             }
 
             if (socket is not null)
@@ -602,7 +605,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         }
     }
 
-    private async Task EventLoopAsync(Socket socket, BrokeredChannelJournal journal, long sessionId, CancellationToken cancellationToken)
+    private async Task EventLoopAsync(Socket socket, IBrokeredClientStorage storage, long sessionId, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested && !_disposed)
         {
@@ -612,7 +615,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                 switch (frame.Type)
                 {
                     case SidecarFrameType.Notify:
-                        DrainAvailableMessages(journal, sessionId);
+                        DrainAvailableMessages(storage, sessionId);
                         break;
                     case SidecarFrameType.Error:
                         HandleConnectionLost(
@@ -644,7 +647,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
 
     private async Task HeartbeatLoopAsync(Socket socket, CancellationToken cancellationToken)
     {
-        TimeSpan interval = TimeSpan.FromMilliseconds(ResolveHeartbeatIntervalMs());
+        TimeSpan interval = TimeSpan.FromMilliseconds(_transportSettings.HeartbeatIntervalMs);
         using var timer = new PeriodicTimer(interval);
 
         try
@@ -695,12 +698,12 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         }
     }
 
-    private void DrainAvailableMessages(BrokeredChannelJournal journal, long sessionId)
+    private void DrainAvailableMessages(IBrokeredClientStorage storage, long sessionId)
     {
-        BrokeredJournalDrainResult result;
+        BrokeredStorageDrainResult result;
         try
         {
-            result = journal.Drain(_clientInstanceId, ref _nextSequence);
+            result = storage.Drain(new BrokeredStorageParticipant(sessionId, _clientInstanceId), ref _nextSequence);
         }
         catch (Exception ex)
         {
@@ -938,7 +941,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
     private void TeardownConnection(bool sendDispose)
     {
         Socket? socket;
-        BrokeredChannelJournal? journal;
+        IBrokeredClientStorage? storage;
         UnixSidecarProcessManager.Lease? lease;
         CancellationTokenSource? connectionCts;
         Task? eventLoopTask;
@@ -947,14 +950,14 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         lock (_stateGate)
         {
             socket = _socket;
-            journal = _journal;
+            storage = _storage;
             lease = _lease;
             connectionCts = _connectionCts;
             eventLoopTask = _eventLoopTask;
             heartbeatTask = _heartbeatTask;
 
             _socket = null;
-            _journal = null;
+            _storage = null;
             _lease = null;
             _connectionCts = null;
             _eventLoopTask = null;
@@ -968,7 +971,7 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         }
 
         if (socket is null &&
-            journal is null &&
+            storage is null &&
             lease is null &&
             connectionCts is null &&
             eventLoopTask is null &&
@@ -1054,12 +1057,12 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
                     "Failed to dispose socket during connection teardown.");
             }
 
-            if (journal is not null)
+            if (storage is not null)
             {
                 SafeInvoke(
-                    () => journal.Dispose(),
-                    "JournalDisposeFailedDuringTeardown",
-                    "Failed to dispose journal during connection teardown.");
+                    () => storage.Dispose(),
+                    "StorageDisposeFailedDuringTeardown",
+                    "Failed to dispose broker storage during connection teardown.");
             }
 
             if (lease.HasValue)
@@ -1326,84 +1329,11 @@ public sealed class UnixSidecarTinyMessageBus : IXivMessageBus
         }
     }
 
-    private SidecarAttachRing DecodeAttachFrame(SidecarFrame frame)
-    {
-        if (frame.Type == SidecarFrameType.Error)
-        {
-            string message = frame.Payload.Length == 0
-                ? "Broker attach failed."
-                : System.Text.Encoding.UTF8.GetString(frame.Payload.Span);
-            TinyIpcLogger.Warning(
-                nameof(UnixSidecarTinyMessageBus),
-                "AttachRejectedByBroker",
-                "Broker rejected sidecar attach.",
-                null,
-                ("channel", _channelName),
-                ("payloadLength", frame.Payload.Length),
-                ("brokerError", message));
-            throw new InvalidOperationException(message);
-        }
-
-        try
-        {
-            return SidecarProtocol.DecodeAttachRing(frame);
-        }
-        catch (Exception ex)
-        {
-            TinyIpcLogger.Warning(
-                nameof(UnixSidecarTinyMessageBus),
-                "AttachRingDecodeFailed",
-                "Failed to decode broker ATTACH_RING frame.",
-                ex,
-                ("channel", _channelName),
-                ("frameType", frame.Type),
-                ("payloadLength", frame.Payload.Length),
-                ("payloadPreview", BuildPayloadPreview(frame.Payload.Span)));
-            throw;
-        }
-    }
-
-    private void LogAttachFrameReceived(SidecarFrame frame)
-    {
-        TinyIpcLogger.Info(
-            nameof(UnixSidecarTinyMessageBus),
-            "AttachRingFrameReceived",
-            "Received broker attach frame.",
-            ("channel", _channelName),
-            ("frameType", frame.Type),
-            ("payloadLength", frame.Payload.Length),
-            ("payloadPreview", BuildPayloadPreview(frame.Payload.Span)));
-    }
-
     private static TimeSpan ComputeReconnectDelay(int attemptIndex)
     {
         TimeSpan baseline = ReconnectBackoffSchedule[Math.Min(attemptIndex, ReconnectBackoffSchedule.Length - 1)];
         int jitterMs = Random.Shared.Next(0, 251);
         return baseline + TimeSpan.FromMilliseconds(jitterMs);
-    }
-
-    private static int ResolveHeartbeatIntervalMs()
-        => ResolvePositiveInt32("TINYIPC_SIDECAR_HEARTBEAT_INTERVAL_MS", DefaultHeartbeatIntervalMs);
-
-    private static int ResolveHeartbeatTimeoutMs()
-        => ResolvePositiveInt32("TINYIPC_SIDECAR_HEARTBEAT_TIMEOUT_MS", DefaultHeartbeatTimeoutMs);
-
-    private static long ResolveMinMessageAgeMs()
-    {
-        string? raw = Environment.GetEnvironmentVariable("TINYIPC_MESSAGE_TTL_MS");
-        return long.TryParse(raw, out long value) && value >= 0 ? value : 1_000L;
-    }
-
-    private static int ResolvePositiveInt32(string variableName, int fallback)
-    {
-        string? raw = Environment.GetEnvironmentVariable(variableName);
-        return int.TryParse(raw, out int value) && value > 0 ? value : fallback;
-    }
-
-    private static string BuildPayloadPreview(ReadOnlySpan<byte> payload)
-    {
-        int count = Math.Min(payload.Length, 32);
-        return count == 0 ? string.Empty : Convert.ToHexString(payload[..count]);
     }
 
     private void OnProcessExit(object? sender, EventArgs e)

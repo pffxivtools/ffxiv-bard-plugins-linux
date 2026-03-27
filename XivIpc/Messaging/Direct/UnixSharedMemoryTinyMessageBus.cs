@@ -32,9 +32,6 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
     private const int SlotReservedOffset = 40;      // int
     private const int SlotHeaderSize = 44;
 
-    private const int MinimumSlotCount = 4;
-    private const int DefaultSlotCount = 64;
-    private const long DefaultMessageTtlMs = 1_000;
     private const int FutexWaitTimeoutMs = 1_000;
 
     private const string MetadataMagic = "TINYIPC_BUS_META";
@@ -42,6 +39,7 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
 
     private readonly string _channelName;
     private readonly int _requestedBufferBytes;
+    private readonly DirectTransportSettings _settings;
     private readonly RingSizing _sizing;
     private readonly UnixSharedFileLock _writerLock;
     private readonly UnixSharedMemoryRegion _region;
@@ -73,9 +71,9 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
 
         _channelName = channelName;
         _requestedBufferBytes = maxPayloadBytes;
+        _settings = TinyIpcRuntimeSettings.ResolveDirectTransport();
 
-        int requestedSlotCount = ResolveSlotCount();
-        _sizing = RingSizingPolicy.Compute(maxPayloadBytes, requestedSlotCount, HeaderSize, SlotHeaderSize);
+        _sizing = RingSizingPolicy.Compute(maxPayloadBytes, _settings.SlotCount, HeaderSize, SlotHeaderSize);
         int requestedImageSize = _sizing.ImageSize;
 
         UnixSharedStorageHelpers.EnsureSharedDirectoryExists();
@@ -551,7 +549,7 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
 
     private BusMetadata BuildDesiredMetadata()
     {
-        long ttlMs = ResolveMessageTtlMs();
+        long ttlMs = _settings.MessageTtlMs;
 
         return new BusMetadata(
             MetadataMagic,
@@ -617,7 +615,7 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
             if (!values.TryGetValue("channel", out string? channel) || !string.Equals(channel, _channelName, StringComparison.Ordinal))
                 return null;
 
-            if (!TryReadInt32(values, "slotCount", out int slotCount) || slotCount < MinimumSlotCount)
+            if (!TryReadInt32(values, "slotCount", out int slotCount) || slotCount < 4)
                 return null;
 
             if (!TryReadInt32(values, "slotPayloadBytes", out int slotPayloadBytes) || slotPayloadBytes <= 0)
@@ -813,7 +811,7 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
                 GenerationId: generation);
         }
 
-        if (slotCount < MinimumSlotCount)
+        if (slotCount < 4)
         {
             return new ImageValidationResult(
                 false,
@@ -962,24 +960,6 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
         return tail;
     }
 
-    private static int ResolveSlotCount()
-    {
-        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.SlotCount);
-        if (int.TryParse(configured, out int value) && value >= MinimumSlotCount)
-            return value;
-
-        return DefaultSlotCount;
-    }
-
-    private static long ResolveMessageTtlMs()
-    {
-        string? configured = TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.MessageTtlMs);
-        if (long.TryParse(configured, out long value) && value >= 0)
-            return value;
-
-        return DefaultMessageTtlMs;
-    }
-
     private static int ComputeRequiredImageSize(int slotCount, int slotPayloadBytes)
         => checked(HeaderSize + (slotCount * (SlotHeaderSize + slotPayloadBytes)));
 
@@ -1060,4 +1040,3 @@ internal sealed class UnixSharedMemoryTinyMessageBus : IXivMessageBus
         Guid GenerationId = default,
         uint Magic = 0);
 }
-
