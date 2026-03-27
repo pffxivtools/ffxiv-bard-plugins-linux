@@ -1,225 +1,147 @@
 # XivIpc
 
-`XivIpc` provides Linux support for TinyIpc-based Dalamud plugins.
+`XivIpc` is the Linux runtime and packaging repo for TinyIpc-based Dalamud plugins such as `BardToolbox`, `MidiBard 2`, and `Master Of Puppets`.
 
-This repo exists for the plugins packaged by this project, including `BardToolbox`, `MidiBard 2`, and `MasterOfPuppets`, and for any other consumer that expects the `TinyIpc` API shape but needs to run on Linux, Wine, or xivlauncher's XLCore runtime. The public API surface stays TinyIpc-compatible through `TinyIpc.Shim`, while the transport underneath is replaced with a Linux-native implementation.
+If you are here to install and use the plugins on Linux, this README is the guide. If you are building, testing, or packaging the repo itself, use [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
-If you are looking for developer/build information, start with [docs/DEVELOPING.md](docs/DEVELOPING.md). This README is the user guide.
+## What This Repo Does
 
-## Why This Exists
+These plugins were originally built around Windows-only TinyIpc behavior. This repo ships Linux-compatible plugin packages and the native runtime pieces needed to make them work under Linux and Wine.
 
-Upstream [steamcore/TinyIpc](https://github.com/steamcore/TinyIpc) describes TinyIpc as a lightweight, serverless .NET inter-process broadcast message bus for Windows desktop applications. Its own README also calls out two important constraints:
+For most users, the important part is simple:
 
-- it is serverless
-- it is Windows-only
+- install the plugin from this repo's custom Dalamud feed
+- launch the game through xivlauncher on Linux
+- use the plugin normally in game
 
-That is the problem this repo solves.
+With the current runtime defaults, the IPC side should work out of the box for the standard single-user setup.
 
-Linux, Wine, and Proton do not provide the same Windows-only named primitives that upstream TinyIpc depends on. On top of that, cross-client communication on Linux needs explicit handling for:
+## Supported Setup
 
-- shared filesystem paths
-- Unix socket ownership
-- group permissions
-- Wine path translation
-- native Linux process startup
-
-This repo keeps the TinyIpc-facing API, but changes how it is implemented:
-
-- `TinyIpc.Shim` preserves types such as `TinyMessageBus`, `TinyMemoryMappedFile`, and `TinyIpcOptions`
-- `XivIpc` provides the Unix-side implementation
-- `XivIpc.NativeHost` is the native Linux broker process
-
-## How It Works
-
-At runtime, the message bus is brokered instead of fully serverless.
-
-1. A plugin creates a `TinyMessageBus` or `TinyMemoryMappedFile`.
-2. `TinyIpc.Shim` forwards that work into the Unix implementation in `XivIpc`.
-3. The client discovers or launches `XivIpc.NativeHost`.
-4. The client connects to the broker over a Unix domain socket.
-5. The broker creates and owns the channel journal files in the shared runtime directory.
-6. Publishers send control messages to the broker, and subscribers drain from the broker-owned journal.
-7. The broker tracks live sessions and shuts down after the last client disconnects and the idle timeout expires.
-
-The current production path is:
-
-- control plane: Unix domain socket
-- message storage: broker-owned shared journal files
-- shared storage: file-backed named shared files
-- access control: Unix group ownership via `TINYIPC_SHARED_GROUP`
-
-The important pieces in this repo are:
-
-- [`TinyIpc.Shim`](TinyIpc.Shim/README.md): TinyIpc-compatible public facade
-- [`XivIpc`](XivIpc/README.md): Unix-side transport and storage implementation
-- [`XivIpc.NativeHost`](XivIpc.NativeHost/README.md): native Linux broker
-
-## Runtime Requirements
-
-The recommended setup is:
+Recommended:
 
 - Linux
-- xivlauncher-core
+- `xivlauncher-core`
 - xivlauncher's built-in XLCore Wine runtime
 
-Important compatibility notes:
+Compatibility notes:
 
-- Steam Proton does not currently work for this setup because Pressure Vessel sandboxes the runtime and prevents the required shared-path/native-host model from working reliably.
-- If you are not using XLCore Wine, use at least Wine 10.2.
 - XLCore Wine is the preferred runtime.
+- If you are not using XLCore Wine, use a recent Wine build.
+- Steam Proton is not a supported primary path for this setup. Pressure Vessel sandboxing can interfere with the shared-path/native-host model these plugins use.
 
-## Install Guide
+## Install
 
-### 1. Create a shared Unix group
+### 1. Add the custom Dalamud repo
 
-Create one Unix group that every game client using this IPC setup will share.
+Open `Dalamud Settings`, then add this URL under custom plugin repositories:
+
+```text
+https://raw.githubusercontent.com/pffxivtools/ffxiv-bard-plugins-linux/refs/heads/main/pluginmaster.json
+```
+
+### 2. Install the plugin you want
+
+Open `Plugin Installer` and install one of the packaged plugins:
+
+- `BardToolbox`
+- `MidiBard 2`
+- `Master Of Puppets`
+
+### 3. Launch normally
+
+Launch the game through xivlauncher on Linux and use the plugin as you normally would.
+
+You should not need to manually install or stage `XivIpc.NativeHost`, create a broker directory, or export `TINYIPC_*` variables for the default setup.
+
+## What Works Automatically
+
+The current runtime path is much simpler than the older manual setup:
+
+- the shared runtime directory defaults to `/tmp/tinyipc-shared-ffxiv`
+- the native host is expected at `/tmp/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost`
+- if that native host is missing, the runtime can download the latest published host automatically
+- default single-user setups can run without `TINYIPC_SHARED_GROUP`
+
+That means the standard path is "install plugin and run it", not "manually configure broker infrastructure first".
+
+## Usage
+
+This repo does not change the normal in-game usage of the packaged plugins. After installation:
+
+- `MidiBard 2` is still used through its normal in-game UI and commands
+- `BardToolbox` is still configured through its own windows and settings
+- `Master Of Puppets` is still used through its own action and broadcast workflows
+
+For feature-specific help, use each plugin's own docs, UI help, or community support links.
+
+## Advanced Tips
+
+### DXVK VRAM limit tweak
+
+If you are running multiple clients, this DXVK config can help limit VRAM use per client:
+
+```ini
+dxgi.maxDeviceMemory = 2048
+dxgi.maxSharedMemory = 2048
+```
 
 Example:
 
 ```bash
-sudo groupadd steam
-sudo usermod -aG steam myuser
+export DXVK_CONFIG_FILE=/home/shared/dxvk-alt.conf
 ```
 
-Every cooperating client needs access through the same group, because the broker checks peer group membership before allowing a connection.
+Put the two `dxgi.*` lines in that file, then launch the client with `DXVK_CONFIG_FILE` pointing to it.
 
-### 2. Create a shared root and runtime directory
+### Optional logging
 
-Create a shared directory that all game clients can access. Use the setgid bit so new files and directories inherit the group.
-
-Example layout:
-
-```text
-/home/shared/tinyipc-shared-ffxiv/
-/home/shared/tmpfs/tinyipc-shared-ffxiv/
-```
-
-Recommended:
-
-- use one shared root for durable payloads and staged binaries
-- use one runtime directory for broker socket, broker state, and journal files
-- make the runtime directory a `tmpfs` mount for speed if possible
-
-Example permissions for the user-managed shared directory:
-
-```text
-drwxrwsr-x
-```
-
-The broker-managed runtime artifacts inside that directory are more restrictive. In normal operation the implementation expects group-owned broker directories and files and repairs them toward modes such as:
-
-- directories: `2770`
-- files: `660`
-
-### 3. Place `XivIpc.NativeHost` in the shared area
-
-Download or publish `XivIpc.NativeHost` and place it somewhere all clients can reference, for example:
-
-```text
-/home/shared/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost
-```
-
-That path is the native Linux executable the clients will launch when they need the broker.
-
-### 4. Set the environment variables before launching
-
-A working launcher example looks like this:
+If you need runtime logs for troubleshooting:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-user="${1:-myuser}"
-
-export TINYIPC_NATIVE_HOST_PATH="/home/shared/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost"
-export TINYIPC_BROKER_DIR="Z:\\home\\shared\\tmpfs\\tinyipc-shared-ffxiv"
-export TINYIPC_SHARED_DIR="Z:\\home\\shared\\tmpfs\\tinyipc-shared-ffxiv"
-export TINYIPC_SHARED_GROUP="steam"
-
-/usr/bin/xivlauncher-core
+export TINYIPC_ENABLE_LOGGING=1
+export TINYIPC_LOG_DIR=/tmp/tinyipc-logs
+export TINYIPC_LOG_LEVEL=info
 ```
-
-What each variable does:
-
-- `TINYIPC_NATIVE_HOST_PATH`
-  - Path to the native Linux broker executable.
-  - Keep this as the real Unix path to `XivIpc.NativeHost`.
-- `TINYIPC_BROKER_DIR`
-  - Directory for the broker socket, state file, and broker-owned journals.
-  - In most setups this should be the same location as `TINYIPC_SHARED_DIR`.
-- `TINYIPC_SHARED_DIR`
-  - Shared storage root used by the TinyIpc-compatible file and message-bus implementation.
-  - A tmpfs-backed path is ideal for performance.
-- `TINYIPC_SHARED_GROUP`
-  - Required group used for broker authorization and filesystem ownership.
-  - All cooperating game clients must share this group.
-
-### 5. Path format matters
-
-The example above mixes Unix and Wine-style paths on purpose.
-
-- `TINYIPC_NATIVE_HOST_PATH` should point at the real Linux executable path.
-- `TINYIPC_BROKER_DIR` and `TINYIPC_SHARED_DIR` are commonly provided as `Z:\...` paths in launcher/Wine-facing setups.
-
-This repo normalizes paths depending on which runtime is reading them. That lets the Windows-side plugin runtime and the Linux native host agree on the same physical location.
-
-As a rule:
-
-- use a Unix path for the native host executable
-- use the shared runtime path format that your launcher/runtime expects for the broker/shared directories
-- keep `TINYIPC_BROKER_DIR` and `TINYIPC_SHARED_DIR` pointed at the same physical directory unless you have a specific reason to separate them
-
-## What Gets Created At Runtime
-
-Once the first client connects, the broker creates runtime files in the broker directory, including:
-
-- the Unix socket
-- the broker state file
-- one or more broker-owned journal files for channels
-
-The broker is singleton-per-directory. If multiple clients point at the same broker directory, they join the same broker instance.
 
 ## Troubleshooting
 
-### The broker does not start
+### The plugin installs but clients do not see each other
 
-Check:
+Start with the simple checks:
 
-- `TINYIPC_NATIVE_HOST_PATH` points to a real `XivIpc.NativeHost` binary
-- `TINYIPC_SHARED_GROUP` is set
-- the shared group exists on the machine
-- the launching user is a member of that group
-- the shared and runtime directories are writable and group-accessible
+- make sure all clients are using the same launcher/runtime family
+- prefer XLCore Wine over Proton
+- restart the affected clients after updating plugins
 
-### Clients do not see each other
+If you are running a more customized setup with multiple users or custom shared paths, refer to [docs/DEVELOPING.md](docs/DEVELOPING.md) for the lower-level runtime details.
 
-Check:
+### The native broker does not seem to start
 
-- all clients use the same `TINYIPC_SHARED_GROUP`
-- all clients use the same physical shared/runtime directory
-- the runtime is not isolated behind a sandbox that blocks the shared path
+In the default setup, this usually means one of:
 
-### Steam Proton does not work
+- the client could not download or launch `XivIpc.NativeHost`
+- the runtime environment is too restricted or sandboxed
+- the shared temp path is not writable
 
-That is expected for this setup. Steam Proton uses Pressure Vessel sandboxing, which breaks the shared-path/native-host model this repo depends on. Use xivlauncher's XLCore Wine runtime instead.
+Turn on logging with the variables above and check the generated `tinyipc-*.log` files.
 
-### The broker seems to stay alive forever
+### I am using Proton and it behaves inconsistently
 
-The broker shuts down after all sessions disconnect and the idle timeout expires. If it stays alive, one client probably still has a live connection or leaked session.
+That is expected enough that XLCore Wine should be treated as the supported path. Proton's containerization can block the shared filesystem and native broker behavior these plugins rely on.
 
-### I want logs
+### I need custom paths, shared groups, or manual staging
 
-Useful optional environment variables:
+Those are advanced or developer-managed setups now. Use [docs/DEVELOPING.md](docs/DEVELOPING.md) for:
 
-- `TINYIPC_ENABLE_LOGGING=1`
-- `TINYIPC_LOG_DIR=/path/to/logs`
-- `TINYIPC_LOG_LEVEL=info`
+- custom `TINYIPC_*` environment variables
+- shared-group and multi-user setups
+- native host staging and publish scripts
+- broker lifecycle and sidecar details
 
-## For Developers
+## Developer Links
 
-This README is intentionally user-focused.
-
-If you are building, testing, or packaging this repo, use:
+If you are working on the repo itself:
 
 - [docs/DEVELOPING.md](docs/DEVELOPING.md)
 - [TinyIpc.Shim README](TinyIpc.Shim/README.md)

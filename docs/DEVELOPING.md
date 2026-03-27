@@ -18,11 +18,19 @@ The current production sidecar architecture is:
 - one native Linux broker process per shared directory
 - strict group-based access for cross-user sidecar mode
 
-## Prerequisites
+## Production Defaults
 
-- .NET SDK supporting `net9.0`
-- Linux for sidecar, multi-user, Wine, and Proton validation
-- a valid shared group for brokered sidecar mode, typically `steam`
+The end-user README intentionally treats the standard Linux path as "install and run". The current production defaults behind that are:
+
+- default shared directory: `/tmp/tinyipc-shared-ffxiv`
+- default native host path: `/tmp/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost`
+- default native host download URL: latest `XivIpc.NativeHost-linux-x64.tar.gz` release asset from this repo
+- default broker idle shutdown: `120000` ms
+
+Permission behavior depends on whether `TINYIPC_SHARED_GROUP` is configured:
+
+- with a valid shared group: broker directories are repaired toward `2770`, files toward `660`, and staged executable payloads toward `770`
+- without a shared group: the runtime falls back to open shared permissions suitable for the default single-user path
 
 Useful environment variables:
 
@@ -47,6 +55,12 @@ Direct shared-memory discovery contract:
 - the rendezvous metadata file is `tinyipc_busmeta_<channel>_<hash>.bin` in `TINYIPC_SHARED_DIR`
 - that metadata file records version, slot count, slot payload bytes, image size, TTL, and generation id
 - reopening with compatible sizing reuses the same region and metadata; incompatible larger requests are rejected while another compatible participant is still attached
+
+## Prerequisites
+
+- .NET SDK supporting `net9.0`
+- Linux for sidecar, multi-user, Wine, and Proton validation
+- a valid shared group for brokered sidecar mode, typically `steam`
 
 ## Build
 
@@ -164,18 +178,16 @@ Semver asset packaging:
 PUBLISH_SCHEME=semver RELEASE_VERSION=1.2.3 GITHUB_REPOSITORY=owner/repo scripts/publish-release.sh
 ```
 
-`scripts/publish-local.sh` still stages `XivIpc.NativeHost` into the shared directory. In brokered sidecar mode, staged directories and files should be group-owned and non-world-accessible.
+`scripts/publish-local.sh` still stages `XivIpc.NativeHost` into the shared directory. In brokered sidecar mode, staged directories and files should be group-owned and non-world-accessible when `TINYIPC_SHARED_GROUP` is in use.
 
 ## Troubleshooting
 
 If sidecar startup fails, check:
 
-- `TINYIPC_SHARED_GROUP` is set and resolvable on the machine
+- `TINYIPC_SHARED_GROUP` is set and resolvable on the machine when you expect group-shared broker mode
 - `TINYIPC_SHARED_DIR` is writable by the launching user
-- the shared directory artifacts have the expected modes:
-  - directories: `2770`
-  - files: `660`
-  - staged executable host payload: `770`
+- the shared directory artifacts have the expected modes for the selected access model
+- the staged native host path exists, or the runtime can reach the configured/default host download URL
 
 If you suspect duplicate brokers:
 
