@@ -11,6 +11,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: write
+
 concurrency:
   group: publish-midibard2
   cancel-in-progress: false

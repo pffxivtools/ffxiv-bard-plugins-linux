@@ -11,6 +11,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: write
+
 concurrency:
   group: publish-masterofpuppets
   cancel-in-progress: false
