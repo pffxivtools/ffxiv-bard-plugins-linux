@@ -13,6 +13,7 @@ source "${SCRIPT_DIR}/release-common.sh"
 
 : "${PUBLISH_SCHEME:?PUBLISH_SCHEME must be set to semver or plugins}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
+: "${FORCE_REPUBLISH:=false}"
 
 DIST_DIR="${REPO_ROOT}/dist/github"
 WORK_DIR="${DIST_DIR}/work"
@@ -23,6 +24,13 @@ PLUGINMASTER_FILE="${DIST_DIR}/pluginmaster.json"
 ROOT_PLUGINMASTER_FILE="${REPO_ROOT}/pluginmaster.json"
 SHIM_WORK_ROOT="${WORK_DIR}"
 NATIVE_HOST_DIR="${WORK_DIR}/native-host"
+
+normalize_bool() {
+  case "${1,,}" in
+    1|true|yes|y|on) printf 'true\n' ;;
+    *) printf 'false\n' ;;
+  esac
+}
 
 reset_release_dirs() {
   rm -rf "${DIST_DIR}"
@@ -89,6 +97,9 @@ build_semver_release_item() {
 }
 
 main() {
+  FORCE_REPUBLISH="$(normalize_bool "${FORCE_REPUBLISH}")"
+  export FORCE_REPUBLISH
+
   ensure_release_prereqs
   reset_release_dirs
   ensure_pluginmaster_file "${PLUGINMASTER_FILE}"
@@ -118,9 +129,13 @@ main() {
     local local_version
     local_version="$(get_local_plugin_version_from_pluginmaster "${PLUGINMASTER_FILE}" "${plugin_name}")"
 
-    if [[ "${PUBLISH_SCHEME}" == "plugins" ]] && ! plugin_version_changed "${local_version}" "${upstream_version}"; then
+    if [[ "${PUBLISH_SCHEME}" == "plugins" ]] && ! plugin_version_changed "${local_version}" "${upstream_version}" && [[ "${FORCE_REPUBLISH}" != "true" ]]; then
       log "Skipping ${plugin_name}: upstream version ${upstream_version} matches local pluginmaster version"
       continue
+    fi
+
+    if [[ "${PUBLISH_SCHEME}" == "plugins" ]] && [[ "${FORCE_REPUBLISH}" == "true" ]] && ! plugin_version_changed "${local_version}" "${upstream_version}"; then
+      log "Force republish enabled for ${plugin_name}: rebuilding release assets for unchanged upstream version ${upstream_version}"
     fi
 
     abi_flavor="$(resolve_abi_flavor "${plugin_name}" "${default_abi_flavor}")"

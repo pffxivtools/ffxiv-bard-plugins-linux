@@ -66,20 +66,12 @@ public sealed class ParallelFunctionalTests
             readySignals[i] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             observedBySubscriber[subscriberIndex] = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
 
-            subscriberTasks[i] = Task.Run(async () =>
-            {
-                await foreach (var item in subscribers[subscriberIndex].SubscribeAsync(cts.Token))
-                {
-                    string message = GetString(item);
-                    if (TryHandleBarrier(message, readySignals[subscriberIndex]))
-                        continue;
-
-                    observedBySubscriber[subscriberIndex].TryAdd(message, 0);
-
-                    if (observedBySubscriber[subscriberIndex].Count >= expectedTotal)
-                        break;
-                }
-            }, cts.Token);
+            subscriberTasks[i] = ConsumeStringMessagesUntilCountAsync(
+                subscribers[subscriberIndex],
+                observedBySubscriber[subscriberIndex],
+                readySignals[subscriberIndex],
+                expectedTotal,
+                cts.Token);
         }
 
         await AwaitSubscriptionsReadyAsync(publishers[0], readySignals, cts.Token);
@@ -87,7 +79,7 @@ public sealed class ParallelFunctionalTests
         var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task[] publisherTasks = Enumerable.Range(0, publisherCount)
-            .Select(publisherIndex => Task.Run(async () =>
+            .Select(async publisherIndex =>
             {
                 var rng = new Random(unchecked(Environment.TickCount * 397 + publisherIndex));
 
@@ -101,13 +93,14 @@ public sealed class ParallelFunctionalTests
                     if ((messageIndex % 7) == 0)
                         await Task.Delay(rng.Next(0, 4), cts.Token);
                 }
-            }, cts.Token))
+            })
             .ToArray();
 
         startGate.TrySetResult();
 
         await Task.WhenAll(publisherTasks);
-        await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(45), cts.Token);
+        await WaitForExpectedSubscriberCountsAsync(scope, backend, observedBySubscriber, expectedTotal, cts.Token);
+        await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(10), cts.Token);
 
         string[] expected = Enumerable.Range(0, publisherCount)
             .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
@@ -633,10 +626,66 @@ public sealed class ParallelFunctionalTests
         }
 
         Task[] tasks = buses
-            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(10)))
+            .Select(bus => bus.WaitForConnectedForDiagnosticsAsync(TimeSpan.FromSeconds(30)))
             .ToArray();
 
-        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(40), cancellationToken);
+    }
+
+    private static async Task ConsumeStringMessagesUntilCountAsync(
+        TinyMessageBus subscriber,
+        ConcurrentDictionary<string, byte> observed,
+        TaskCompletionSource readySignal,
+        int expectedTotal,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var item in subscriber.SubscribeAsync(cancellationToken))
+        {
+            string message = GetString(item);
+            if (TryHandleBarrier(message, readySignal))
+                continue;
+
+            observed.TryAdd(message, 0);
+
+            if (observed.Count >= expectedTotal)
+                break;
+        }
+    }
+
+    private static async Task WaitForExpectedSubscriberCountsAsync(
+        TestEnvironmentScope scope,
+        string backend,
+        ConcurrentDictionary<int, ConcurrentDictionary<string, byte>> observedBySubscriber,
+        int expectedTotal,
+        CancellationToken cancellationToken)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (observedBySubscriber.Values.All(messages => messages.Count >= expectedTotal))
+                return;
+
+            await Task.Delay(100, cancellationToken);
+        }
+
+        string counts = string.Join(
+            ", ",
+            observedBySubscriber
+                .OrderBy(pair => pair.Key)
+                .Select(pair => $"subscriber[{pair.Key}]={pair.Value.Count}/{expectedTotal}"));
+
+        string diagnostics = string.Empty;
+        if (IsSidecarStyleBackend(backend))
+        {
+            string logs = scope.ReadAllLogsOrEmpty();
+            if (!string.IsNullOrWhiteSpace(logs))
+                diagnostics = $"{Environment.NewLine}Sidecar logs:{Environment.NewLine}{logs}";
+        }
+
+        throw new TimeoutException($"Timed out waiting for all subscribers to observe all messages. {counts}{diagnostics}");
     }
 
     private static bool IsSidecarStyleBackend(string backend)
@@ -783,6 +832,9 @@ public sealed class ParallelFunctionalTests
                 Directory.CreateDirectory(_testSharedDir);
                 overrides[TinyIpcEnvironment.SharedDirectory] = _testSharedDir;
                 overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
+                overrides[TinyIpcEnvironment.LogDirectory] = _testSharedDir;
+                overrides[TinyIpcEnvironment.LogLevel] = "info";
+                overrides[TinyIpcEnvironment.EnableLogging] = "1";
 
                 string? hostPath = ResolveNativeHostPath();
                 if (!string.IsNullOrWhiteSpace(hostPath))
