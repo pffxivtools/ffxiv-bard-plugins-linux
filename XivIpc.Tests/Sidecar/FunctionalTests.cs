@@ -469,6 +469,7 @@ public sealed class FunctionalTests
                 Directory.CreateDirectory(_testSharedDir);
                 overrides[TinyIpcEnvironment.SharedDirectory] = _testSharedDir;
                 overrides[TinyIpcEnvironment.SharedGroup] = ResolveCurrentSharedGroup();
+                overrides[TinyIpcEnvironment.MessageTtlMs] = "120000";
                 overrides[TinyIpcEnvironment.LogDirectory] = _testSharedDir;
                 overrides[TinyIpcEnvironment.LogLevel] = "info";
                 overrides[TinyIpcEnvironment.EnableLogging] = "1";

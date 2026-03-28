@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using TinyIpc;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
 using XivIpc.Internal;
@@ -638,7 +639,7 @@ public sealed class SidecarLifecycleTests
     [MemberData(nameof(Modes))]
     public async Task JournalPruning_IsLogged_AndDrainCatchesUpToRetainedTail(string mode)
     {
-        using TestEnvironmentScope scope = new(mode);
+        using TestEnvironmentScope scope = new(mode, messageTtlMs: 1_000);
         const int requestedBufferBytes = 2_048;
 
         using TinyMessageBus publisher = scope.CreateBus("backlog-channel", requestedBufferBytes);
@@ -663,7 +664,12 @@ public sealed class SidecarLifecycleTests
             await PublishBytesAsync(publisher, payload);
         }
 
-        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(
+            attach.RingPath,
+            attach.SlotCount,
+            attach.SlotPayloadBytes,
+            attach.RingLength,
+            scope.MessageTtlMs);
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
         while (DateTime.UtcNow < deadline)
         {
@@ -731,7 +737,12 @@ public sealed class SidecarLifecycleTests
         using UnixSidecarProcessManager.Lease lease = UnixSidecarProcessManager.Acquire();
         using Socket rawSocket = ConnectRawSocket(lease.SocketPath);
         SidecarAttachRing attach = AttachRawSession(channelName, requestedBufferBytes, rawSocket, Guid.NewGuid());
-        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(
+            attach.RingPath,
+            attach.SlotCount,
+            attach.SlotPayloadBytes,
+            attach.RingLength,
+            scope.MessageTtlMs);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         Task<string[]>[] receiveTasks = subscribers
@@ -807,7 +818,12 @@ public sealed class SidecarLifecycleTests
 
         using Socket rawSocket = ConnectRawSocket(scope.SocketPath);
         SidecarAttachRing attach = AttachRawSession(channelName, requestedBufferBytes, rawSocket, rawClientId);
-        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(attach.RingPath, attach.SlotCount, attach.SlotPayloadBytes, attach.RingLength, 1_000L);
+        using BrokeredChannelJournal journal = BrokeredChannelJournal.Attach(
+            attach.RingPath,
+            attach.SlotCount,
+            attach.SlotPayloadBytes,
+            attach.RingLength,
+            scope.MessageTtlMs);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         Task<byte[]> receiveTask = ReceiveSingleMessageAsync(managedSubscriber, cts.Token);
@@ -1281,7 +1297,7 @@ public sealed class SidecarLifecycleTests
         private readonly Dictionary<string, string?> _overrideValues = new(StringComparer.Ordinal);
         private readonly IDisposable _overrides;
 
-        public TestEnvironmentScope(string mode, int? brokerIdleShutdownMs = 2_000)
+        public TestEnvironmentScope(string mode, int? brokerIdleShutdownMs = 2_000, long? messageTtlMs = null)
         {
             LogTestEvent($"TestEnvironmentScope.Start: mode={mode}");
             var scopeStart = Stopwatch.StartNew();
@@ -1291,6 +1307,7 @@ public sealed class SidecarLifecycleTests
             SocketPath = Path.Combine(SharedDirectory, "tinyipc-sidecar.sock");
             StatePath = Path.Combine(SharedDirectory, "tinyipc-sidecar.state.json");
             SharedGroup = ResolveCurrentSharedGroup();
+            MessageTtlMs = messageTtlMs ?? (long)TinyIpcOptions.DefaultMinMessageAge.TotalMilliseconds;
 
             Directory.CreateDirectory(SharedDirectory);
             ProductionPathTestEnvironment.ResetLogger();
@@ -1306,6 +1323,7 @@ public sealed class SidecarLifecycleTests
                 _overrideValues[TinyIpcEnvironment.EnableLogging] = "1";
                 _overrideValues[TinyIpcEnvironment.FileNotifier] = "auto";
                 _overrideValues[TinyIpcEnvironment.BrokerIdleShutdownMs] = brokerIdleShutdownMs?.ToString();
+                _overrideValues[TinyIpcEnvironment.MessageTtlMs] = MessageTtlMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
                 if (ProductionPathTestEnvironment.IsProductionRingPath(mode))
                     _overrideValues[TinyIpcEnvironment.SidecarStorageMode] = "ring";
@@ -1321,6 +1339,7 @@ public sealed class SidecarLifecycleTests
                 _overrideValues[TinyIpcEnvironment.EnableLogging] = "1";
                 _overrideValues[TinyIpcEnvironment.FileNotifier] = "auto";
                 _overrideValues[TinyIpcEnvironment.BrokerIdleShutdownMs] = brokerIdleShutdownMs?.ToString();
+                _overrideValues[TinyIpcEnvironment.MessageTtlMs] = MessageTtlMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
             }
 
             if (OperatingSystem.IsLinux() && string.IsNullOrWhiteSpace(TinyIpcEnvironment.GetEnvironmentVariable(TinyIpcEnvironment.UnixShell)))
@@ -1337,6 +1356,7 @@ public sealed class SidecarLifecycleTests
         public string SharedGroup { get; }
         public string SocketPath { get; }
         public string StatePath { get; }
+        public long MessageTtlMs { get; }
 
         public TinyMessageBus CreateBus(int maxPayloadBytes = DefaultRequestedBufferBytes)
             => CreateBus(ChannelName, maxPayloadBytes);

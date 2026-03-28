@@ -26,6 +26,7 @@ The end-user README intentionally treats the standard Linux path as "install and
 - default native host path: `/tmp/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost`
 - default native host download URL: latest `XivIpc.NativeHost-linux-x64.tar.gz` release asset from this repo
 - default broker idle shutdown: `120000` ms
+- default message TTL: `30000` ms
 
 Permission behavior depends on whether `TINYIPC_SHARED_GROUP` is configured:
 

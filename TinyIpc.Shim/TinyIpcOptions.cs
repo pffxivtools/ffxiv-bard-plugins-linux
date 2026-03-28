@@ -7,7 +7,7 @@ public class TinyIpcOptions
     public const int DefaultMaxFileSize = 1024 * 1024;
     public const int DefaultMaxReaderCount = 6;
 
-    public static readonly TimeSpan DefaultMinMessageAge = TimeSpan.FromMilliseconds(1_000);
+    public static readonly TimeSpan DefaultMinMessageAge = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultWaitTimeout = TimeSpan.FromSeconds(5);
 
     public string Name { get; set; } = Process.GetCurrentProcess().ProcessName;
@@ -20,4 +20,3 @@ public class TinyIpcOptions
 
     public TimeSpan WaitTimeout { get; set; } = DefaultWaitTimeout;
 }
-

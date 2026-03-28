@@ -67,7 +67,7 @@ internal static class TinyIpcRuntimeSettings
 {
     private const int DefaultSlotCount = 64;
     private const int MinimumSlotCount = 4;
-    private const long DefaultMessageTtlMs = 1_000;
+    private const long DefaultMessageTtlMs = 30_000;
     private const int DefaultHeartbeatIntervalMs = 2_000;
     private const int DefaultHeartbeatTimeoutMs = 60_000;
     private const string DefaultSharedPrefix = "tinyipc";
