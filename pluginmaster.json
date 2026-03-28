@@ -72,10 +72,10 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 62310,
-    "LastUpdate": "1774598903",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.6/BardToolbox.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.6/BardToolbox.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.6/BardToolbox.zip"
+    "LastUpdate": "1774670927",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.3/BardToolbox-2.2.4.3.zip"
   },
   {
     "Author": "Zune",
