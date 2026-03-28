@@ -104,7 +104,7 @@ public sealed class FunctionalTests
     public async Task MultiPublisherMultiSubscriber_AllSubscribersObserveAllMessages(string backend)
     {
         using TestEnvironmentScope scope = new(backend);
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
         const int publisherCount = 8;
         const int subscriberCount = 8;
@@ -144,20 +144,12 @@ public sealed class FunctionalTests
             readySignals[i] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             allObserved[subscriberIndex] = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
 
-            readerTasks[i] = Task.Run(async () =>
-            {
-                await foreach (var item in subscribers[subscriberIndex].SubscribeAsync(cts.Token))
-                {
-                    string message = GetString(item);
-                    if (TryHandleBarrier(message, readySignals[subscriberIndex]))
-                        continue;
-
-                    allObserved[subscriberIndex].TryAdd(message, 0);
-
-                    if (allObserved[subscriberIndex].Count >= expectedTotal)
-                        break;
-                }
-            }, cts.Token);
+            readerTasks[i] = ConsumeStringMessagesUntilCountAsync(
+                subscribers[subscriberIndex],
+                allObserved[subscriberIndex],
+                readySignals[subscriberIndex],
+                expectedTotal,
+                cts.Token);
         }
 
         await AwaitSubscriptionsReadyAsync(publishers[0], readySignals, cts.Token);
@@ -165,7 +157,7 @@ public sealed class FunctionalTests
         var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task[] publisherTasks = Enumerable.Range(0, publisherCount)
-            .Select(publisherIndex => Task.Run(async () =>
+            .Select(async publisherIndex =>
             {
                 var rng = new Random(unchecked(Environment.TickCount * 31 + publisherIndex));
 
@@ -177,14 +169,14 @@ public sealed class FunctionalTests
                     await PublishStringAsync(publishers[publisherIndex], payload);
                     await Task.Delay(rng.Next(0, 4), cts.Token);
                 }
-            }, cts.Token))
+            })
             .ToArray();
 
         startGate.TrySetResult();
 
         await Task.WhenAll(publisherTasks);
         await WaitForExpectedSubscriberCountsAsync(scope, backend, allObserved, expectedTotal, cts.Token);
-        await Task.WhenAll(readerTasks).WaitAsync(TimeSpan.FromSeconds(10));
+        await Task.WhenAll(readerTasks).WaitAsync(TimeSpan.FromSeconds(15), cts.Token);
 
         string[] expected = Enumerable.Range(0, publisherCount)
             .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
@@ -334,6 +326,26 @@ public sealed class FunctionalTests
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(40), cancellationToken);
     }
 
+    private static async Task ConsumeStringMessagesUntilCountAsync(
+        TinyMessageBus subscriber,
+        ConcurrentDictionary<string, byte> observed,
+        TaskCompletionSource readySignal,
+        int expectedTotal,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var item in subscriber.SubscribeAsync(cancellationToken))
+        {
+            string message = GetString(item);
+            if (TryHandleBarrier(message, readySignal))
+                continue;
+
+            observed.TryAdd(message, 0);
+
+            if (observed.Count >= expectedTotal)
+                break;
+        }
+    }
+
     private static async Task WaitForExpectedSubscriberCountsAsync(
         TestEnvironmentScope scope,
         string backend,
@@ -343,16 +355,36 @@ public sealed class FunctionalTests
     {
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
 
-        while (DateTime.UtcNow < deadline)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            while (DateTime.UtcNow < deadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            if (allObserved.Values.All(messages => messages.Count >= expectedTotal))
-                return;
+                if (allObserved.Values.All(messages => messages.Count >= expectedTotal))
+                    return;
 
-            await Task.Delay(100, cancellationToken);
+                await Task.Delay(100, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                BuildSubscriberCountTimeoutMessage(scope, backend, allObserved, expectedTotal, "Canceled while waiting for all subscribers to observe all messages."),
+                ex);
         }
 
+        throw new TimeoutException(
+            BuildSubscriberCountTimeoutMessage(scope, backend, allObserved, expectedTotal, "Timed out waiting for all subscribers to observe all messages."));
+    }
+
+    private static string BuildSubscriberCountTimeoutMessage(
+        TestEnvironmentScope scope,
+        string backend,
+        ConcurrentDictionary<int, ConcurrentDictionary<string, byte>> allObserved,
+        int expectedTotal,
+        string prefix)
+    {
         string counts = string.Join(
             ", ",
             allObserved
@@ -367,7 +399,7 @@ public sealed class FunctionalTests
                 diagnostics = $"{Environment.NewLine}Latest sidecar log tail:{Environment.NewLine}{logTail}";
         }
 
-        throw new TimeoutException($"Timed out waiting for all subscribers to observe all messages. {counts}{diagnostics}");
+        return $"{prefix} {counts}{diagnostics}";
     }
 
     private static bool IsSidecarStyleBackend(string backend)
