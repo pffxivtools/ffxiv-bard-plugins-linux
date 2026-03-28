@@ -70,11 +70,13 @@ build_plugin_tracking_release_item() {
   local version="$3"
   local asset_path="$4"
   local output_file="$5"
+  local notes_file="$6"
 
   local tag="${asset_slug}-${version}"
   local title="${plugin_name} ${version}"
   local notes
   notes="$(release_notes_for_plugin "${plugin_name}" "${version}")"
+  printf '%s\n' "${notes}" > "${notes_file}"
 
   jq -n \
     --arg tag "${tag}" \
@@ -173,7 +175,8 @@ main() {
 
     if [[ "${PUBLISH_SCHEME}" == "plugins" ]]; then
       release_item_file="${RELEASE_ITEMS_DIR}/${asset_slug}.json"
-      build_plugin_tracking_release_item "${asset_slug}" "${plugin_name}" "${upstream_version}" "${artifact_path}" "${release_item_file}"
+      local release_notes_file="${METADATA_DIR}/${asset_slug}-${upstream_version}.notes.md"
+      build_plugin_tracking_release_item "${asset_slug}" "${plugin_name}" "${upstream_version}" "${artifact_path}" "${release_item_file}" "${release_notes_file}"
     fi
   done < <(selected_targets)
 
