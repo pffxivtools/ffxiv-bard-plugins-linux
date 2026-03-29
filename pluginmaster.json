@@ -3,7 +3,7 @@
     "Author": "BardToolbox",
     "Name": "BardToolbox",
     "InternalName": "BardToolbox",
-    "AssemblyVersion": "2.2.4.3",
+    "AssemblyVersion": "2.2.4.6",
     "Description": "",
     "ApplicableVersion": "any",
     "RepoUrl": "https://discord.gg/h9Nt5NXZWz",
@@ -72,10 +72,10 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 62310,
-    "LastUpdate": "1774675495",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.7/BardToolbox.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.7/BardToolbox.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.7/BardToolbox.zip"
+    "LastUpdate": "1774817543",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.6/BardToolbox-2.2.4.6.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.6/BardToolbox-2.2.4.6.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.4.6/BardToolbox-2.2.4.6.zip"
   },
   {
     "Author": "Zune",
