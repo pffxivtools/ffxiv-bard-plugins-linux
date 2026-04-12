@@ -167,7 +167,7 @@ download_file() {
 
 gh_api_json() {
   local endpoint="$1"
-  local owner_repo="$2"
+  local owner_repo="${2:-}"
   GH_TOKEN="$(resolve_github_token "${owner_repo}")" gh api "${endpoint}"
 }
 

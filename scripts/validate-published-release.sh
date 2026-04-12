@@ -106,7 +106,7 @@ release_json_file="$(mktemp "${TMPDIR:-/tmp}/validate-published-release.release.
 expected_assets_file="$(mktemp "${TMPDIR:-/tmp}/validate-published-release.expected-assets.XXXXXX")"
 actual_assets_file="$(mktemp "${TMPDIR:-/tmp}/validate-published-release.actual-assets.XXXXXX")"
 
-gh_api_json "repos/${REPOSITORY}/releases/tags/${TAG}" > "${release_json_file}"
+gh_api_json "repos/${REPOSITORY}/releases/tags/${TAG}" "${REPOSITORY}" > "${release_json_file}"
 
 jq -e --arg tag "${TAG}" '.tag_name == $tag and .draft == false' "${release_json_file}" >/dev/null || die "Published release does not match expected tag/draft state"
 
@@ -114,14 +114,14 @@ case "${MODE}" in
   plugin)
     jq -e '.prerelease == true' "${release_json_file}" >/dev/null || die "Plugin release must be a prerelease"
     latest_release_file="$(mktemp "${TMPDIR:-/tmp}/validate-published-release.latest.XXXXXX")"
-    if gh_api_json "repos/${REPOSITORY}/releases/latest" > "${latest_release_file}" 2>/dev/null; then
+    if gh_api_json "repos/${REPOSITORY}/releases/latest" "${REPOSITORY}" > "${latest_release_file}" 2>/dev/null; then
       jq -e --arg tag "${TAG}" '.tag_name != $tag' "${latest_release_file}" >/dev/null || die "Plugin prerelease unexpectedly became latest"
     fi
     rm -f "${latest_release_file}"
     ;;
   semver)
     jq -e '.prerelease == false' "${release_json_file}" >/dev/null || die "Semver release must not be a prerelease"
-    gh_api_json "repos/${REPOSITORY}/releases/latest" | jq -e --arg tag "${TAG}" '.tag_name == $tag' >/dev/null || die "Semver release is not the latest release"
+    gh_api_json "repos/${REPOSITORY}/releases/latest" "${REPOSITORY}" | jq -e --arg tag "${TAG}" '.tag_name == $tag' >/dev/null || die "Semver release is not the latest release"
     ;;
 esac
 
@@ -134,7 +134,7 @@ if [[ -n "${EXPECTED_PLUGINMASTER_FILE}" ]]; then
   assert_json_file "${EXPECTED_PLUGINMASTER_FILE}"
 
   remote_pluginmaster_file="$(mktemp "${TMPDIR:-/tmp}/validate-published-release.pluginmaster.XXXXXX")"
-  gh_api_json "repos/${REPOSITORY}/contents/pluginmaster.json?ref=${DEFAULT_BRANCH}" \
+  gh_api_json "repos/${REPOSITORY}/contents/pluginmaster.json?ref=${DEFAULT_BRANCH}" "${REPOSITORY}" \
     | jq -r '.content // empty' \
     | tr -d '\n' \
     | base64 -d > "${remote_pluginmaster_file}"
