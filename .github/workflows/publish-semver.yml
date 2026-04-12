@@ -68,8 +68,8 @@ jobs:
           BARDTOOLBOX_LOCAL_DIR: ${{ env.ACT == 'true' && format('{0}/.github/act/fixtures/publish/BardToolbox', github.workspace) || '' }}
           MIDIBARD2_PLUGINMASTER: ${{ env.ACT == 'true' && format('file://{0}/.github/act/fixtures/publish/manifests/MidiBard2.pluginmaster.json', github.workspace) || '' }}
           MASTEROFPUPPETS_PLUGINMASTER: ${{ env.ACT == 'true' && format('file://{0}/.github/act/fixtures/publish/manifests/MasterOfPuppets.pluginmaster.json', github.workspace) || '' }}
-          GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || steps.bardtoolbox_app_token.outputs.token }}
-          BARDTOOLBOX_GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || steps.bardtoolbox_app_token.outputs.token }}
+          GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || github.token }}
+          BARDTOOLBOX_GH_TOKEN: ${{ env.ACT == 'true' && 'act-dry-run' || steps.bardtoolbox_app_token.outputs.token || github.token }}
         run: bash scripts/publish-release.sh
 
       - name: Validate semver release payload

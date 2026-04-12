@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using TinyIpc.IO;
 using TinyIpc.Messaging;
@@ -357,6 +358,115 @@ public sealed class ParallelFunctionalTests
             {
                 Assert.True(payload.Length >= payloadBytes, $"Payload for {id} was unexpectedly short.");
                 Assert.True(ValidateLargePayload(payload), $"Payload for {id} failed deterministic validation.");
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(Backends))]
+    public async Task ParallelWriters_WithOpaqueBinaryPayloads_AreDeliveredExactly(string backend)
+    {
+        using TestEnvironmentScope scope = new(backend);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+
+        const int publisherCount = 4;
+        const int subscriberCount = 4;
+        const int messagesPerPublisher = 10;
+        int expectedTotal = publisherCount * messagesPerPublisher;
+
+        using var publishersScope = new DisposableList<TinyMessageBus>();
+        using var subscribersScope = new DisposableList<TinyMessageBus>();
+        int requestedBufferBytes = IsSidecarStyleBackend(backend) ? 2 * 1024 * 1024 : TinyMemoryMappedFile.DefaultMaxFileSize;
+
+        TinyMessageBus[] publishers = Enumerable.Range(0, publisherCount)
+            .Select(_ =>
+            {
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
+                publishersScope.Add(bus);
+                return bus;
+            })
+            .ToArray();
+
+        TinyMessageBus[] subscribers = Enumerable.Range(0, subscriberCount)
+            .Select(_ =>
+            {
+                var bus = new TinyMessageBus(new TinyMemoryMappedFile(scope.ChannelName, requestedBufferBytes), disposeFile: true);
+                subscribersScope.Add(bus);
+                return bus;
+            })
+            .ToArray();
+
+        await WaitForBusesReadyAsync(backend, publishers.Concat(subscribers), cts.Token);
+
+        var expectedById = Enumerable.Range(0, publisherCount)
+            .SelectMany(pub => Enumerable.Range(0, messagesPerPublisher)
+                .Select(msg =>
+                {
+                    byte[] payload = BuildOpaqueParallelPayload(pub, msg);
+                    return new KeyValuePair<string, byte[]>(ComputePayloadId(payload), payload);
+                }))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+
+        var observedBySubscriber = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte[]>>();
+        var readySignals = new TaskCompletionSource[subscriberCount];
+        var subscriberTasks = new Task[subscriberCount];
+
+        for (int i = 0; i < subscriberCount; i++)
+        {
+            int subscriberIndex = i;
+            readySignals[i] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            observedBySubscriber[subscriberIndex] = new ConcurrentDictionary<string, byte[]>(StringComparer.Ordinal);
+
+            subscriberTasks[i] = Task.Run(async () =>
+            {
+                await foreach (var item in subscribers[subscriberIndex].SubscribeAsync(cts.Token))
+                {
+                    byte[] bytes = GetBytes(item);
+                    if (TryHandleBarrier(bytes, readySignals[subscriberIndex]))
+                        continue;
+
+                    observedBySubscriber[subscriberIndex].TryAdd(ComputePayloadId(bytes), bytes);
+
+                    if (observedBySubscriber[subscriberIndex].Count >= expectedTotal)
+                        break;
+                }
+            }, cts.Token);
+        }
+
+        await AwaitSubscriptionsReadyAsync(publishers[0], readySignals, cts.Token);
+
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Task[] publisherTasks = Enumerable.Range(0, publisherCount)
+            .Select(async publisherIndex =>
+            {
+                await startGate.Task;
+
+                for (int messageIndex = 0; messageIndex < messagesPerPublisher; messageIndex++)
+                {
+                    await PublishBytesAsync(publishers[publisherIndex], BuildOpaqueParallelPayload(publisherIndex, messageIndex));
+
+                    if ((messageIndex % 3) == 0)
+                        await Task.Delay((publisherIndex + messageIndex) % 4, cts.Token);
+                }
+            })
+            .ToArray();
+
+        startGate.TrySetResult();
+
+        await Task.WhenAll(publisherTasks);
+        await Task.WhenAll(subscriberTasks).WaitAsync(TimeSpan.FromSeconds(60), cts.Token);
+
+        for (int subscriberIndex = 0; subscriberIndex < subscriberCount; subscriberIndex++)
+        {
+            ConcurrentDictionary<string, byte[]> observed = observedBySubscriber[subscriberIndex];
+            Assert.Equal(expectedTotal, observed.Count);
+
+            foreach ((string id, byte[] expected) in expectedById)
+            {
+                Assert.True(observed.TryGetValue(id, out byte[]? actual), $"subscriber[{subscriberIndex}] missing payload {id}");
+                Assert.Equal(DescribePayload(expected), DescribePayload(actual!));
+                Assert.Equal(expected, actual);
             }
         }
     }
@@ -729,6 +839,38 @@ public sealed class ParallelFunctionalTests
 
         return payload;
     }
+
+    private static byte[] BuildOpaqueParallelPayload(int publisherIndex, int messageIndex)
+    {
+        int[] lengths = { 13, 29, 61, 257, 1021, 4093 };
+        int totalBytes = lengths[(publisherIndex * 7 + messageIndex) % lengths.Length];
+        byte[] header = Encoding.ASCII.GetBytes($"opaque-pub={publisherIndex:D2};msg={messageIndex:D3};");
+        if (header.Length >= totalBytes)
+            totalBytes = header.Length + 8;
+
+        var payload = new byte[totalBytes];
+        Buffer.BlockCopy(header, 0, payload, 0, header.Length);
+
+        for (int i = header.Length; i < payload.Length; i++)
+            payload[i] = (byte)((publisherIndex * 73 + messageIndex * 41 + i * 19) % 256);
+
+        if (payload.Length > header.Length + 5)
+        {
+            payload[header.Length] = 0;
+            payload[header.Length + 1] = 1;
+            payload[header.Length + 2] = 0x80;
+            payload[header.Length + 3] = 0xFE;
+            payload[header.Length + 4] = 0x0A;
+        }
+
+        return payload;
+    }
+
+    private static string ComputePayloadId(byte[] payload)
+        => Convert.ToHexString(SHA256.HashData(payload));
+
+    private static string DescribePayload(byte[] payload)
+        => $"len={payload.Length},sha256={ComputePayloadId(payload)}";
 
     private static string ExtractId(byte[] payload)
     {

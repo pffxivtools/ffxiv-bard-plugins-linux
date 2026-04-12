@@ -92,7 +92,15 @@ resolve_abi_flavor() {
 }
 
 resolve_github_token() {
-  local token="${GH_TOKEN:-${BARDTOOLBOX_GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+  local owner_repo="${1:-}"
+  local token=""
+
+  if [[ "${owner_repo}" == "${BARDTOOLBOX_PRIVATE_REPO}" ]]; then
+    token="${BARDTOOLBOX_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+  else
+    token="${GH_TOKEN:-${GITHUB_TOKEN:-${BARDTOOLBOX_GH_TOKEN:-}}}"
+  fi
+
   [[ -n "${token}" ]] || die "GH_TOKEN (or BARDTOOLBOX_GH_TOKEN/GITHUB_TOKEN) must be set for GitHub fetches"
   printf '%s\n' "${token}"
 }
@@ -159,7 +167,8 @@ download_file() {
 
 gh_api_json() {
   local endpoint="$1"
-  GH_TOKEN="$(resolve_github_token)" gh api "${endpoint}"
+  local owner_repo="$2"
+  GH_TOKEN="$(resolve_github_token "${owner_repo}")" gh api "${endpoint}"
 }
 
 fetch_github_file_with_gh() {
@@ -172,12 +181,12 @@ fetch_github_file_with_gh() {
 
   local sha
   sha="$(
-    gh_api_json "repos/${owner_repo}/contents/${path}?ref=${ref}" \
+    gh_api_json "repos/${owner_repo}/contents/${path}?ref=${ref}" "${owner_repo}" \
       | jq -r '.sha // empty'
   )"
   [[ -n "${sha}" && "${sha}" != "null" ]] || die "Could not resolve blob SHA for ${owner_repo}/${path}@${ref}"
 
-  gh_api_json "repos/${owner_repo}/git/blobs/${sha}" \
+  gh_api_json "repos/${owner_repo}/git/blobs/${sha}" "${owner_repo}" \
     | jq -r '.content // empty' \
     | tr -d '\n' \
     | base64 -d > "${output_file}"
@@ -195,7 +204,7 @@ download_github_release_asset_with_gh() {
   tmp_dir="$(mktemp -d)"
   mkdir -p "$(dirname "${output_file}")"
 
-  GH_TOKEN="$(resolve_github_token)" \
+  GH_TOKEN="$(resolve_github_token "${owner_repo}")" \
     gh release download "${tag}" \
       --repo "${owner_repo}" \
       --pattern "${asset_name}" \

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Diagnostics;
 using TinyIpc.IO;
@@ -195,6 +196,51 @@ public sealed class FunctionalTests
         }
     }
 
+    [Theory]
+    [MemberData(nameof(Backends))]
+    public async Task OpaqueBinaryPayloads_AreDeliveredByteForByte(string backend)
+    {
+        using TestEnvironmentScope scope = new(backend);
+        using var publisher = new TinyMessageBus(scope.ChannelName);
+        using var subscriber = new TinyMessageBus(scope.ChannelName);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        byte[][] expectedPayloads = BuildOpaquePayloadCorpus();
+        var observed = new List<byte[]>();
+        var readerReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Task reader = Task.Run(async () =>
+        {
+            await foreach (var item in subscriber.SubscribeAsync(cts.Token))
+            {
+                byte[] payload = GetBytes(item);
+                if (TryHandleBarrier(payload, readerReady))
+                    continue;
+
+                observed.Add(payload);
+                if (observed.Count >= expectedPayloads.Length)
+                    break;
+            }
+        }, cts.Token);
+
+        await WaitForBusesReadyAsync(backend, new[] { publisher, subscriber }, cts.Token);
+        await AwaitSubscriptionsReadyAsync(publisher, new[] { readerReady }, cts.Token);
+
+        foreach (byte[] payload in expectedPayloads)
+            await PublishBytesAsync(publisher, payload);
+
+        await reader.WaitAsync(TimeSpan.FromSeconds(15), cts.Token);
+
+        Assert.Equal(expectedPayloads.Length, observed.Count);
+        for (int i = 0; i < expectedPayloads.Length; i++)
+        {
+            Assert.Equal(
+                DescribePayload(expectedPayloads[i]),
+                DescribePayload(observed[i]));
+            Assert.Equal(expectedPayloads[i], observed[i]);
+        }
+    }
+
     [Fact]
     public void TinyMemoryMappedFile_ReadWrite_RoundTrips()
     {
@@ -216,7 +262,11 @@ public sealed class FunctionalTests
     private static async Task PublishStringAsync(TinyMessageBus bus, string value)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(value);
+        await PublishBytesAsync(bus, bytes);
+    }
 
+    private static async Task PublishBytesAsync(TinyMessageBus bus, byte[] bytes)
+    {
         MethodInfo[] methods = typeof(TinyMessageBus)
             .GetMethods(BindingFlags.Instance | BindingFlags.Public)
             .Where(m => m.Name == "PublishAsync")
@@ -282,6 +332,15 @@ public sealed class FunctionalTests
     private static bool TryHandleBarrier(string message, TaskCompletionSource readySignal)
     {
         if (!message.StartsWith(BarrierPrefix, StringComparison.Ordinal))
+            return false;
+
+        readySignal.TrySetResult();
+        return true;
+    }
+
+    private static bool TryHandleBarrier(byte[] payload, TaskCompletionSource readySignal)
+    {
+        if (!payload.AsSpan().StartsWith(Encoding.UTF8.GetBytes(BarrierPrefix)))
             return false;
 
         readySignal.TrySetResult();
@@ -407,22 +466,81 @@ public sealed class FunctionalTests
             || ProductionPathTestEnvironment.IsProductionPath(backend);
 
     private static string GetString(object item)
+        => Encoding.UTF8.GetString(GetBytes(item));
+
+    private static byte[] GetBytes(object item)
     {
         if (item is BinaryData data)
-            return Encoding.UTF8.GetString(data.ToArray());
+            return data.ToArray();
 
         if (item is TinyMessageReceivedEventArgs e)
-            return Encoding.UTF8.GetString(e.Message);
+            return e.Message;
 
         if (item is byte[] bytes)
-            return Encoding.UTF8.GetString(bytes);
+            return bytes;
 
         if (item is IReadOnlyList<byte> list)
-            return Encoding.UTF8.GetString(list is byte[] arr ? arr : list.ToArray());
+            return list is byte[] arr ? arr : list.ToArray();
 
         throw new InvalidOperationException(
             $"Unsupported SubscribeAsync payload type: {item.GetType().FullName}");
     }
+
+    private static byte[][] BuildOpaquePayloadCorpus()
+        => new[]
+        {
+            BuildOpaquePayload(caseIndex: 0, totalBytes: 3),
+            BuildOpaquePayload(caseIndex: 1, totalBytes: 17),
+            BuildOpaquePayload(caseIndex: 2, totalBytes: 31),
+            BuildOpaquePayload(caseIndex: 3, totalBytes: 257),
+            BuildOpaquePayload(caseIndex: 4, totalBytes: 1021),
+            BuildOpaquePayload(caseIndex: 5, totalBytes: 4095)
+        };
+
+    private static byte[] BuildOpaquePayload(int caseIndex, int totalBytes)
+    {
+        byte[] header = Encoding.ASCII.GetBytes($"opaque-case={caseIndex:D2};");
+        if (totalBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(totalBytes), totalBytes, "Payload length must be positive.");
+
+        if (header.Length >= totalBytes)
+        {
+            var tinyPayload = new byte[totalBytes];
+            for (int i = 0; i < tinyPayload.Length; i++)
+                tinyPayload[i] = (byte)(((caseIndex + 1) * 53 + i * 97) % 256);
+
+            return tinyPayload;
+        }
+
+        var payload = new byte[totalBytes];
+        Buffer.BlockCopy(header, 0, payload, 0, header.Length);
+
+        for (int i = header.Length; i < payload.Length; i++)
+        {
+            payload[i] = caseIndex switch
+            {
+                0 => (byte)(i * 17 + 3),
+                1 => i % 5 == 0 ? (byte)0 : (byte)(255 - (i % 251)),
+                2 => (byte)((i * 31 + caseIndex * 7) % 251),
+                3 => (byte)((i ^ 0x5A) & 0xFF),
+                4 => (byte)((i * 97 + 11) % 253),
+                _ => (byte)(((i * 193) + caseIndex * 29) % 256)
+            };
+        }
+
+        if (payload.Length > header.Length + 4)
+        {
+            payload[header.Length] = 0;
+            payload[header.Length + 1] = 0x0A;
+            payload[header.Length + 2] = 0x7F;
+            payload[header.Length + 3] = 0xFF;
+        }
+
+        return payload;
+    }
+
+    private static string DescribePayload(byte[] payload)
+        => $"len={payload.Length},sha256={Convert.ToHexString(SHA256.HashData(payload))}";
 
     private sealed class TestEnvironmentScope : IDisposable
     {
