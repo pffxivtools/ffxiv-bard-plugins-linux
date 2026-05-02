@@ -16,9 +16,9 @@ set -Eeuo pipefail
 #   local-bardtoolbox
 #   github-url-pluginmaster
 TARGETS=(
-  "BardToolbox|BardToolbox|local-bardtoolbox|${BARDTOOLBOX_PRIVATE_REPO}|4x"
-  "MidiBard2|MidiBard 2|github-url-pluginmaster|${MIDIBARD2_PLUGINMASTER}|3x"
-  "MasterOfPuppets|MasterOfPuppets|github-url-pluginmaster|${MASTEROFPUPPETS_PLUGINMASTER}|3x"
+  "BardToolbox|BardToolbox|local-bardtoolbox|${BARDTOOLBOX_PRIVATE_REPO}|5x"
+  "MidiBard2|MidiBard 2|github-url-pluginmaster|${MIDIBARD2_PLUGINMASTER}|5x"
+  "MasterOfPuppets|MasterOfPuppets|github-url-pluginmaster|${MASTEROFPUPPETS_PLUGINMASTER}|5x"
 )
 
 log() { printf '[publish] %s\n' "$*"; }
@@ -85,8 +85,8 @@ resolve_abi_flavor() {
   fi
 
   case "${plugin_name}" in
-    BardToolbox) printf '4x\n' ;;
-    "MidiBard 2"|MidiBard2|MasterOfPuppets) printf '3x\n' ;;
+    BardToolbox) printf '5x\n' ;;
+    "MidiBard 2"|MidiBard2|MasterOfPuppets) printf '5x\n' ;;
     *) printf 'compat\n' ;;
   esac
 }

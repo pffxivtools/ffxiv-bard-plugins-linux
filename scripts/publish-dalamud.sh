@@ -58,8 +58,8 @@ resolve_abi_flavor() {
   fi
 
   case "${plugin_name}" in
-    BardToolbox) printf '4x\n' ;;
-    "MidiBard 2"|MidiBard2|MasterOfPuppets) printf '3x\n' ;;
+    BardToolbox) printf '5x\n' ;;
+    "MidiBard 2"|MidiBard2|MasterOfPuppets) printf '5x\n' ;;
     *) printf '5x\n' ;;
   esac
 }
