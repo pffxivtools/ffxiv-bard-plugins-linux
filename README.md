@@ -30,6 +30,10 @@ Compatibility notes:
 - If you are not using XLCore Wine, use a recent Wine build.
 - Steam Proton is not a supported primary path for this setup. Pressure Vessel sandboxing can interfere with the shared-path/native-host model these plugins use.
 
+## Setting up multiple clients using multiple users
+
+Refer to [docs/RUN_GAME_CLIENT.md](docs/RUN_GAME_CLIENT.md) for guidance on how to run multiple instances of the game on Linux.
+
 ## Install
 
 ### 1. Add the custom Dalamud repo
