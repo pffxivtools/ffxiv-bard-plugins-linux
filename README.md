@@ -1,106 +1,82 @@
 # XivIpc
 
-`XivIpc` is the Linux runtime and packaging repo for TinyIpc-based Dalamud plugins such as `BardToolbox`, `MidiBard 2`, and `Master Of Puppets`.
+> **⚠️ DEPRECATED — Do not install FFXIV plugins from this repo**
+>
+> The upstream plugins now bundle XivIpc directly. They detect the runtime environment and
+> use XivIpc on Linux without needing shims or custom builds from this repo.
+>
+> **BardToolbox** may not continue to be updated here. Migrate to **MasterOfPuppets** instead.
+>
+> | Plugin | Source |
+> |--------|--------|
+> | MasterOfPuppets | [github.com/zunetrix/MasterOfPuppets](https://github.com/zunetrix/MasterOfPuppets) |
+> | MidiBard2 | [github.com/zunetrix/MidiBard2](https://github.com/zunetrix/MidiBard2) / [github.com/reckhou/MidiBard2](https://github.com/reckhou/MidiBard2) |
+>
+> Install plugins from the upstream Dalamud repos instead of this repo's feed:
+>
+> | Repo | Plugin URL |
+> |------|------------|
+> | Official MidiBard2 (stable) | `https://raw.githubusercontent.com/reckhou/DalamudPlugins-Ori/api6/pluginmaster.json` |
+> | Zune repo (Alpha/Beta, MasterOfPuppets) | `https://raw.githubusercontent.com/zunetrix/DalamudPlugins/main/pluginmaster.json` |
+>
+> This repo is left as-is and CI will continue to run, but the plugins published here should
+> no longer be used.
 
-If you are here to install and use the plugins on Linux, this README is the guide. If you are building, testing, or packaging the repo itself, use [docs/DEVELOPING.md](docs/DEVELOPING.md).
+If you play FFXIV on Linux and want to play music through the game's performance system, these plugins let you do it. XivIpc is the Linux IPC runtime that makes them work under Wine — it replaces the Windows-only TinyIpc library these plugins were originally built around.
 
-## What This Repo Does
+## Which Plugin Should I Use?
 
-These plugins were originally built around Windows-only TinyIpc behavior. This repo ships Linux-compatible plugin packages and the native runtime pieces needed to make them work under Linux and Wine.
+| Plugin | What it does | Status |
+|--------|-------------|--------|
+| **Master Of Puppets** | Broadcast and automate performance actions across multiple clients. The most actively developed option. | **Recommended** — still actively maintained |
+| **MidiBard 2** | Play MIDI files through the game's performance system. Supports solo and ensemble play. | Actively maintained upstream |
+| **BardToolbox** | Older tool for MIDI playback and performance automation. | No longer actively maintained here — migrate to MasterOfPuppets |
 
-For most users, the important part is simple:
+## Quick Start
 
-- install the plugin from this repo's custom Dalamud feed
-- launch the game through xivlauncher on Linux
-- use the plugin normally in game
+If you're new to FFXIV on Linux, start with the [XIVLauncher install guide](https://goatcorp.github.io/faq/steamdeck.html). Once you have XIVLauncher and Dalamud running, getting a plugin takes two steps:
 
-With the current runtime defaults, the IPC side should work out of the box for the standard single-user setup.
+1. **Add the plugin repo** — open Dalamud Settings, go to the Experimental tab, and add one of the URLs from the banner above under "Custom Plugin Repositories".
+2. **Install the plugin** — open the Plugin Installer, find the plugin, and install it.
 
-## Supported Setup
+Launch the game and use the plugin normally. The IPC backend handles itself — you don't need to install anything extra or set any environment variables.
 
-Recommended:
+### In-Game Commands
 
-- Linux
-- `xivlauncher-core`
-- xivlauncher's built-in XLCore Wine runtime
+| Plugin | Command |
+|--------|---------|
+| MidiBard 2 | `/mb` or `/midibard` |
+| Master Of Puppets | `/mop` |
+| BardToolbox | `/btb` |
 
-Compatibility notes:
+## Environment
 
-- XLCore Wine is the preferred runtime.
-- If you are not using XLCore Wine, use a recent Wine build.
-- Steam Proton is not a supported primary path for this setup. Pressure Vessel sandboxing can interfere with the shared-path/native-host model these plugins use.
+### Runtime
 
-## Setting up multiple clients using multiple users
+| Runtime | Works? | Notes |
+|---------|--------|-------|
+| XLCore Wine (XIVLauncher default) | ✅ | Recommended — tested and supported |
+| Other Wine builds | ✅ | Should work with a recent Wine |
+| Steam Proton | ⚠️ | Pressure Vessel sandboxing can block the shared filesystem access these plugins need |
 
-Refer to [docs/RUN_GAME_CLIENT.md](docs/RUN_GAME_CLIENT.md) for guidance on how to run multiple instances of the game on Linux.
+### What Runs Automatically
 
-## Install
+The IPC backend starts on its own when a plugin needs it. It creates a shared runtime directory at `/tmp/tinyipc-shared-ffxiv` and downloads the native broker binary from GitHub if it isn't there yet. For a normal single-client setup, that's all there is to it.
 
-### 1. Add the custom Dalamud repo
+### DXVK Memory
 
-Open `Dalamud Settings`, then add this URL under custom plugin repositories:
-
-```text
-https://raw.githubusercontent.com/pffxivtools/ffxiv-bard-plugins-linux/refs/heads/main/pluginmaster.json
-```
-
-### 2. Install the plugin you want
-
-Open `Plugin Installer` and install one of the packaged plugins:
-
-- `BardToolbox`
-- `MidiBard 2`
-- `Master Of Puppets`
-
-### 3. Launch normally
-
-Launch the game through xivlauncher on Linux and use the plugin as you normally would.
-
-You should not need to manually install or stage `XivIpc.NativeHost`, create a broker directory, or export `TINYIPC_*` variables for the default setup.
-
-## What Works Automatically
-
-The current runtime path is much simpler than the older manual setup:
-
-- the shared runtime directory defaults to `/tmp/tinyipc-shared-ffxiv`
-- the native host is expected at `/tmp/tinyipc-shared-ffxiv/tinyipc-native-host/XivIpc.NativeHost`
-- if that native host is missing, the runtime can download the latest published host automatically
-- default single-user setups can run without `TINYIPC_SHARED_GROUP`
-
-That means the standard path is "install plugin and run it", not "manually configure broker infrastructure first".
-
-## Usage
-
-This repo does not change the normal in-game usage of the packaged plugins. After installation:
-
-- `MidiBard 2` is still used through its normal in-game UI and commands
-- `BardToolbox` is still configured through its own windows and settings
-- `Master Of Puppets` is still used through its own action and broadcast workflows
-
-For feature-specific help, use each plugin's own docs, UI help, or community support links.
-
-## Advanced Tips
-
-### DXVK VRAM limit tweak
-
-If you are running multiple clients, this DXVK config can help limit VRAM use per client:
+Running multiple clients can exhaust your GPU memory. Limit it per client with a DXVK config:
 
 ```ini
 dxgi.maxDeviceMemory = 2048
 dxgi.maxSharedMemory = 2048
 ```
 
-Example:
+Save that to a file (say `~/.config/dxvk.conf`) and set `DXVK_CONFIG_FILE=~/.config/dxvk.conf` before launching the client.
 
-```bash
-export DXVK_CONFIG_FILE=/home/shared/dxvk-alt.conf
-```
+### Logging
 
-Put the two `dxgi.*` lines in that file, then launch the client with `DXVK_CONFIG_FILE` pointing to it.
-
-### Optional logging
-
-If you need runtime logs for troubleshooting:
+If something isn't working, turn on logging to see what the IPC backend is doing:
 
 ```bash
 export TINYIPC_ENABLE_LOGGING=1
@@ -108,47 +84,42 @@ export TINYIPC_LOG_DIR=/tmp/tinyipc-logs
 export TINYIPC_LOG_LEVEL=info
 ```
 
+Logs will appear in `TINYIPC_LOG_DIR` as `tinyipc-*.log` files.
+
+## Running Multiple Clients
+
+If you want to run multiple game profiles side by side (for example, to have one character play music while another performs), see the full guide at [docs/RUN_GAME_CLIENT.md](docs/RUN_GAME_CLIENT.md).
+
+The basic approach: create separate Linux users for each profile, give them display access, and launch XIVLauncher under the right user with the right environment. The guide includes a `run-other.sh` script that handles this.
+
 ## Troubleshooting
 
-### The plugin installs but clients do not see each other
+### Clients don't see each other
 
-Start with the simple checks:
+- Make sure all clients are using the same runtime family (XLCore Wine, not a mix of Wine and Proton)
+- Restart all clients after updating plugins
+- If you're running a custom multi-user setup, check that everyone is in the same shared group
 
-- make sure all clients are using the same launcher/runtime family
-- prefer XLCore Wine over Proton
-- restart the affected clients after updating plugins
+### The plugin installs but doesn't seem to work
 
-If you are running a more customized setup with multiple users or custom shared paths, refer to [docs/DEVELOPING.md](docs/DEVELOPING.md) for the lower-level runtime details.
+Enable logging (see above) and check the logs. Common causes:
 
-### The native broker does not seem to start
+- The native broker binary couldn't download or start — check your network and that `/tmp` is writable
+- Proton's sandbox is blocking access to the shared runtime directory
+- The runtime directory was removed or is on a filesystem without POSIX shared memory support
 
-In the default setup, this usually means one of:
+### I need to customize paths or use a shared group
 
-- the client could not download or launch `XivIpc.NativeHost`
-- the runtime environment is too restricted or sandboxed
-- the shared temp path is not writable
+Advanced setup options — custom `TINYIPC_*` environment variables, manual broker staging, multi-user groups — are covered in [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
-Turn on logging with the variables above and check the generated `tinyipc-*.log` files.
+### I'm using the legacy install from this repo's feed
 
-### I am using Proton and it behaves inconsistently
+Legacy install instructions are at [docs/INSTALL.md](docs/INSTALL.md). But you should switch to the upstream repos — they bundle XivIpc directly and are kept up to date.
 
-That is expected enough that XLCore Wine should be treated as the supported path. Proton's containerization can block the shared filesystem and native broker behavior these plugins rely on.
+## For Developers
 
-### I need custom paths, shared groups, or manual staging
-
-Those are advanced or developer-managed setups now. Use [docs/DEVELOPING.md](docs/DEVELOPING.md) for:
-
-- custom `TINYIPC_*` environment variables
-- shared-group and multi-user setups
-- native host staging and publish scripts
-- broker lifecycle and sidecar details
-
-## Developer Links
-
-If you are working on the repo itself:
-
-- [docs/DEVELOPING.md](docs/DEVELOPING.md)
-- [TinyIpc.Shim README](TinyIpc.Shim/README.md)
-- [XivIpc README](XivIpc/README.md)
-- [XivIpc.NativeHost README](XivIpc.NativeHost/README.md)
-- [XivIpc.Tests README](XivIpc.Tests/README.md)
+- [docs/DEVELOPING.md](docs/DEVELOPING.md) — build, test, publish, architecture
+- [TinyIpc.Shim/README.md](TinyIpc.Shim/README.md) — public API compatibility surface
+- [XivIpc/README.md](XivIpc/README.md) — IPC internals
+- [XivIpc.NativeHost/README.md](XivIpc.NativeHost/README.md) — native broker process
+- [XivIpc.Tests/README.md](XivIpc.Tests/README.md) — test coverage

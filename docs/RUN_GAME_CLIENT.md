@@ -1,75 +1,56 @@
-# Recreating A Multi-User Game Client Setup On Linux
+# Running Multiple FFXIV Clients on Linux
 
-This guide describes how to run the game client as separate local Linux users from one desktop session. The main pattern is a `run-other.sh` launcher: you start it from your normal desktop user, pass the account name, and it runs `xivlauncher-core` under the matching local Linux user.
+If you want to run multiple game profiles side by side — for example, to have one character perform music while another character plays — you need each launcher instance to use its own configuration. The cleanest way to do that on Linux is to run each profile under a separate local Linux user.
 
-This is useful when each game profile should have its own home directory, launcher config, Wine prefix, and game settings.
+Each user gets their own home directory and `.xlcore` config, so launcher settings, Wine prefixes, and plugin state never collide.
 
-The examples use placeholders:
+## How It Works
 
-- `<account>`: a local Linux username for one game profile
-- `<account-list>`: a text file containing one account username per line
-- `<shared-group>`: a Linux group allowed to access shared game files
-- `<dxvk-config>`: optional path to a DXVK config file
-
-## Overview
-
-The setup has four parts:
-
-1. Install the game and `xivlauncher-core`.
-2. Create one local Linux user per game profile.
-3. Allow those users to access the display and shared game files.
-4. Use `run-other.sh` to launch the client as the selected user.
-
-The important idea is that the launched process receives the target user's `HOME`, `USER`, and `LOGNAME`, then runs through `sudo -u <account>`. That makes the launcher use that user's own `.xlcore` directory instead of your normal desktop user's config.
+You create one Linux user per game profile, then use a launcher script that runs `xivlauncher-core` under that user with the right environment variables (`HOME`, `USER`, `LOGNAME`, `DISPLAY`). The script uses `sudo -u` to switch users and `xhost` to grant display access.
 
 ## Prerequisites
 
-Install the base tools:
+- **XIVLauncher installed** — see the [XIVLauncher Linux install guide](https://goatcorp.github.io/faq/steamdeck.html)
+- **The game installed** in a location readable by all account users
+- **Base tools** — install these if you don't have them:
 
 ```bash
-sudo apt install sudo x11-xserver-utils mangohud
+sudo apt install x11-xserver-utils mangohud
 ```
 
-Package names vary by distribution. You also need:
+Package names vary by distribution — adjust for your distro.
 
-- Steam, Proton, Wine, or the runtime your launcher uses
-- `xivlauncher-core` available on the system path, usually as `/usr/bin/xivlauncher-core`
-- The game installed in a location readable by every account user
-- A desktop session with `DISPLAY` set
+## Step-by-Step
 
-If the game files live in a shared Steam library or shared install directory, create a group for access:
+### 1. Create the Account List
 
-```bash
-sudo groupadd <shared-group>
-sudo usermod -aG <shared-group> "$USER"
+Create a text file called `accounts.txt` with one Linux username per line:
+
+```text
+bard_one
+bard_two
+bard_three
 ```
 
-Then make the shared game directory group-readable and group-writable if needed:
+Keep names lowercase, no spaces or special characters.
+
+### 2. Create a Shared Group
+
+If your game files live in a shared directory (like a Steam library), create a group so all account users can access them:
 
 ```bash
-sudo chgrp -R <shared-group> /path/to/game/library
+sudo groupadd ffxiv
+sudo usermod -aG ffxiv "$USER"
+sudo chgrp -R ffxiv /path/to/game/library
 sudo chmod -R g+rwX /path/to/game/library
 ```
 
-Log out and back in after changing your own group membership.
+Log out and back in after adding yourself to the group.
 
-## Create The Account List
+### 3. Create the Linux Users
 
-Create a simple text file with one local username per game profile:
-
-```text
-account_one
-account_two
-account_three
-```
-
-Save it as `accounts.txt` next to `run-other.sh`.
-
-Use Linux-safe usernames: lowercase letters, numbers, underscores, and hyphens.
-
-## Create Local Users
-
-Create one Linux user for each account in `accounts.txt`:
+<details>
+<summary>Script: create the users</summary>
 
 ```bash
 while IFS= read -r account; do
@@ -77,14 +58,16 @@ while IFS= read -r account; do
   [[ "$account" =~ ^[[:space:]]*# ]] && continue
 
   sudo useradd --create-home --shell /bin/bash "$account"
-  sudo usermod -aG <shared-group> "$account"
+  sudo usermod -aG ffxiv "$account"
   sudo passwd -l "$account" >/dev/null
 done < accounts.txt
 ```
 
-This creates a real home directory for each profile and locks password login for those users. They can still be used through `sudo -u`.
+This creates a home directory for each profile and locks password login (the accounts are only used through `sudo -u`).
+</details>
 
-Prepare each launcher home directory:
+<details>
+<summary>Script: prepare launcher directories</summary>
 
 ```bash
 while IFS= read -r account; do
@@ -95,10 +78,14 @@ while IFS= read -r account; do
   sudo -u "$account" mkdir -p "$home_dir/.xlcore"
 done < accounts.txt
 ```
+</details>
 
-## Create `run-other.sh`
+### 4. Create the Launcher Script
 
-Create a file named `run-other.sh`:
+Save this as `run-other.sh` next to your `accounts.txt`:
+
+<details>
+<summary><code>run-other.sh</code></summary>
 
 ```bash
 #!/usr/bin/env bash
@@ -140,7 +127,7 @@ printf 'home=%q\n' "$account_home"
 
 sudo -u "$account" mkdir -p "$account_home/.xlcore"
 
-# Allow this local Linux user to open windows in your current X11 session.
+# Allow this user to open windows in your current X11 session.
 xhost +SI:localuser:"$account"
 
 exec sudo -u "$account" env \
@@ -153,38 +140,21 @@ exec sudo -u "$account" env \
   MANGOHUD_CONFIG="fps_limit=30,no_display" \
   mangohud /usr/bin/xivlauncher-core
 ```
+</details>
 
-Make it executable:
+Make it executable and test it:
 
 ```bash
 chmod +x run-other.sh
+./run-other.sh bard_one
 ```
 
-Launch one profile:
+### 5. Launch All Profiles at Once (Optional)
 
-```bash
-./run-other.sh <account>
-```
+Save this as `run-many.sh`:
 
-## Optional DXVK Config
-
-If you use a shared DXVK config file, add this line to the `env` block before `MANGOHUD=1`:
-
-```bash
-  DXVK_CONFIG_FILE=<dxvk-config> \
-```
-
-Example:
-
-```bash
-  DXVK_CONFIG_FILE=/opt/game-client/dxvk.conf \
-```
-
-Make sure every account user can read that file.
-
-## Batch Launching
-
-After `run-other.sh` works for one account, you can add a batch wrapper:
+<details>
+<summary><code>run-many.sh</code></summary>
 
 ```bash
 #!/usr/bin/env bash
@@ -205,32 +175,52 @@ while IFS= read -r account; do
   sleep 30
 done < "$ACCOUNTS_FILE"
 ```
+</details>
 
-Save it as `run-many.sh`, make it executable, then run:
+Make it executable and run:
 
 ```bash
 chmod +x run-many.sh
 ./run-many.sh accounts.txt
 ```
 
-The delay gives each launcher time to initialize before the next one starts.
+The 30-second delay gives each launcher time to initialize before the next one starts.
 
-## Migrating Existing Launcher Profiles
+## Optional: DXVK Config
 
-If you already have saved launcher profiles, copy each profile into the target user's `.xlcore` directory:
+If you want to limit VRAM per client (helpful when running multiple instances), add a DXVK config file to the `env` block in `run-other.sh`:
+
+```bash
+  DXVK_CONFIG_FILE=/opt/game-client/dxvk.conf \
+```
+
+Example config (`dxvk.conf`):
+
+```ini
+dxgi.maxDeviceMemory = 2048
+dxgi.maxSharedMemory = 2048
+```
+
+Make sure every account user can read the file.
+
+## Migrating Existing Profiles
+
+If you already have launcher profiles saved, copy them into the target user's `.xlcore` directory:
 
 ```bash
 sudo rsync -a --delete /path/to/profile-data/ "$account_home/.xlcore"/
 sudo chown -R "$account:$account" "$account_home/.xlcore"
 ```
 
-For character config folders, launch the account once first so the launcher creates its target directories. Then copy only the matching config data into that user's launcher config path.
+For character-specific configs, launch the account once first so the launcher creates its target directories, then copy only what you need.
 
 ## Troubleshooting
 
-- `Linux user does not exist`: create the local user first.
-- `Account not found in account list`: add the username to `accounts.txt`.
-- Launcher opens under the wrong profile: confirm `HOME`, `USER`, and `LOGNAME` are set inside the `sudo -u ... env` block.
-- No window appears: confirm `DISPLAY` is set and run `xhost +SI:localuser:<account>` from your desktop session.
-- Permission errors reading game files: add the account user to the shared group and check group permissions on the game directory.
-- MangoHud is missing: remove `mangohud` from the final command or install MangoHud for your distribution.
+| Symptom | Fix |
+|---------|-----|
+| `Linux user does not exist` | Run the user creation script from step 3 |
+| `Account not found` | Add the username to `accounts.txt` |
+| Launcher uses the wrong profile | Make sure `HOME`, `USER`, and `LOGNAME` are set inside the `env` block of `run-other.sh` |
+| No window appears | Run `xhost +SI:localuser:<account>` from your desktop session and confirm `DISPLAY` is set |
+| Permission errors on game files | Add the account user to the shared group and check directory permissions |
+| `mangohud: command not found` | Remove `mangohud` from the final command in `run-other.sh`, or install MangoHud for your distribution |
