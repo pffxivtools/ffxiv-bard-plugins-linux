@@ -72,16 +72,16 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 62310,
-    "LastUpdate": "1777707975",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.8/BardToolbox.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.8/BardToolbox.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/0.0.8/BardToolbox.zip"
+    "LastUpdate": "1778375093",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.5.4/BardToolbox-2.2.5.4.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.5.4/BardToolbox-2.2.5.4.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/BardToolbox-2.2.5.4/BardToolbox-2.2.5.4.zip"
   },
   {
     "Author": "Zune",
     "Name": "Master Of Puppets",
     "InternalName": "MasterOfPuppets",
-    "AssemblyVersion": "1.15.0.185",
+    "AssemblyVersion": "1.15.0.221",
     "DalamudApiLevel": 15,
     "Punchline": "Gremlins Control Center",
     "Description": "FFXIV plugin that lets you create and send custom actions (similar to in-game macros), either locally or via chat-based broadcast. It supports broadcasting actions to multiple clients locally, or through in-game chat channels such as Party, Linkshell, and Cross-World Linkshell. Use it to trigger custom actions like emotes, minions, mounts, fashion changes, and more.",
@@ -91,19 +91,19 @@
       "utility"
     ],
     "IconUrl": "https://i.imgur.com/uFq8py7.png",
-    "Changelog": "Weird features added",
+    "Changelog": "Add xiv account launcher queue",
     "DownloadCount": 0,
-    "LastUpdate": "1778212586",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.185/MasterOfPuppets-1.15.0.185.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.185/MasterOfPuppets-1.15.0.185.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.185/MasterOfPuppets-1.15.0.185.zip",
+    "LastUpdate": "1782966835",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.221/MasterOfPuppets-1.15.0.221.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.221/MasterOfPuppets-1.15.0.221.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.221/MasterOfPuppets-1.15.0.221.zip",
     "IsHide": false
   },
   {
     "Author": "akira0245, Ori, Kalle, Zune",
     "Name": "MidiBard 2",
     "InternalName": "MidiBard2",
-    "AssemblyVersion": "3.2.4.3",
+    "AssemblyVersion": "3.2.4.5",
     "Description": "Bard performance using midi files or keyboard.\n- Solo and ensemble mode support\n- Text commands for instrument equip and switch\nSupported by FFXIV Bards & Bands Community: ffbard.com",
     "ApplicableVersion": "any",
     "RepoUrl": "https://midibard.org",
@@ -128,9 +128,9 @@
     "IsHide": false,
     "IsTestingExclusive": "False",
     "DownloadCount": 221454,
-    "LastUpdate": "1778212329",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.3/MidiBard2-3.2.4.3.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.3/MidiBard2-3.2.4.3.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.3/MidiBard2-3.2.4.3.zip"
+    "LastUpdate": "1779509179",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.5/MidiBard2-3.2.4.5.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.5/MidiBard2-3.2.4.5.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MidiBard2-3.2.4.5/MidiBard2-3.2.4.5.zip"
   }
 ]
