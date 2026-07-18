@@ -81,7 +81,7 @@
     "Author": "Zune",
     "Name": "Master Of Puppets",
     "InternalName": "MasterOfPuppets",
-    "AssemblyVersion": "1.15.0.222",
+    "AssemblyVersion": "1.15.0.223",
     "DalamudApiLevel": 15,
     "Punchline": "Gremlins Control Center",
     "Description": "FFXIV plugin that lets you create and send custom actions (similar to in-game macros), either locally or via chat-based broadcast. It supports broadcasting actions to multiple clients locally, or through in-game chat channels such as Party, Linkshell, and Cross-World Linkshell. Use it to trigger custom actions like emotes, minions, mounts, fashion changes, and more.",
@@ -91,12 +91,12 @@
       "utility"
     ],
     "IconUrl": "https://i.imgur.com/uFq8py7.png",
-    "Changelog": "Add new game settings profile window",
+    "Changelog": "Add ridepillion action",
     "DownloadCount": 0,
-    "LastUpdate": "1783915510",
-    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.222/MasterOfPuppets-1.15.0.222.zip",
-    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.222/MasterOfPuppets-1.15.0.222.zip",
-    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.222/MasterOfPuppets-1.15.0.222.zip",
+    "LastUpdate": "1784345894",
+    "DownloadLinkInstall": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.223/MasterOfPuppets-1.15.0.223.zip",
+    "DownloadLinkUpdate": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.223/MasterOfPuppets-1.15.0.223.zip",
+    "DownloadLinkTesting": "https://github.com/pffxivtools/ffxiv-bard-plugins-linux/releases/download/MasterOfPuppets-1.15.0.223/MasterOfPuppets-1.15.0.223.zip",
     "IsHide": false
   },
   {
